@@ -302,7 +302,7 @@ pub mod platform {
         let Ok(content) = std::fs::read_to_string(cert_pem_path) else {
             return false;
         };
-        let Ok(Ok(der)) = rustls_pemfile::certs(&mut content.as_bytes())
+        let Ok(Some(der)) = rustls_pemfile::certs(&mut content.as_bytes())
             .next()
             .transpose()
         else {

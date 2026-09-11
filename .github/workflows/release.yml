@@ -30,7 +30,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -44,12 +44,12 @@ jobs:
             patchelf
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: 'pnpm'
@@ -115,7 +115,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: ''
+          args: '--bundles nsis'
 
       - name: Build and publish (Tauri) - Windows arm64
         if: matrix.platform == 'windows-latest'
@@ -138,7 +138,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--target aarch64-pc-windows-msvc'
+          args: '--bundles nsis --target aarch64-pc-windows-msvc'
 
       - name: Build and publish (Tauri) - macOS x86_64 (Intel)
         if: matrix.platform == 'macos-latest'
@@ -169,7 +169,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--target x86_64-apple-darwin'
+          args: '--bundles dmg --target x86_64-apple-darwin'
 
       - name: Build and publish (Tauri) - macOS aarch64 (Apple Silicon)
         if: matrix.platform == 'macos-latest'
@@ -199,4 +199,4 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--target aarch64-apple-darwin'
+          args: '--bundles dmg --target aarch64-apple-darwin'
