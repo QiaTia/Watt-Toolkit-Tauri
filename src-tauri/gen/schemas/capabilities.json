@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Watt Toolkit 主窗口默认能力","local":true,"windows":["main"],"permissions":["core:default","core:app:default","core:window:default","core:event:default","core:webview:default"]}}

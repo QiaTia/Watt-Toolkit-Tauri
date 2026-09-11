@@ -1,0 +1,17 @@
+[package]
+name = "watt-script"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rquickjs = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"

@@ -1,0 +1,13 @@
+[package]
+name = "watt-dns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+hickory-resolver = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+once_cell = { workspace = true }

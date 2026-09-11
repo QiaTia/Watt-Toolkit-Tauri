@@ -1,0 +1,22 @@
+[package]
+name = "watt-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    # 复用 workspace rustls ring provider，避免引入 aws-lc-rs 造成双 provider 歧义
+    "rustls-no-provider",
+] }
+# rustls-no-provider 不自动安装 crypto provider，需手动 install_default（见 client.rs）
+rustls = { workspace = true }
+
+watt-config = { workspace = true }

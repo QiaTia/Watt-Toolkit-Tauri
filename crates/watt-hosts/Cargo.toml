@@ -1,0 +1,9 @@
+[package]
+name = "watt-hosts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

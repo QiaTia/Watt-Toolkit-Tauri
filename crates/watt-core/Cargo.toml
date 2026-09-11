@@ -1,0 +1,50 @@
+[package]
+name = "watt-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+httparse = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+dashmap = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+watt-cert = { workspace = true }
+watt-config = { workspace = true }
+watt-dns = { workspace = true }
+watt-hosts = { workspace = true }
+watt-script = { workspace = true }
+
+rustls-native-certs = "0.7"
+urlencoding = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+] }
+
+[dev-dependencies]
+tokio-test = "0.4"
