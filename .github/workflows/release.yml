@@ -71,6 +71,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --dir ui --frozen-lockfile
 
+      - name: Build frontend
+        run: pnpm --dir ui build
+
       - name: Build and publish (Tauri) - Linux
         if: matrix.platform == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@v0
@@ -92,7 +95,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '${{ matrix.args }}'
+          args: '${{ matrix.args }} --config ${{ github.workspace }}/src-tauri/tauri.conf.ci.json'
 
       - name: Build and publish (Tauri) - Windows x86_64
         if: matrix.platform == 'windows-latest'
@@ -115,7 +118,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--bundles nsis'
+          args: '--bundles nsis --config ${{ github.workspace }}/src-tauri/tauri.conf.ci.json'
 
       - name: Build and publish (Tauri) - Windows arm64
         if: matrix.platform == 'windows-latest'
@@ -138,7 +141,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--bundles nsis --target aarch64-pc-windows-msvc'
+          args: '--bundles nsis --target aarch64-pc-windows-msvc --config ${{ github.workspace }}/src-tauri/tauri.conf.ci.json'
 
       - name: Build and publish (Tauri) - macOS x86_64 (Intel)
         if: matrix.platform == 'macos-latest'
@@ -169,7 +172,7 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--bundles dmg --target x86_64-apple-darwin'
+          args: '--bundles dmg --target x86_64-apple-darwin --config ${{ github.workspace }}/src-tauri/tauri.conf.ci.json'
 
       - name: Build and publish (Tauri) - macOS aarch64 (Apple Silicon)
         if: matrix.platform == 'macos-latest'
@@ -199,4 +202,4 @@ jobs:
             > 注：macOS 未签名版本首次打开时，请在「访达」中右键点击应用 → 打开，以绕过 Gatekeeper 拦截。
           releaseDraft: false
           prerelease: false
-          args: '--bundles dmg --target aarch64-apple-darwin'
+          args: '--bundles dmg --target aarch64-apple-darwin --config ${{ github.workspace }}/src-tauri/tauri.conf.ci.json'
