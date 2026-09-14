@@ -7,6 +7,7 @@ import type {
   AppInfo,
   CertificateInfo,
   CertStatusDto,
+  ConnectivityTestItem,
   DomainRule,
   EngineStartParams,
   EngineStateDto,
@@ -97,4 +98,9 @@ export function accelerateSetEnabled(enabledIds: string[]): Promise<void> {
 /** 由勾选 Id 集合构建引擎规则 */
 export function accelerateGetRules(enabledIds: string[]): Promise<DomainRule[]> {
   return invoke('accelerate_get_rules', { enabledIds });
+}
+
+/** 分组连通性测试：并发对每个域名发起完整 HTTPS GET 并计时 */
+export function accelerateConnectivityTest(hosts: string[]): Promise<ConnectivityTestItem[]> {
+  return invoke('accelerate_connectivity_test', { hosts });
 }

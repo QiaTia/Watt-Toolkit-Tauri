@@ -56,6 +56,22 @@ const GITHUB_ASSETS_IPS: &[&str] = &[
     "185.199.111.154",
 ];
 
+/// Google 翻译系（translate.google.com / translate.googleapis.com /
+/// translate.gstatic.com）备用 IP（Google China 边缘段）。
+/// 注意：该段不同 IP 覆盖的 SNI 集合不同（部分 IP 对个别域名 TLS 握手即被重置），
+/// 出站竞速以「TLS 握手完成」为胜出条件，可自动跳过 SNI 不匹配的候选。
+/// 2026-09 实测前置项：120.253.253.34 对三个域名均全证书验证通过。
+const GOOGLE_TRANSLATE_IPS: &[&str] = &[
+    "120.253.253.34",
+    "120.253.253.98",
+    "120.253.253.226",
+    "203.208.49.99",
+    "203.208.49.98",
+    "203.208.49.66",
+    "120.253.253.240",
+    "120.253.253.250",
+];
+
 /// 返回该 host 的备用 IP 列表（无匹配时为空）。
 ///
 /// 匹配按后缀进行，更具体的服务段优先：
@@ -66,7 +82,15 @@ pub fn fallback_ips(host: &str) -> Vec<IpAddr> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
 
     let pool: &[&str] =
-        if host == "githubusercontent.com" || host.ends_with(".githubusercontent.com") {
+        if host == "translate.googleapis.com"
+            || host.ends_with(".translate.googleapis.com")
+            || host == "translate.gstatic.com"
+            || host.ends_with(".translate.gstatic.com")
+            || host == "translate.google.com"
+            || host.ends_with(".translate.google.com")
+        {
+            GOOGLE_TRANSLATE_IPS
+        } else if host == "githubusercontent.com" || host.ends_with(".githubusercontent.com") {
             GITHUB_USERCONTENT_IPS
         } else if host == "githubassets.com" || host.ends_with(".githubassets.com") {
             GITHUB_ASSETS_IPS
@@ -125,5 +149,23 @@ mod tests {
         assert!(fallback_ips("example.com").is_empty());
         // 形似但非目标（防止后缀误命中）
         assert!(fallback_ips("notgithub.com").is_empty());
+        // google.com 主站不命中翻译段（仅 translate.* 前缀）
+        assert!(fallback_ips("www.google.com").is_empty());
+    }
+
+    #[test]
+    fn test_google_translate_hosts_hit_translate_pool() {
+        for host in [
+            "translate.google.com",
+            "translate.googleapis.com",
+            "translate.gstatic.com",
+        ] {
+            let ips = fallback_ips(host);
+            assert!(!ips.is_empty(), "{host} 应有备用 IP");
+            assert!(
+                ips.iter().any(|ip| ip.to_string() == "120.253.253.34"),
+                "{host} 应命中 Google 翻译段"
+            );
+        }
     }
 }

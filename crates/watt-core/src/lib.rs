@@ -7,6 +7,7 @@
 //! - 26501：系统代理/PAC 模式正向代理（CONNECT 隧道 + HTTP 代理）
 //! - 8868：SOCKS5 入站
 
+pub mod connect_test;
 pub mod engine;
 pub mod fallback;
 pub mod forward_proxy;

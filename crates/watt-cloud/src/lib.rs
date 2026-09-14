@@ -16,6 +16,7 @@
 //! 字段语义经 `ReverseProxyHttpClientHandler.GetIPEndPointsAsync()` 交叉确认：
 //! `IPAddress` 直连 IP → `ForwardDestination` 解析该镜像域名取 IP（Host/SNI 仍为原始域名）。
 
+pub mod builtin;
 pub mod cache;
 pub mod client;
 pub mod dto;

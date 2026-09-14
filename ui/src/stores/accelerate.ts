@@ -9,13 +9,20 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import {
+  accelerateConnectivityTest,
   accelerateGetProjects,
   accelerateGetRules,
   accelerateRefresh,
   accelerateSetEnabled,
 } from '@/api';
 import { useSettingsStore } from '@/stores/settings';
-import type { AccelerateCatalog, AccelerateProject, DomainRule } from '@/types/ipc';
+import type {
+  AccelerateCatalog,
+  AccelerateProject,
+  AccelerateProjectGroup,
+  ConnectivityTestItem,
+  DomainRule,
+} from '@/types/ipc';
 
 export const useAccelerateStore = defineStore('accelerate', () => {
   const catalog = ref<AccelerateCatalog | null>(null);
@@ -145,6 +152,73 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     return { rules };
   }
 
+  /* ========== 连通性测试（对齐原版 ProxyDomainGroupViewModel.ConnectTestCommand） ========== */
+
+  /** 项目 Id → 延迟显示文本（'123 ms' | 'Timeout' | 'error'） */
+  const probeResults = ref<Record<string, string>>({});
+  /** 正在测试的分组 Id 集合 */
+  const testingGroups = ref<Set<string>>(new Set());
+
+  /** 项目的探测主机：第一个监听域名，回退匹配域名（剥 URL 前缀/通配符/端口） */
+  function projectHost(project: AccelerateProject): string {
+    const raw = project.rule.listening_domain_names[0] ?? project.rule.match_domain_names[0] ?? '';
+    const noScheme = raw.replace(/^https?:\/\//i, '');
+    const host = (noScheme.split('/')[0] ?? '').split(':')[0] ?? '';
+    return host.replace(/^\*\./, '').toLowerCase();
+  }
+
+  /** 结果格式化：失败区分超时/错误，成功 >20s 判 Timeout（对齐原版阈值） */
+  function formatProbeResult(r: ConnectivityTestItem): string {
+    if (!r.ok) return r.error?.includes('超时') === true ? 'Timeout' : 'error';
+    if (r.latencyMs > 20_000) return 'Timeout';
+    return `${r.latencyMs} ms`;
+  }
+
+  /**
+   * 分组连通性测试：仅测当前勾选项，同 host 去重，后端全并发探测。
+   * 返回 'empty'（无可测试项）/ 'ok' / 'fail-all'（全部失败，供页面弹警告）。
+   */
+  async function testGroup(group: AccelerateProjectGroup): Promise<'empty' | 'ok' | 'fail-all'> {
+    if (testingGroups.value.has(group.id)) return 'empty';
+    const targets: Array<{ id: string; host: string }> = [];
+    const walk = (p: AccelerateProject): void => {
+      if (checkedIds.value.has(p.id)) {
+        const host = projectHost(p);
+        if (host) targets.push({ id: p.id, host });
+      }
+      p.items.forEach(walk);
+    };
+    group.items.forEach(walk);
+    if (targets.length === 0) return 'empty';
+
+    testingGroups.value = new Set(testingGroups.value).add(group.id);
+    try {
+      const hosts = [...new Set(targets.map((t) => t.host))];
+      const results = await accelerateConnectivityTest(hosts);
+      const byHost = new Map(results.map((r) => [r.host, r]));
+      const next = { ...probeResults.value };
+      let failAll = true;
+      for (const t of targets) {
+        const r = byHost.get(t.host);
+        if (!r) continue;
+        const text = formatProbeResult(r);
+        next[t.id] = text;
+        if (text !== 'Timeout' && text !== 'error') failAll = false;
+      }
+      probeResults.value = next;
+      return failAll ? 'fail-all' : 'ok';
+    } finally {
+      const rest = new Set(testingGroups.value);
+      rest.delete(group.id);
+      testingGroups.value = rest;
+    }
+  }
+
+  /** 清空探测结果（刷新列表时结果已过期） */
+  function clearProbes(): void {
+    probeResults.value = {};
+  }
+
   return {
     catalog,
     source,
@@ -154,6 +228,8 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     groups,
     allProjectIds,
     defaultCheckedIds,
+    probeResults,
+    testingGroups,
     load,
     toggle,
     toggleGroup,
@@ -161,5 +237,8 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     setAll,
     persist,
     buildEngineAssets,
+    testGroup,
+    projectHost,
+    clearProbes,
   };
 });

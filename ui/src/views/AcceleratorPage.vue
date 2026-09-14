@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
+import AntApp from 'ant-design-vue/es/app';
 import { useProxyStore } from '@/stores/proxy';
 import { useSettingsStore } from '@/stores/settings';
 import { useAccelerateStore } from '@/stores/accelerate';
@@ -13,6 +14,7 @@ import type {
 const proxy = useProxyStore();
 const settings = useSettingsStore();
 const accel = useAccelerateStore();
+const { message } = AntApp.useApp();
 
 // 必须在 setup 顶层调用：放到 onMounted 里会因没有活跃组件实例而注册失败，
 // 导致离开页面后 1s 统计轮询永不停止。
@@ -168,10 +170,36 @@ const refreshing = ref(false);
 async function refreshCatalog(): Promise<void> {
   refreshing.value = true;
   try {
+    accel.clearProbes();
     await accel.load(true, settings.settings.enabled_accelerate_ids);
   } finally {
     refreshing.value = false;
   }
+}
+
+/* ========== 连通性测试（对齐原版「连通性测试」按钮） ========== */
+
+/** 分组连通性测试：展开面板展示结果，全失败时弹警告（对齐原版 Toast 语义） */
+async function runGroupTest(group: AccelerateProjectGroup): Promise<void> {
+  if (!activeKeys.value.includes(group.id)) {
+    activeKeys.value = [...activeKeys.value, group.id];
+  }
+  const res = await accel.testGroup(group);
+  if (res === 'empty') {
+    message.warning('没有可测试的项目：请先勾选该分组内的加速项');
+    return;
+  }
+  if (res === 'fail-all') {
+    message.error('当前测试项全部未通过，请检查网络链接状况，以及代理设置里的设置项是否正常。');
+  }
+}
+
+/** 延迟文本配色（对齐原版：≤1000ms 绿 / >1000ms 橙 / Timeout·error 红） */
+function delayClass(text: string | undefined): string {
+  if (!text) return 'delay-ok';
+  if (text === 'Timeout' || text === 'error') return 'delay-bad';
+  const ms = Number.parseInt(text, 10);
+  return Number.isFinite(ms) && ms > 1000 ? 'delay-mid' : 'delay-ok';
 }
 
 function isChecked(p: AccelerateProject): boolean {
@@ -310,6 +338,14 @@ async function toggleEngine(): Promise<void> {
                 <a-tag>
                   {{ groupCount(group).hit }}/{{ groupCount(group).total }}
                 </a-tag>
+                <a-button
+                  size="small"
+                  class="group-test-btn"
+                  :loading="accel.testingGroups.has(group.id)"
+                  @click.stop="runGroupTest(group)"
+                >
+                  连通性测试
+                </a-button>
               </div>
             </template>
 
@@ -319,11 +355,25 @@ async function toggleEngine(): Promise<void> {
                   <a-checkbox :checked="isChecked(project)" @change="accel.toggle(project)" />
                   <span class="project-name">{{ project.name }}</span>
                   <a-tag v-if="project.serverSide" color="blue">服务端加速</a-tag>
+                  <span
+                    v-if="accel.probeResults[project.id]"
+                    class="delay"
+                    :class="delayClass(accel.probeResults[project.id])"
+                  >
+                    {{ accel.probeResults[project.id] }}
+                  </span>
                 </label>
                 <div v-if="project.items.length" class="sub-list">
                   <label v-for="sub in project.items" :key="sub.id" class="project-row sub">
                     <a-checkbox :checked="isChecked(sub)" @change="accel.toggle(sub)" />
                     <span class="project-name">{{ sub.name }}</span>
+                    <span
+                      v-if="accel.probeResults[sub.id]"
+                      class="delay"
+                      :class="delayClass(accel.probeResults[sub.id])"
+                    >
+                      {{ accel.probeResults[sub.id] }}
+                    </span>
                   </label>
                 </div>
               </div>
@@ -445,6 +495,29 @@ async function toggleEngine(): Promise<void> {
 
 .sub-list {
   margin: 2px 0 4px;
+}
+
+.group-test-btn {
+  margin-left: auto;
+}
+
+/* 延迟配色（对齐原版 DelayColor：≤1000 绿 / >1000 橙 / 失败红） */
+.delay {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.delay-ok {
+  color: #52c41a;
+}
+
+.delay-mid {
+  color: #faad14;
+}
+
+.delay-bad {
+  color: #ff4d4f;
 }
 
 .hint {

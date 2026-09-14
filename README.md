@@ -108,6 +108,9 @@ git push origin v0.1.0
 - Tauri 配置中 `beforeDevCommand` 与 `beforeBuildCommand` 已按当前仓库路径设定为 `pnpm --dir ../ui dev` 和 `pnpm --dir ../ui build`。
 - 发布脚本中的项目名已从原来其他项目的命名改为当前仓库的 `Watt Toolkit`。
 
+##
+参考项目:
+[https://github.com/WattToolkit/WattToolkit](https://github.com/WattToolkit/WattToolkit)
 ## 许可证
 
 本项目采用 GPL-3.0 许可证，详情见 [LICENSE](LICENSE)。

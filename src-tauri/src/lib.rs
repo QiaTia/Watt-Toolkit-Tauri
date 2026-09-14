@@ -107,6 +107,7 @@ pub fn run() {
             commands::accelerate::accelerate_refresh,
             commands::accelerate::accelerate_set_enabled,
             commands::accelerate::accelerate_get_rules,
+            commands::accelerate::accelerate_connectivity_test,
             commands::migrate::migration_get_report,
         ])
         .build(tauri::generate_context!())

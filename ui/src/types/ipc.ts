@@ -163,6 +163,19 @@ export interface AccelerateCatalogDto {
   source: string;
 }
 
+/* ========== 连通性测试（对齐原版 NetworkTestService.TestOpenUrlAsync） ========== */
+
+/** 连通性测试单项结果 */
+export interface ConnectivityTestItem {
+  host: string;
+  /** 完整收到 HTTP 响应（任意状态码均算连通） */
+  ok: boolean;
+  status?: number | null;
+  /** 总耗时（连接 + TLS + 请求 + 完整响应体），毫秒 */
+  latencyMs: number;
+  error?: string | null;
+}
+
 /* ========== 引擎启动参数（命令层 camelCase，嵌套领域模型 snake_case） ========== */
 
 export interface EngineStartParams {
