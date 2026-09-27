@@ -1,52 +1,67 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
+import { useI18n } from 'vue-i18n';
 import zhCN from 'ant-design-vue/es/locale/zh_CN';
+import zhTW from 'ant-design-vue/es/locale/zh_TW';
+import jaJP from 'ant-design-vue/es/locale/ja_JP';
+import enUS from 'ant-design-vue/es/locale/en_US';
+import frFR from 'ant-design-vue/es/locale/fr_FR';
 import theme from 'ant-design-vue/es/theme';
 import { useProxyStore } from '@/stores/proxy';
 import { useAppStore } from '@/stores/app';
 import { useSettingsStore } from '@/stores/settings';
 import { useCertStore } from '@/stores/cert';
+import { useThemeStore } from '@/stores/theme';
+import { i18n, type LocaleCode } from '@/locales';
+import AppHeader from '@/components/AppHeader.vue';
+import appIcon from '@/assets/app-icon.png';
 
 const route = useRoute();
 const router = useRouter();
+const { t } = useI18n();
 const proxy = useProxyStore();
 const appStore = useAppStore();
 const settings = useSettingsStore();
 const cert = useCertStore();
+const themeStore = useThemeStore();
 
 const collapsed = ref(false);
 
-/** 主导航（path → 标题，用于顶栏面包屑标题） */
-const navRoutes: ReadonlyArray<{ path: string; title: string }> = [
-  { path: '/', title: '首页' },
-  { path: '/accelerator', title: '网络加速' },
-  { path: '/settings', title: '设置' },
-  { path: '/about', title: '关于' },
+/** 主导航（path → 标题 key，用于顶栏标题） */
+const navRoutes: ReadonlyArray<{ path: string; titleKey: string }> = [
+  { path: '/', titleKey: 'nav.home' },
+  { path: '/accelerator', titleKey: 'nav.accelerator' },
+  { path: '/settings', titleKey: 'nav.settings' },
+  { path: '/about', titleKey: 'nav.about' },
 ];
 
 const selectedKeys = computed<string[]>(() => [route.path]);
-const currentTitle = computed(
-  () => navRoutes.find((r) => r.path === route.path)?.title ?? 'Watt Toolkit',
-);
+const currentTitle = computed(() => {
+  const key = navRoutes.find((r) => r.path === route.path)?.titleKey;
+  return key ? t(key) : 'Watt Toolkit';
+});
+
+/** antd 组件库文案（内置组件的内置文字）跟随语言切换 */
+const antdLocales: Record<LocaleCode, typeof zhCN> = {
+  'zh-Hans': zhCN,
+  'zh-Hant': zhTW,
+  ja: jaJP,
+  en: enUS,
+  fr: frFR,
+};
+const antdLocale = computed(() => antdLocales[i18n.global.locale.value as LocaleCode]);
 
 function onMenuClick(info: { key: string | number }): void {
   void router.push(String(info.key));
 }
 
-/* 跟随系统深色模式；antd 通过 algorithm 切换整套色板 */
-const prefersDark = ref(false);
-const schemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
-prefersDark.value = schemeQuery.matches;
-
-function onSchemeChange(e: MediaQueryListEvent): void {
-  prefersDark.value = e.matches;
-}
-
+/* 主题三态（浅色/深色/跟随系统）由 theme store 解析；antd 通过 algorithm 切换整套色板 */
 const themeConfig = computed(() => ({
-  algorithm: prefersDark.value ? theme.darkAlgorithm : theme.defaultAlgorithm,
+  algorithm: themeStore.isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
   token: {
-    colorPrimary: prefersDark.value ? '#4f8ef7' : '#3b82f6',
+    // 主色对齐应用图标渐变亮端（#247bc7）；暗色下提亮 25% 保证对比度
+    colorPrimary: themeStore.isDark ? '#5a9cd5' : '#247bc7',
     borderRadius: 8,
   },
 }));
@@ -67,21 +82,16 @@ const engineTagColor = computed(() => {
 });
 
 onMounted(() => {
-  schemeQuery.addEventListener('change', onSchemeChange);
   void appStore.load();
   // ensureLoaded 幂等去重：子页面可能更早发起加载
   void settings.ensureLoaded();
   void cert.refresh();
   void proxy.refreshState();
 });
-
-onUnmounted(() => {
-  schemeQuery.removeEventListener('change', onSchemeChange);
-});
 </script>
 
 <template>
-  <a-config-provider :locale="zhCN" :theme="themeConfig">
+  <a-config-provider :locale="antdLocale" :theme="themeConfig">
     <a-app>
       <a-layout class="shell">
         <a-layout-sider
@@ -94,7 +104,7 @@ onUnmounted(() => {
           class="shell-sider"
         >
           <div class="brand">
-            <span class="brand-mark">⚡</span>
+            <img :src="appIcon" :alt="$t('about.iconAlt')" class="brand-mark" />
             <span v-show="!collapsed" class="brand-text">Watt Toolkit</span>
           </div>
 
@@ -107,19 +117,19 @@ onUnmounted(() => {
           >
             <a-menu-item key="/">
               <template #icon><HomeOutlined /></template>
-              <span>首页</span>
+              <span>{{ $t('nav.home') }}</span>
             </a-menu-item>
             <a-menu-item key="/accelerator">
               <template #icon><RocketOutlined /></template>
-              <span>网络加速</span>
+              <span>{{ $t('nav.accelerator') }}</span>
             </a-menu-item>
             <a-menu-item key="/settings">
               <template #icon><SettingOutlined /></template>
-              <span>设置</span>
+              <span>{{ $t('nav.settings') }}</span>
             </a-menu-item>
             <a-menu-item key="/about">
               <template #icon><InfoCircleOutlined /></template>
-              <span>关于</span>
+              <span>{{ $t('nav.about') }}</span>
             </a-menu-item>
           </a-menu>
 
@@ -132,15 +142,11 @@ onUnmounted(() => {
         </a-layout-sider>
 
         <a-layout class="shell-body">
-          <a-layout-header class="shell-header">
-            <a-button type="text" class="collapse-trigger" @click="collapsed = !collapsed">
-              <template #icon>
-                <MenuUnfoldOutlined v-if="collapsed" />
-                <MenuFoldOutlined v-else />
-              </template>
-            </a-button>
-            <span class="header-title">{{ currentTitle }}</span>
-          </a-layout-header>
+          <AppHeader
+            :title="currentTitle"
+            :collapsed="collapsed"
+            @toggle="collapsed = !collapsed"
+          />
 
           <a-layout-content class="shell-content">
             <RouterView />
@@ -182,8 +188,11 @@ onUnmounted(() => {
 }
 
 .brand-mark {
-  font-size: 20px;
-  line-height: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .brand-text {
@@ -206,26 +215,6 @@ onUnmounted(() => {
 .shell-body {
   height: 100%;
   min-width: 0;
-}
-
-.shell-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 56px;
-  padding: 0 20px 0 8px;
-  background: var(--bg-card);
-  border-bottom: 1px solid var(--border);
-  line-height: normal;
-}
-
-.collapse-trigger {
-  font-size: 16px;
-}
-
-.header-title {
-  font-size: 16px;
-  font-weight: 600;
 }
 
 .shell-content {

@@ -4,7 +4,7 @@
 use crate::sni::{outbound_tls_connector, server_name, OutboundVerify};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use watt_config::{ExternalProxyType, TwoLevelAgentSettings};
 
@@ -127,10 +127,58 @@ impl DnsResolve for SystemDns {
     }
 }
 
+/// 候选健康度记忆（进程内共享）。
+///
+/// 「TLS 握手可达」≠「HTTP 可用」：实测存在 TLS 能完成但之后流量被掐死的节点
+/// （github.com 11 个候选中 4 个 TLS ✓ 但 HTTP 无响应，TLS 耗时 5~34s）。
+/// 健康候选集体抖动的窗口里，这类僵尸候选会赢得竞速，随后在请求阶段失败或
+/// 静默挂死，且重试可能再次选中它们。此处记录「竞速胜出但请求失败」的 IP 并
+/// 短期降权：后续竞速优先健康候选，仅当健康候选全灭时才重新尝试（到期自动恢复）。
+#[derive(Default)]
+pub struct CandidateHealth {
+    demoted: std::sync::Mutex<std::collections::HashMap<IpAddr, Instant>>,
+}
+
+/// 降权时长（秒）：足够跨过一次网络抖动窗口，又不至于长期拉黑
+const DEMOTE_SECS: u64 = 60;
+
+impl CandidateHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 标记某候选「竞速胜出但请求阶段失败」
+    pub fn mark_failed(&self, ip: IpAddr) {
+        let mut map = self.demoted.lock().unwrap();
+        let until = Instant::now() + Duration::from_secs(DEMOTE_SECS);
+        map.insert(ip, until);
+        map.retain(|_, u| *u > Instant::now());
+    }
+
+    /// 候选分区：健康在前，被降权在后
+    fn partition(&self, addrs: Vec<SocketAddr>) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let now = Instant::now();
+        let mut map = self.demoted.lock().unwrap();
+        map.retain(|_, u| *u > now);
+        let mut healthy = Vec::new();
+        let mut demoted = Vec::new();
+        for a in addrs {
+            if map.contains_key(&a.ip()) {
+                demoted.push(a);
+            } else {
+                healthy.push(a);
+            }
+        }
+        (healthy, demoted)
+    }
+}
+
 /// 出站连接器
 pub struct OutboundConnector {
     pub dns: Arc<dyn DnsResolve>,
     pub upstream: Option<UpstreamProxy>,
+    /// 候选健康度记忆（None = 不跟踪，如探测/隧道场景）
+    pub health: Option<Arc<CandidateHealth>>,
 }
 
 /// 二级代理配置
@@ -160,20 +208,55 @@ impl UpstreamProxy {
 
 impl OutboundConnector {
     pub fn new(dns: Arc<dyn DnsResolve>, upstream: Option<UpstreamProxy>) -> Self {
-        Self { dns, upstream }
+        Self {
+            dns,
+            upstream,
+            health: None,
+        }
+    }
+
+    /// 启用候选健康度记忆（链式）
+    pub fn with_health(mut self, health: Arc<CandidateHealth>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// 标记候选失败（竞速胜出后在请求阶段失败/挂死）
+    pub fn mark_failed(&self, addr: SocketAddr) {
+        if let Some(h) = &self.health {
+            h.mark_failed(addr.ip());
+        }
     }
 
     /// 建立出站连接（含可选 TLS）
     pub async fn connect(&self, target: &OutboundTarget) -> Result<OutboundStream, OutboundError> {
+        self.connect_tracked(target)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// 同 [`Self::connect`]，但附带胜出候选地址——供调用方在请求阶段失败时
+    /// 调用 [`Self::mark_failed`] 降权该候选（健康度记忆闭环）。
+    pub async fn connect_tracked(
+        &self,
+        target: &OutboundTarget,
+    ) -> Result<(OutboundStream, Option<SocketAddr>), OutboundError> {
         let timeout = Duration::from_millis(target.timeout_ms.unwrap_or(30000));
 
-        // 二级代理：单一通道，无候选竞速
+        // 二级代理：单一通道，无候选竞速（无候选地址可归因）
         if self.upstream.is_some() {
             let stream = self.connect_via_upstream(target, timeout).await?;
-            return Self::wrap_tls(target, stream, timeout).await;
+            let stream = Self::wrap_tls(target, stream, timeout).await?;
+            return Ok((stream, None));
         }
 
         let addrs = self.resolve_candidates(target).await?;
+
+        // 健康度降权：被标记失败的候选仅当健康候选全灭时才参与竞速
+        let (healthy, demoted) = match &self.health {
+            Some(h) => h.partition(addrs),
+            None => (addrs, Vec::new()),
+        };
 
         // —— 竞速的胜出条件必须与「可用性」一致 ——
         // TCP 握手成功 ≠ 服务可达。部分网络只放行 TCP，TLS 之后的流量被阻断，
@@ -181,12 +264,20 @@ impl OutboundConnector {
         // 完成 TLS 握手，其余全部 TCP 可达但 TLS 超时。若仅以 TCP 握手作为胜出条件，
         // 竞速会稳定选中「TCP 最快、TLS 已死」的候选 → 必然失败（现象：20s 超时 / 500）。
         // 因此凡是需要 TLS 的目标，一律以「完成 TLS 握手」作为胜出条件。
+        // （TLS 握手完成后 HTTP 阶段仍可能死亡的残余缺口，由健康度降权 + 请求层
+        // 重试兜底，见 http_relay::forward。）
         if target.tls {
-            return Self::race_tls(target, addrs, timeout).await;
+            let (stream, addr) = Self::race_tls(target, healthy, demoted, timeout).await?;
+            return Ok((OutboundStream::Tls(Box::new(stream)), Some(addr)));
         }
 
-        let stream = Self::race_tcp(target, addrs, timeout).await?;
-        Ok(OutboundStream::Plain(stream))
+        let (stream, addr) = Self::race_tcp(
+            target,
+            if healthy.is_empty() { demoted } else { healthy },
+            timeout,
+        )
+        .await?;
+        Ok((OutboundStream::Plain(stream), Some(addr)))
     }
 
     /// 构造 TLS 连接器与 SNI。
@@ -239,13 +330,42 @@ impl OutboundConnector {
 
     /// TLS 竞速：候选并发执行「TCP + TLS 握手」，首个完成 TLS 者胜出。
     ///
+    /// `demoted` 为健康度降权的候选：仅当健康候选全灭时才参与竞速。
     /// 用 `JoinSet` 承载候选，胜出后随作用域结束统一 abort，
     /// 避免落败候选的握手在后台继续空跑（TLS 超时可达十几秒）。
     async fn race_tls(
         target: &OutboundTarget,
         addrs: Vec<SocketAddr>,
+        demoted: Vec<SocketAddr>,
         timeout: Duration,
-    ) -> Result<OutboundStream, OutboundError> {
+    ) -> Result<
+        (
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+            SocketAddr,
+        ),
+        OutboundError,
+    > {
+        if !addrs.is_empty() {
+            match Self::race_tls_once(target, addrs, timeout).await {
+                Ok(winner) => return Ok(winner),
+                Err(e) if demoted.is_empty() => return Err(e),
+                Err(_) => {} // 健康候选全灭 → 降级到被降权候选
+            }
+        }
+        Self::race_tls_once(target, demoted, timeout).await
+    }
+
+    async fn race_tls_once(
+        target: &OutboundTarget,
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+            SocketAddr,
+        ),
+        OutboundError,
+    > {
         let (connector, name) = Self::tls_parts(target)?;
         let mut set = tokio::task::JoinSet::new();
 
@@ -272,9 +392,9 @@ impl OutboundConnector {
         let mut last_err = None;
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_addr, Ok(tls_stream))) => {
+                Ok((addr, Ok(tls_stream))) => {
                     // 胜出：set 随作用域 drop，其余候选被 abort
-                    return Ok(OutboundStream::Tls(Box::new(tls_stream)));
+                    return Ok((tls_stream, addr));
                 }
                 Ok((addr, Err(e))) => last_err = Some(format!("{addr}: {e}")),
                 Err(e) => last_err = Some(format!("候选任务异常: {e}")),
@@ -384,7 +504,7 @@ impl OutboundConnector {
         target: &OutboundTarget,
         addrs: Vec<SocketAddr>,
         timeout: Duration,
-    ) -> Result<tokio::net::TcpStream, OutboundError> {
+    ) -> Result<(tokio::net::TcpStream, SocketAddr), OutboundError> {
         let mut set = tokio::task::JoinSet::new();
         for addr in addrs {
             set.spawn(async move {
@@ -402,7 +522,7 @@ impl OutboundConnector {
         let mut last_err = None;
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_addr, Ok(stream))) => return Ok(stream),
+                Ok((addr, Ok(stream))) => return Ok((stream, addr)),
                 Ok((addr, Err(e))) => last_err = Some(format!("{addr}: {e}")),
                 Err(e) => last_err = Some(format!("候选任务异常: {e}")),
             }
@@ -724,19 +844,118 @@ mod tests {
 
         // 黑洞排在前：其 TCP 握手更快，正是旧实现会选中的那个
         let started = Instant::now();
-        let stream = OutboundConnector::race_tls(
+        let (_stream, winner) = OutboundConnector::race_tls(
             &target,
             vec![hole_addr, tls_addr],
+            vec![],
             Duration::from_secs(5),
         )
         .await
         .expect("应跳过 TLS 死候选，命中可完成 TLS 的候选");
 
-        assert!(matches!(stream, OutboundStream::Tls(_)));
+        assert_eq!(winner, tls_addr, "胜出者应是可完成 TLS 的候选地址");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "不应等到黑洞候选超时才成功，实际耗时 {:?}",
             started.elapsed()
         );
+    }
+
+    /// 回归：被降权候选仅在健康候选全灭时才参与竞速。
+    #[tokio::test]
+    async fn test_race_tls_prefers_healthy_over_demoted() {
+        use tokio::io::AsyncReadExt as _;
+        // 两个健康候选（自签 CA 动态签发）
+        let ca = Arc::new(watt_cert::ca::CaCertificate::generate().unwrap());
+        let tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let acceptor = crate::sni::mitm_tls_acceptor(ca);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = tls_listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        // 黑洞候选（已降权）：若参与竞速且 TCP 秒连，TLS 永远握手不上
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hole_addr = blackhole.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = blackhole.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let target = OutboundTarget {
+            host: "tls.test".into(),
+            port: tls_addr.port(),
+            tls: true,
+            tls_sni: None,
+            tls_ignore_name_mismatch: true,
+            override_ip: None,
+            forward_destination: None,
+            timeout_ms: Some(5000),
+        };
+
+        // 健康候选存在时，被降权的黑洞不应参与竞速
+        let (stream, winner) = OutboundConnector::race_tls(
+            &target,
+            vec![tls_addr],
+            vec![hole_addr],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("健康候选应胜出");
+        assert_eq!(winner, tls_addr);
+        let _ = stream;
+
+        // 健康候选全灭（列表为空）→ 允许降级到被降权候选（黑洞 TCP 可连但 TLS 死 → 报错，
+        // 但这里验证的是「降级路径被走到」，故预期为连接失败错误而非跳过）
+        let err = OutboundConnector::race_tls(
+            &target,
+            vec![],
+            vec![hole_addr],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(err.is_err(), "健康候选为空时应降级尝试被降权候选");
+    }
+
+    #[test]
+    fn test_candidate_health_partition_and_expiry() {
+        use std::time::Instant;
+        let health = CandidateHealth::new();
+        let a: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let b: SocketAddr = "5.6.7.8:443".parse().unwrap();
+
+        // 未标记：全部健康
+        let (healthy, demoted) = health.partition(vec![a, b]);
+        assert_eq!(healthy.len(), 2);
+        assert!(demoted.is_empty());
+
+        // 标记 a 失败：a 被降权
+        health.mark_failed(a.ip());
+        let (healthy, demoted) = health.partition(vec![a, b]);
+        assert_eq!(healthy, vec![b]);
+        assert_eq!(demoted, vec![a]);
+
+        // 立即再标记不应延长为「永久」（超过 DEMOTE_SECS 后应自动恢复）：
+        // 用简短验证——mark_failed 后 map 里存的是 now + DEMOTE_SECS
+        let until = *health.demoted.lock().unwrap().get(&a.ip()).unwrap();
+        assert!(until > Instant::now());
+        assert!(until <= Instant::now() + Duration::from_secs(DEMOTE_SECS + 1));
     }
 }

@@ -1,14 +1,23 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import AntApp from 'ant-design-vue/es/app';
+import { useI18n } from 'vue-i18n';
 import { useSettingsStore } from '@/stores/settings';
 import { useCertStore } from '@/stores/cert';
+import { useThemeStore, type ThemeMode } from '@/stores/theme';
+import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
 import type { ProxyMode } from '@/types/ipc';
 
 const settings = useSettingsStore();
 const cert = useCertStore();
-// 由 <a-app>（App.vue）提供的上下文创建，跟随全局主题
-const { message } = AntApp.useApp();
+// 主题/语言即时生效（localStorage 持久化），不走「保存设置」
+const theme = useThemeStore();
+const { t } = useI18n();
+
+/** 语言选择器双向绑定（写 localStorage + 切 i18n locale） */
+const language = computed<LocaleCode>({
+  get: () => getLocale(),
+  set: (v) => setLocale(v),
+});
 
 /** 证书操作错误（UAC 取消 / 引擎运行中等） */
 const certError = ref<string | null>(null);
@@ -85,27 +94,24 @@ const customDohAddress = nullableString(
   (v) => (settings.settings.dns.custom_doh_address = v),
 );
 
-const modeOptions: Array<{ value: ProxyMode; label: string }> = [
-  { value: 'Hosts', label: 'Hosts 模式' },
-  { value: 'System', label: '系统代理' },
-  { value: 'Pac', label: 'PAC 模式' },
-  { value: 'ProxyOnly', label: '仅代理端口' },
-];
+const modeOptions = computed<Array<{ value: ProxyMode; label: string }>>(() => [
+  { value: 'Hosts', label: t('accel.modes.hosts.label') },
+  { value: 'System', label: t('accel.modes.system.label') },
+  { value: 'Pac', label: t('accel.modes.pac.label') },
+  { value: 'ProxyOnly', label: t('accel.modes.proxyOnly.label') },
+]);
+
+const themeOptions = computed<Array<{ value: ThemeMode; label: string }>>(() => [
+  { value: 'light', label: t('settings.themeLight') },
+  { value: 'dark', label: t('settings.themeDark') },
+  { value: 'auto', label: t('settings.themeAuto') },
+]);
 
 const proxyTypeOptions: Array<{ value: string; label: string }> = [
   { value: 'HTTP', label: 'HTTP' },
   { value: 'SOCKS4', label: 'SOCKS4' },
   { value: 'SOCKS5', label: 'SOCKS5' },
 ];
-
-async function save(): Promise<void> {
-  const ok = await settings.save();
-  if (ok) {
-    void message.success('设置已保存');
-  } else {
-    void message.error('保存失败，请查看日志');
-  }
-}
 
 /** 包装证书操作：统一错误提示 */
 async function withCertError(action: () => Promise<void>): Promise<void> {
@@ -145,20 +151,46 @@ function formatTime(iso: string): string {
 
 <template>
   <div class="page">
-    <a-card :bordered="false" title="代理设置" class="panel">
+    <a-card :bordered="false" :title="$t('settings.generalTitle')" class="panel">
       <a-form layout="vertical">
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="代理模式">
+            <a-form-item :label="$t('settings.appearance')">
+              <a-segmented v-model:value="theme.mode" :options="themeOptions" />
+              <a-typography-paragraph type="secondary" class="field-hint">
+                {{ $t('settings.themeHint') }}
+              </a-typography-paragraph>
+            </a-form-item>
+          </a-col>
+          <a-col :xs="24" :md="12" :lg="8">
+            <a-form-item :label="$t('settings.language')">
+              <a-select
+                v-model:value="language"
+                :options="localeOptions.map((o) => ({ value: o.value, label: o.label }))"
+              />
+              <a-typography-paragraph type="secondary" class="field-hint">
+                {{ $t('settings.languageHint') }}
+              </a-typography-paragraph>
+            </a-form-item>
+          </a-col>
+        </a-row>
+      </a-form>
+    </a-card>
+
+    <a-card :bordered="false" :title="$t('settings.proxyTitle')" class="panel">
+      <a-form layout="vertical">
+        <a-row :gutter="16">
+          <a-col :xs="24" :md="12" :lg="8">
+            <a-form-item :label="$t('settings.proxyMode')">
               <a-select
                 v-model:value="settings.settings.proxy_mode"
                 :options="modeOptions"
-                placeholder="选择加速模式"
+                :placeholder="$t('settings.proxyModePlaceholder')"
               />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="正向代理端口">
+            <a-form-item :label="$t('settings.forwardPort')">
               <a-input-number
                 v-model:value="systemProxyPort"
                 :min="0"
@@ -168,7 +200,7 @@ function formatTime(iso: string): string {
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="HTTP→HTTPS 重定向 (80)">
+            <a-form-item :label="$t('settings.httpRedirect')">
               <a-switch v-model:checked="settings.settings.enable_http_proxy_to_https" />
             </a-form-item>
           </a-col>
@@ -176,12 +208,12 @@ function formatTime(iso: string): string {
 
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="启用 SOCKS5">
+            <a-form-item :label="$t('settings.socks5Enable')">
               <a-switch v-model:checked="settings.settings.socks5_proxy_enable" />
             </a-form-item>
           </a-col>
           <a-col v-if="settings.settings.socks5_proxy_enable" :xs="24" :md="12" :lg="8">
-            <a-form-item label="SOCKS5 端口">
+            <a-form-item :label="$t('settings.socks5Port')">
               <a-input-number
                 v-model:value="socks5ProxyPort"
                 :min="0"
@@ -194,11 +226,11 @@ function formatTime(iso: string): string {
       </a-form>
     </a-card>
 
-    <a-card :bordered="false" title="二级代理（上游）" class="panel">
+    <a-card :bordered="false" :title="$t('settings.twoLevelTitle')" class="panel">
       <a-form layout="vertical">
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="启用二级代理">
+            <a-form-item :label="$t('settings.twoLevelEnable')">
               <a-switch v-model:checked="settings.settings.two_level_agent.enable" />
             </a-form-item>
           </a-col>
@@ -206,22 +238,22 @@ function formatTime(iso: string): string {
 
         <a-row v-if="settings.settings.two_level_agent.enable" :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="协议类型">
+            <a-form-item :label="$t('settings.protocol')">
               <a-select
                 v-model:value="proxyType"
                 :options="proxyTypeOptions"
-                placeholder="默认 SOCKS5"
+                :placeholder="$t('settings.protocolPlaceholder')"
                 allow-clear
               />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="服务器地址">
+            <a-form-item :label="$t('settings.serverAddr')">
               <a-input v-model:value="twoLevelIp" placeholder="127.0.0.1" />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="端口">
+            <a-form-item :label="$t('settings.port')">
               <a-input-number
                 v-model:value="twoLevelPort"
                 :min="0"
@@ -231,34 +263,34 @@ function formatTime(iso: string): string {
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="用户名">
-              <a-input v-model:value="twoLevelUsername" placeholder="可选" />
+            <a-form-item :label="$t('settings.username')">
+              <a-input v-model:value="twoLevelUsername" :placeholder="$t('settings.optional')" />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="密码">
-              <a-input-password v-model:value="twoLevelPassword" placeholder="可选" />
+            <a-form-item :label="$t('settings.password')">
+              <a-input-password v-model:value="twoLevelPassword" :placeholder="$t('settings.optional')" />
             </a-form-item>
           </a-col>
         </a-row>
       </a-form>
     </a-card>
 
-    <a-card :bordered="false" title="DNS 设置" class="panel">
+    <a-card :bordered="false" :title="$t('settings.dnsTitle')" class="panel">
       <a-form layout="vertical">
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="自定义主 DNS">
+            <a-form-item :label="$t('settings.masterDns')">
               <a-input v-model:value="masterDns" placeholder="223.5.5.5" allow-clear />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item label="使用 DoH">
+            <a-form-item :label="$t('settings.useDoh')">
               <a-switch v-model:checked="settings.settings.dns.use_doh" />
             </a-form-item>
           </a-col>
           <a-col v-if="settings.settings.dns.use_doh" :xs="24" :md="12" :lg="8">
-            <a-form-item label="自定义 DoH 地址">
+            <a-form-item :label="$t('settings.dohAddr')">
               <a-input
                 v-model:value="customDohAddress"
                 placeholder="https://dns.alidns.com/dns-query"
@@ -270,27 +302,27 @@ function formatTime(iso: string): string {
       </a-form>
     </a-card>
 
-    <a-card v-if="cert.status" :bordered="false" title="CA 证书" class="panel">
+    <a-card v-if="cert.status" :bordered="false" :title="$t('settings.certTitle')" class="panel">
       <a-descriptions :column="{ xs: 1, sm: 2 }" size="small" bordered class="cert-desc">
-        <a-descriptions-item label="信任状态">
+        <a-descriptions-item :label="$t('settings.trustStatus')">
           <a-tag :color="cert.status.installed ? 'success' : 'warning'">
-            {{ cert.status.installed ? '已安装并信任' : '未安装' }}
+            {{ cert.status.installed ? $t('settings.trusted') : $t('settings.untrusted') }}
           </a-tag>
         </a-descriptions-item>
-        <a-descriptions-item label="剩余有效期">
+        <a-descriptions-item :label="$t('settings.daysRemaining')">
           <a-typography-text :type="cert.status.expired ? 'danger' : 'success'">
-            {{ cert.status.daysRemaining }} 天
+            {{ cert.status.daysRemaining }} {{ $t('common.daysUnit') }}
           </a-typography-text>
         </a-descriptions-item>
       </a-descriptions>
 
       <a-descriptions v-if="cert.info" :column="1" size="small" bordered class="cert-desc">
-        <a-descriptions-item label="主题">{{ cert.info.subject }}</a-descriptions-item>
-        <a-descriptions-item label="序列号">
+        <a-descriptions-item :label="$t('settings.subject')">{{ cert.info.subject }}</a-descriptions-item>
+        <a-descriptions-item :label="$t('settings.serial')">
           <span class="mono">{{ cert.info.serial }}</span>
         </a-descriptions-item>
-        <a-descriptions-item label="生效时间">{{ formatTime(cert.info.not_before) }}</a-descriptions-item>
-        <a-descriptions-item label="过期时间">{{ formatTime(cert.info.not_after) }}</a-descriptions-item>
+        <a-descriptions-item :label="$t('settings.notBefore')">{{ formatTime(cert.info.not_before) }}</a-descriptions-item>
+        <a-descriptions-item :label="$t('settings.notAfter')">{{ formatTime(cert.info.not_after) }}</a-descriptions-item>
         <a-descriptions-item label="SHA-1">
           <span class="mono fp">{{ groupFingerprint(cert.info.sha1) }}</span>
         </a-descriptions-item>
@@ -305,37 +337,34 @@ function formatTime(iso: string): string {
 
       <a-space :size="12" wrap>
         <a-button v-if="!cert.status.installed" type="primary" :loading="cert.busy" @click="installCa">
-          安装到系统信任存储
+          {{ $t('settings.install') }}
         </a-button>
         <a-popconfirm
           v-else
-          title="确定从系统信任存储移除 Watt Toolkit 根证书？"
-          ok-text="移除"
-          cancel-text="取消"
+          :title="$t('settings.uninstallConfirm')"
+          :ok-text="$t('settings.okRemove')"
+          :cancel-text="$t('settings.cancel')"
           @confirm="uninstallCa"
         >
-          <a-button danger :loading="cert.busy">移除信任</a-button>
+          <a-button danger :loading="cert.busy">{{ $t('settings.uninstall') }}</a-button>
         </a-popconfirm>
-        <a-button :loading="cert.busy" @click="exportCa">导出证书 (PEM)</a-button>
+        <a-button :loading="cert.busy" @click="exportCa">
+          {{ $t('settings.exportCert') }}
+        </a-button>
         <a-popconfirm
-          title="重新生成 CA 证书将使所有已签发证书失效，确定继续？"
-          ok-text="重新生成"
-          cancel-text="取消"
+          :title="$t('settings.regenerateConfirm')"
+          :ok-text="$t('settings.okRegenerate')"
+          :cancel-text="$t('settings.cancel')"
           @confirm="regenerateCa"
         >
-          <a-button danger :loading="cert.busy">重新生成</a-button>
+          <a-button danger :loading="cert.busy">{{ $t('settings.regenerate') }}</a-button>
         </a-popconfirm>
       </a-space>
 
       <a-typography-paragraph type="secondary" class="hint">
-        安装到系统信任存储是 HTTPS 加速（MITM）的前提，Windows 下安装会弹出 UAC 提权确认。
-        也可导出 PEM 后手动导入到「受信任的根证书颁发机构」。
+        {{ $t('settings.certHint') }}
       </a-typography-paragraph>
     </a-card>
-
-    <div class="save-bar">
-      <a-button type="primary" :loading="settings.saving" @click="save">保存设置</a-button>
-    </div>
   </div>
 </template>
 
@@ -366,13 +395,9 @@ function formatTime(iso: string): string {
   font-size: 13px;
 }
 
-.save-bar {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 12px 0;
+.field-hint {
+  margin: 10px 0 0;
+  font-size: 13px;
 }
 
 .mono {

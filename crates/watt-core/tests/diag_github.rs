@@ -96,6 +96,10 @@ async fn diag_github_via_hosts_mode() {
     let resp = String::from_utf8_lossy(&buf);
     let first_line = resp.lines().next().unwrap_or("<empty>").to_string();
     println!("[diag] github.com 响应: {first_line}");
+    println!(
+        "[diag] 响应体前 300 字节: {}",
+        String::from_utf8_lossy(&buf[..buf.len().min(300)])
+    );
     assert!(
         resp.starts_with("HTTP/1.1 200"),
         "经 MITM 访问 github.com 失败，首行: {first_line}"
@@ -211,8 +215,9 @@ async fn diag_github_via_mitm_http2() {
         .unwrap()
         .to_bytes();
     println!(
-        "[diag-h2] (4) github.com :status = {status}  body = {} bytes",
-        body.len()
+        "[diag-h2] (4) github.com :status = {status}  body = {} bytes  body首200字节: {}",
+        body.len(),
+        String::from_utf8_lossy(&body[..body.len().min(200)])
     );
     assert_eq!(
         status, 200,

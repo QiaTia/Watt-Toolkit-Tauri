@@ -316,6 +316,7 @@ impl ProxyEngine {
             server_side_proxy_token: config.server_side_proxy_token.clone(),
             dns,
             stats: self.stats.clone(),
+            candidate_health: Arc::new(crate::outbound::CandidateHealth::new()),
             hooks: Some(hooks),
         });
 

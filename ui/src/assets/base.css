@@ -8,7 +8,7 @@
   --bg-card: #ffffff;
   --text: rgba(0, 0, 0, 0.88);
   --text-secondary: rgba(0, 0, 0, 0.45);
-  --primary: #3b82f6;
+  --primary: #247bc7; /* 图标渐变亮端 */
   --success: #22c55e;
   --danger: #ef4444;
   --warning: #f59e0b;
@@ -17,17 +17,17 @@
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #000000;
-    --bg-card: #141414;
-    --text: rgba(255, 255, 255, 0.85);
-    --text-secondary: rgba(255, 255, 255, 0.45);
-    --primary: #4f8ef7;
-    --border: #303030;
+/* 深色令牌：theme store 把解析结果同步到 <html class="dark">（light/dark/auto 三态的统一出口），
+   不再用 prefers-color-scheme 媒体查询 —— 手动选浅色时系统偏好不得反向覆盖 */
+:root.dark {
+  --bg: #000000;
+  --bg-card: #141414;
+  --text: rgba(255, 255, 255, 0.85);
+  --text-secondary: rgba(255, 255, 255, 0.45);
+  --primary: #5a9cd5; /* 图标主色暗色提亮版 */
+  --border: #303030;
 
-    color-scheme: dark;
-  }
+  color-scheme: dark;
 }
 
 html,

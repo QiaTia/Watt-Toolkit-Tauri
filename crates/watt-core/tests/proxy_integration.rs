@@ -17,6 +17,7 @@ use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::Request;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use watt_cert::ca::CaCertificate;
@@ -207,6 +208,72 @@ async fn with_timeout<F: std::future::Future>(f: F) -> F::Output {
 }
 
 // ———— 1. 明文 HTTP 反向代理 ————
+
+/// 回归：连接级失败（转发后对端在响应前断开，hyper 报「connection closed before
+/// message completed」）必须对幂等请求（GET）自动换连接重试一次，而不是把错误页
+/// 甩给浏览器。真实场景：竞速胜出的候选握手后被 RST（按 SNI 限速/阻断）、CDN 偶发断连。
+#[tokio::test]
+async fn test_forward_retries_on_connection_closed_before_response() {
+    with_timeout(async {
+        // 上游：首个连接收到请求后直接断开（不回任何响应），后续连接正常响应
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits = hits_task.clone();
+                tokio::spawn(async move {
+                    // 读到请求头结束（GET 无 body）
+                    let mut buf = [0u8; 4096];
+                    let mut got = Vec::new();
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                got.extend_from_slice(&buf[..n]);
+                                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // 模拟连接级失败：收到请求后直接断开
+                        return;
+                    }
+                    let body = b"retry-ok";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let rule = rule_for(
+            "retry.example.com",
+            Some(format!("http://127.0.0.1:{}/", upstream.port())),
+        );
+        let (proxy_addr, _shutdown) = spawn_http_proxy(relay_ctx(vec![rule])).await;
+
+        let resp = raw_http_get(proxy_addr, "retry.example.com", "/a", &[]).await;
+        assert!(resp.contains("200 OK"), "首次连接失败应重试成功: {resp}");
+        assert!(resp.contains("retry-ok"), "应返回重试后的正常响应: {resp}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "应有两次上游连接（首次被断开 + 重试成功）"
+        );
+    })
+    .await;
+}
 
 #[tokio::test]
 async fn test_http_reverse_proxy_full_chain() {

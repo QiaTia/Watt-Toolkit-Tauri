@@ -6,12 +6,73 @@
 //! - Stopwatch 计时 → 延迟毫秒；异常 → 失败；> 20s → Timeout（UI 层判定）；
 //! - 分组内全部域名**并发**测试。
 //!
-//! 与原版一致的探测路径：系统解析（含 hosts）+ 系统证书存储。
-//! Hosts 模式加速开启时，域名解析到 127.0.0.1 → 本地 443 反代 → 出站，
-//! 因此测得的正是**加速后的真实打开耗时**（原版同语义）；
-//! 证书校验走系统根证书（已安装本引擎 CA 时 MITM 证书可通过）。
+//! 与原版一致的探测路径：系统解析（含 hosts）+ 系统证书存储 + **系统代理**。
+//! Hosts 模式加速开启时，域名解析到 127.0.0.1 → 本地 443 反代 → 出站；
+//! System/PAC/ProxyOnly 模式加速开启时，系统代理指向本引擎正向代理，
+//! 探测经 CONNECT 隧道走加速链路——两种模式测得的都是**加速后的真实打开耗时**。
 
 use std::time::{Duration, Instant};
+
+/// 当前系统代理地址（`host:port`），对齐原版 .NET HttpClient 的默认行为：
+/// HttpClientHandler 默认遵循 WinINET 系统代理设置（含 PAC）。
+///
+/// - `ProxyEnable=1` → 解析 `ProxyServer`（支持 `host:port` 与 `http=..;https=..` 两种形态）
+/// - 否则若有 `AutoConfigURL` 且指向**本引擎 PAC**（回环地址）→ 取其端口
+///   （完整 PAC 求值不做：本工具的 PAC 只会把加速域名导向本引擎正向代理，
+///   而被测域名必然是加速域名，直接走正向代理即等价）
+/// - 都没有 → None（直连，原语义）
+pub fn system_proxy_addr() -> Option<(String, u16)> {
+    let (enabled, server, pac_url) = crate::system_proxy::get_system_proxy_status();
+
+    let parse_host_port = |s: &str| -> Option<(String, u16)> {
+        let (h, p) = s.rsplit_once(':')?;
+        let h = h.trim().trim_matches(['[', ']']).to_string();
+        if h.is_empty() {
+            return None;
+        }
+        p.trim().parse::<u16>().ok().map(|p| (h, p))
+    };
+
+    if enabled {
+        if let Some(s) = server {
+            // ProxyServer 形态 1：host:port；形态 2：http=host:port;https=host:port;...
+            if s.contains('=') {
+                for part in s.split(';') {
+                    let part = part.trim();
+                    let rest = part
+                        .strip_prefix("https=")
+                        .or_else(|| part.strip_prefix("http="))
+                        .or_else(|| part.strip_prefix("socks="));
+                    if let Some(rest) = rest {
+                        if let Some(v) = parse_host_port(rest) {
+                            return Some(v);
+                        }
+                    }
+                }
+            } else if let Some(v) = parse_host_port(&s) {
+                return Some(v);
+            }
+        }
+    }
+
+    // PAC：仅识别本引擎写入的回环地址 PAC
+    if let Some(url) = pac_url {
+        // 形如 http://127.0.0.1:26501/pac
+        let rest = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))?;
+        let authority = rest.split('/').next()?;
+        let (h, p) = authority.rsplit_once(':')?;
+        let is_loopback = h == "127.0.0.1" || h.eq_ignore_ascii_case("localhost");
+        if is_loopback {
+            if let Ok(port) = p.parse::<u16>() {
+                return Some(("127.0.0.1".into(), port));
+            }
+        }
+    }
+
+    None
+}
 
 /// 单个域名探测结果（原版 `ProxyDomainViewModel.DelayMillseconds` 的结构化版）
 #[derive(Debug, Clone)]
@@ -24,6 +85,58 @@ pub struct ProbeResult {
     /// 总耗时（连接 + TLS + 请求 + 完整响应体）
     pub latency_ms: u64,
     pub error: Option<String>,
+}
+
+/// 经 HTTP 正向代理建立 CONNECT 隧道（对齐 HttpClient 走系统代理的路径）。
+async fn connect_via_http_proxy(
+    proxy: &(String, u16),
+    host: &str,
+    timeout: Duration,
+) -> Result<tokio::net::TcpStream, String> {
+    let mut tcp = tokio::time::timeout(
+        timeout,
+        tokio::net::TcpStream::connect((proxy.0.as_str(), proxy.1)),
+    )
+    .await
+    .map_err(|_| "代理连接超时".to_string())?
+    .map_err(|e| format!("代理连接失败: {e}"))?;
+
+    let req = format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(timeout, tcp.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "CONNECT 写入超时".to_string())?
+        .map_err(|e| format!("CONNECT 写入失败: {e}"))?;
+
+    // 读到响应头结束（\r\n\r\n），校验 2xx
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = tokio::time::timeout(timeout, tcp.read(&mut chunk))
+            .await
+            .map_err(|_| "CONNECT 响应超时".to_string())?
+            .map_err(|e| format!("CONNECT 响应读取失败: {e}"))?;
+        if n == 0 {
+            return Err("代理提前关闭连接".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err("CONNECT 响应异常".into());
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let status_ok = head
+        .split_whitespace()
+        .nth(1)
+        .map(|c| c.starts_with('2'))
+        .unwrap_or(false);
+    if !status_ok {
+        return Err(format!("隧道建立失败: {}", head.lines().next().unwrap_or("")));
+    }
+    Ok(tcp)
 }
 
 /// 单域名 HTTPS 探测（443 端口，`timeout` 为总预算）。
@@ -44,11 +157,18 @@ pub async fn probe_https(host: &str, timeout: Duration) -> ProbeResult {
     }
 
     let deadline = async {
-        // 1. TCP：系统解析（hosts 劫持时得到 127.0.0.1，即测加速链路）
-        let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host.as_str(), 443)))
+        // 1. TCP：系统代理存在（含本引擎 PAC）→ 走代理隧道，测得「浏览器真实打开」路径；
+        //    否则直连系统解析（hosts 劫持时即 Hosts 模式加速链路）
+        let tcp = match system_proxy_addr() {
+            Some(proxy) => connect_via_http_proxy(&proxy, &host, timeout).await,
+            None => tokio::time::timeout(
+                timeout,
+                tokio::net::TcpStream::connect((host.as_str(), 443)),
+            )
             .await
             .map_err(|_| "超时".to_string())
-            .and_then(|r| r.map_err(|e| format!("TCP 连接失败: {e}")));
+            .and_then(|r| r.map_err(|e| format!("TCP 连接失败: {e}"))),
+        };
         let tcp = match tcp {
             Ok(s) => s,
             Err(e) => return Err(e),
@@ -161,6 +281,61 @@ mod tests {
         assert!(!is_timeout(500, true));
         // 失败不算 Timeout（显示 error）
         assert!(!is_timeout(25_000, false));
+    }
+
+    #[test]
+    fn test_parse_proxy_server_forms() {
+        // 形态 1：host:port
+        assert_eq!(
+            parse_for_test("127.0.0.1:26501"),
+            Some(("127.0.0.1".into(), 26501))
+        );
+        // 形态 2：分协议
+        assert_eq!(
+            parse_for_test("http=127.0.0.1:8888;https=127.0.0.1:8888"),
+            Some(("127.0.0.1".into(), 8888))
+        );
+        // 端口缺失 → None
+        assert_eq!(parse_for_test("127.0.0.1"), None);
+    }
+
+    /// 仅测解析逻辑（不触注册表）：提取 system_proxy_addr 内的解析分支
+    fn parse_for_test(s: &str) -> Option<(String, u16)> {
+        let parse_host_port = |s: &str| -> Option<(String, u16)> {
+            let (h, p) = s.rsplit_once(':')?;
+            let h = h.trim().trim_matches(['[', ']']).to_string();
+            if h.is_empty() {
+                return None;
+            }
+            p.trim().parse::<u16>().ok().map(|p| (h, p))
+        };
+        if s.contains('=') {
+            for part in s.split(';') {
+                let part = part.trim();
+                let rest = part
+                    .strip_prefix("https=")
+                    .or_else(|| part.strip_prefix("http="));
+                if let Some(rest) = rest {
+                    if let Some(v) = parse_host_port(rest) {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        } else {
+            parse_host_port(s)
+        }
+    }
+
+    #[test]
+    fn test_pac_url_parse_loopback() {
+        // 本引擎 PAC：回环 → 取端口
+        let url = "http://127.0.0.1:26501/pac";
+        let rest = url.strip_prefix("http://").unwrap();
+        let authority = rest.split('/').next().unwrap();
+        let (h, p) = authority.rsplit_once(':').unwrap();
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p.parse::<u16>().unwrap(), 26501);
     }
 
     /// 真实链路验证：Google 翻译域名经系统解析 + 备用池路径可达。

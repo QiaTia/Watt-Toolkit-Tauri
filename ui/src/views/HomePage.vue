@@ -51,9 +51,7 @@ const badgeStatus = computed(() => {
             </a-typography-text>
             <a-typography-text v-else type="secondary">
               {{
-                proxy.isRunning
-                  ? '流量正通过本地代理转发'
-                  : '前往「网络加速」选择项目并一键加速'
+                proxy.isRunning ? $t('home.runningHint') : $t('home.idleHint')
               }}
             </a-typography-text>
           </div>
@@ -61,10 +59,10 @@ const badgeStatus = computed(() => {
 
         <a-row v-if="proxy.isRunning" :gutter="32" class="hero-stats">
           <a-col>
-            <a-statistic title="上行" :value="formatBytes(proxy.stats.upBytes)" />
+            <a-statistic :title="$t('common.up')" :value="formatBytes(proxy.stats.upBytes)" />
           </a-col>
           <a-col>
-            <a-statistic title="下行" :value="formatBytes(proxy.stats.downBytes)" />
+            <a-statistic :title="$t('common.down')" :value="formatBytes(proxy.stats.downBytes)" />
           </a-col>
         </a-row>
       </div>
@@ -72,20 +70,20 @@ const badgeStatus = computed(() => {
 
     <a-row :gutter="16" class="grid">
       <a-col :xs="24" :lg="12">
-        <a-card :bordered="false" title="证书状态" class="info-card">
+        <a-card :bordered="false" :title="$t('home.certTitle')" class="info-card">
           <template #extra>
             <a-tag v-if="cert.status" :color="certHealthy ? 'success' : 'error'">
-              {{ cert.status.expired ? '已过期' : '有效' }}
+              {{ cert.status.expired ? $t('home.expired') : $t('home.valid') }}
             </a-tag>
           </template>
           <a-descriptions v-if="cert.status" :column="1" size="small">
-            <a-descriptions-item label="主题">{{ cert.status.subject }}</a-descriptions-item>
-            <a-descriptions-item label="序列号">
+            <a-descriptions-item :label="$t('home.subject')">{{ cert.status.subject }}</a-descriptions-item>
+            <a-descriptions-item :label="$t('home.serial')">
               <span class="mono">{{ cert.status.serial }}</span>
             </a-descriptions-item>
-            <a-descriptions-item label="剩余有效期">
+            <a-descriptions-item :label="$t('home.daysRemaining')">
               <a-typography-text :type="certHealthy ? 'success' : 'danger'">
-                {{ cert.status.daysRemaining }} 天
+                {{ cert.status.daysRemaining }} {{ $t('common.daysUnit') }}
               </a-typography-text>
             </a-descriptions-item>
           </a-descriptions>
@@ -94,11 +92,11 @@ const badgeStatus = computed(() => {
       </a-col>
 
       <a-col :xs="24" :lg="12">
-        <a-card :bordered="false" title="应用信息" class="info-card">
+        <a-card :bordered="false" :title="$t('home.appTitle')" class="info-card">
           <a-descriptions v-if="app.info" :column="1" size="small">
-            <a-descriptions-item label="版本">{{ app.info.version }}</a-descriptions-item>
-            <a-descriptions-item label="平台">{{ app.info.platform }}</a-descriptions-item>
-            <a-descriptions-item label="数据目录">
+            <a-descriptions-item :label="$t('home.version')">{{ app.info.version }}</a-descriptions-item>
+            <a-descriptions-item :label="$t('home.platform')">{{ app.info.platform }}</a-descriptions-item>
+            <a-descriptions-item :label="$t('home.dataDir')">
               <span class="mono">{{ app.info.dataDir }}</span>
             </a-descriptions-item>
           </a-descriptions>
@@ -140,6 +138,13 @@ const badgeStatus = computed(() => {
 
 .grid {
   margin-top: 16px;
+}
+
+/* gutter 只产生水平间距；窄屏（<lg）两卡片竖排时需补垂直间距 */
+@media (max-width: 991px) {
+  .grid :deep(.ant-col + .ant-col) {
+    margin-top: 16px;
+  }
 }
 
 .info-card {

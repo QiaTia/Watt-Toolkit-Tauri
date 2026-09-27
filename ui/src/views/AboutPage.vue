@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useAppStore } from '@/stores/app';
+import appIcon from '@/assets/app-icon.png';
 
 const app = useAppStore();
 </script>
@@ -8,25 +9,25 @@ const app = useAppStore();
   <div class="page">
     <a-card :bordered="false" class="about-card">
       <div class="about">
-        <a-avatar :size="72" shape="square" class="brand-avatar">⚡</a-avatar>
+        <img :src="appIcon" :alt="$t('about.iconAlt')" class="brand-avatar" />
         <a-typography-title :level="3" class="brand-name">Watt Toolkit</a-typography-title>
         <a-tag v-if="app.info" color="blue" class="brand-tag">
           v{{ app.info.version }} · Tauri
         </a-tag>
         <a-typography-paragraph type="secondary" class="desc">
-          跨平台桌面应用，为 Steam 等游戏平台提供网络加速、脚本扩展等工具箱。
+          {{ $t('about.desc') }}
         </a-typography-paragraph>
 
         <a-descriptions v-if="app.info" :column="1" size="small" bordered class="meta">
-          <a-descriptions-item label="平台">{{ app.info.platform }}</a-descriptions-item>
-          <a-descriptions-item label="数据目录">
+          <a-descriptions-item :label="$t('about.platform')">{{ app.info.platform }}</a-descriptions-item>
+          <a-descriptions-item :label="$t('about.dataDir')">
             <span class="mono">{{ app.info.dataDir }}</span>
           </a-descriptions-item>
         </a-descriptions>
 
         <a-typography-paragraph type="secondary" class="license">
-          本项目基于 GPL-3.0 许可证开源。
-          原项目：
+          {{ $t('about.license') }}
+          {{ $t('about.sourceLabel') }}
           <a href="https://github.com/WattToolkit/WattToolkit" target="_blank" rel="noopener">
             WattToolkit/WattToolkit
           </a>
@@ -50,8 +51,12 @@ const app = useAppStore();
 }
 
 .brand-avatar {
-  font-size: 40px;
-  background: color-mix(in srgb, var(--primary) 15%, transparent);
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+  display: block;
+  /* 深浅两态下都与卡片背景有区分 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 
 .brand-name {

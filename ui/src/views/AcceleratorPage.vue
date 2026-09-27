@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import AntApp from 'ant-design-vue/es/app';
 import { useProxyStore } from '@/stores/proxy';
 import { useSettingsStore } from '@/stores/settings';
@@ -14,6 +15,7 @@ import type {
 const proxy = useProxyStore();
 const settings = useSettingsStore();
 const accel = useAccelerateStore();
+const { t } = useI18n();
 const { message } = AntApp.useApp();
 
 // 必须在 setup 顶层调用：放到 onMounted 里会因没有活跃组件实例而注册失败，
@@ -36,23 +38,23 @@ const modeOptions = computed<ReadonlyArray<{ value: ProxyMode; label: string; de
   () => [
     {
       value: 'Hosts',
-      label: 'Hosts 模式',
-      description: '修改 hosts 指向本地 443 反代（需 443 端口空闲，写入 hosts 可能需要管理员权限）',
+      label: t('accel.modes.hosts.label'),
+      description: t('accel.modes.hosts.desc'),
     },
     {
       value: 'System',
-      label: '系统代理',
-      description: `设置系统代理走本地端口 ${forwardPort.value}，全局生效，无需占用 443`,
+      label: t('accel.modes.system.label'),
+      description: t('accel.modes.system.desc', { port: forwardPort.value }),
     },
     {
       value: 'Pac',
-      label: 'PAC 模式',
-      description: `自动配置脚本按域名分流，仅加速域名走代理（端口 ${forwardPort.value}）`,
+      label: t('accel.modes.pac.label'),
+      description: t('accel.modes.pac.desc', { port: forwardPort.value }),
     },
     {
       value: 'ProxyOnly',
-      label: '仅代理端口',
-      description: `不修改系统设置，手动将浏览器/客户端代理指向 127.0.0.1:${forwardPort.value}`,
+      label: t('accel.modes.proxyOnly.label'),
+      description: t('accel.modes.proxyOnly.desc', { port: forwardPort.value }),
     },
   ],
 );
@@ -64,15 +66,8 @@ const selectedMode = computed({
     settings.settings.proxy_mode = mode;
     // 持久化：引擎按下发的 mode 运行，而 mode 又决定接入面（Hosts/PAC/系统代理），
     // 只改内存会导致「磁盘写 A 模式、引擎跑 B 模式」，重启后行为悄悄漂移。
+    // 运行中 segmented 已禁用（先停止加速才能切换），模式变更必然发生在停止态。
     void settings.save();
-    // 运行中切换模式：接入面需重建才会生效（规则相同，但监听/系统设置不同），
-    // 故停掉再按新模式拉起，避免用户以为切换无效。
-    if (proxy.isRunning) {
-      void (async () => {
-        await proxy.stop();
-        await toggleEngine();
-      })();
-    }
   },
 });
 
@@ -114,14 +109,41 @@ const visibleGroups = computed<AccelerateProjectGroup[]>(() => {
   return out;
 });
 
-/* ========== 分组展开（a-collapse 受控） ========== */
+/* ========== 分组展开（a-collapse 受控，持久化到 localStorage） ========== */
 
 const activeKeys = ref<Array<string | number>>([]);
+const COLLAPSE_KEY = 'accel.active_groups';
+
+function readSavedCollapse(): string[] | null {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCollapse(): void {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(activeKeys.value.map(String)));
+  } catch {
+    // 容量/隐私模式异常不影响功能
+  }
+}
+
+watch(activeKeys, saveCollapse, { deep: true });
 
 watch(
   () => accel.catalog,
   (c) => {
     if (!c) return;
+    // 已有持久化的展开状态 → 恢复（用户手动折叠/展开优先于默认值）
+    const saved = readSavedCollapse();
+    if (saved) {
+      activeKeys.value = saved;
+      return;
+    }
     // 默认展开：云端标记 show 或已含勾选项
     const next: string[] = [];
     for (const g of accel.groups) {
@@ -132,9 +154,14 @@ watch(
   { immediate: true },
 );
 
-// 检索时自动展开所有命中分组，避免「搜到了但折叠着」
+// 检索时自动展开所有命中分组，避免「搜到了但折叠着」；退出检索恢复持久化状态
 watch(searching, (on) => {
-  if (on) activeKeys.value = visibleGroups.value.map((g) => g.id);
+  if (on) {
+    activeKeys.value = visibleGroups.value.map((g) => g.id);
+  } else {
+    const saved = readSavedCollapse();
+    if (saved) activeKeys.value = saved;
+  }
 });
 
 /** 勾选项目数 */
@@ -186,11 +213,11 @@ async function runGroupTest(group: AccelerateProjectGroup): Promise<void> {
   }
   const res = await accel.testGroup(group);
   if (res === 'empty') {
-    message.warning('没有可测试的项目：请先勾选该分组内的加速项');
+    message.warning(t('accel.testEmpty'));
     return;
   }
   if (res === 'fail-all') {
-    message.error('当前测试项全部未通过，请检查网络链接状况，以及代理设置里的设置项是否正常。');
+    message.error(t('accel.testAllFailed'));
   }
 }
 
@@ -240,14 +267,18 @@ async function toggleEngine(): Promise<void> {
 
 <template>
   <div class="page">
-    <a-card :bordered="false" title="加速模式" class="panel">
+    <a-card :bordered="false" :title="$t('accel.modeTitle')" class="panel">
       <a-segmented
         v-model:value="selectedMode"
         :options="modeOptions.map((o) => ({ value: o.value, label: o.label }))"
+        :disabled="proxy.isRunning"
         size="large"
         block
       />
-      <a-typography-paragraph type="secondary" class="mode-desc">
+      <a-typography-paragraph v-if="proxy.isRunning" type="warning" class="mode-desc">
+        {{ $t('accel.runningSwitchHint') }}
+      </a-typography-paragraph>
+      <a-typography-paragraph v-else type="secondary" class="mode-desc">
         {{ currentModeDescription }}
       </a-typography-paragraph>
     </a-card>
@@ -268,15 +299,15 @@ async function toggleEngine(): Promise<void> {
           :loading="proxy.isBusy"
           @click="toggleEngine"
         >
-          {{ proxy.isRunning ? '停止加速' : '一键加速' }}
+          {{ proxy.isRunning ? $t('accel.stop') : $t('accel.start') }}
         </a-button>
       </div>
       <a-row v-if="proxy.isRunning" :gutter="32" class="stats-row">
         <a-col>
-          <a-statistic title="上行" :value="formatBytes(proxy.stats.upBytes)" />
+          <a-statistic :title="$t('common.up')" :value="formatBytes(proxy.stats.upBytes)" />
         </a-col>
         <a-col>
-          <a-statistic title="下行" :value="formatBytes(proxy.stats.downBytes)" />
+          <a-statistic :title="$t('common.down')" :value="formatBytes(proxy.stats.downBytes)" />
         </a-col>
       </a-row>
     </a-card>
@@ -284,9 +315,9 @@ async function toggleEngine(): Promise<void> {
     <a-card :bordered="false" class="panel">
       <template #title>
         <a-space :size="8">
-          加速项目
+          {{ $t('accel.projectsTitle') }}
           <a-tag v-if="accel.source" :color="accel.source === 'cloud' ? 'success' : 'warning'">
-            {{ accel.source === 'cloud' ? '云端' : '本地缓存' }}
+            {{ accel.source === 'cloud' ? $t('accel.sourceCloud') : $t('accel.sourceCache') }}
           </a-tag>
         </a-space>
       </template>
@@ -294,34 +325,34 @@ async function toggleEngine(): Promise<void> {
         <a-space :size="8">
           <a-input-search
             v-model:value="keyword"
-            placeholder="搜索加速项目"
+            :placeholder="$t('accel.searchPlaceholder')"
             allow-clear
             class="search-input"
           />
           <a-button v-if="!isAllSelected" :disabled="accel.loading" @click="accel.setAll(true)">
-            全选
+            {{ $t('accel.selectAll') }}
           </a-button>
           <a-button v-else :disabled="accel.loading" @click="accel.setAll(false)">
-            清空
+            {{ $t('accel.clearAll') }}
           </a-button>
           <a-button :loading="refreshing || accel.loading" @click="refreshCatalog">
-            刷新列表
+            {{ $t('accel.refresh') }}
           </a-button>
         </a-space>
       </template>
 
       <a-alert v-if="accel.error" type="error" show-icon class="catalog-alert">
-        <template #message>加速项目加载失败：{{ accel.error }}</template>
+        <template #message>{{ $t('accel.loadFailed', { error: accel.error }) }}</template>
       </a-alert>
 
       <a-skeleton v-if="accel.loading && !accel.catalog" active :paragraph="{ rows: 5 }" />
 
       <template v-else>
         <a-typography-paragraph type="secondary" class="catalog-hint">
-          已勾选 {{ checkedCount }} / {{ totalCount }} 项
+          {{ $t('accel.checkedSummary', { checked: checkedCount, total: totalCount }) }}
         </a-typography-paragraph>
 
-        <a-empty v-if="visibleGroups.length === 0" description="没有匹配的加速项目" />
+        <a-empty v-if="visibleGroups.length === 0" :description="$t('accel.noMatch')" />
 
         <a-collapse v-else v-model:active-key="activeKeys" :bordered="false" class="groups">
           <a-collapse-panel v-for="group in visibleGroups" :key="group.id">
@@ -344,7 +375,7 @@ async function toggleEngine(): Promise<void> {
                   :loading="accel.testingGroups.has(group.id)"
                   @click.stop="runGroupTest(group)"
                 >
-                  连通性测试
+                  {{ $t('accel.connectivityTest') }}
                 </a-button>
               </div>
             </template>
@@ -354,7 +385,7 @@ async function toggleEngine(): Promise<void> {
                 <label class="project-row">
                   <a-checkbox :checked="isChecked(project)" @change="accel.toggle(project)" />
                   <span class="project-name">{{ project.name }}</span>
-                  <a-tag v-if="project.serverSide" color="blue">服务端加速</a-tag>
+                  <a-tag v-if="project.serverSide" color="blue">{{ $t('accel.serverSide') }}</a-tag>
                   <span
                     v-if="accel.probeResults[project.id]"
                     class="delay"
@@ -383,12 +414,9 @@ async function toggleEngine(): Promise<void> {
       </template>
     </a-card>
 
-    <a-card :bordered="false" title="说明" class="panel">
+    <a-card :bordered="false" :title="$t('accel.hintTitle')" class="panel">
       <a-typography-paragraph type="secondary" class="hint">
-        System / PAC / ProxyOnly 模式监听本地正向代理端口 {{ forwardPort }}，
-        PAC 脚本地址为 http://127.0.0.1:{{ forwardPort }}/pac；
-        Hosts 模式将加速域名写入 hosts 并在本地 443 做 TLS 反代（停止时自动还原）。
-        代理端口可在「设置 → 代理设置」中修改。
+        {{ $t('accel.hint', { port: forwardPort }) }}
       </a-typography-paragraph>
     </a-card>
   </div>

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { computed, onUnmounted, ref } from 'vue';
 import { engineGetState, engineGetStats, engineStart, engineStop } from '@/api';
+import { i18n } from '@/locales';
 import type { EngineStartParams, EngineStateDto, FlowStatsDto } from '@/types/ipc';
 
 /** 代理引擎状态 store */
@@ -19,17 +20,18 @@ export const useProxyStore = defineStore('proxy', () => {
   );
 
   const stateLabel = computed(() => {
+    const t = i18n.global.t;
     switch (state.value.type) {
       case 'stopped':
-        return '已停止';
+        return t('state.stopped');
       case 'starting':
-        return '启动中…';
+        return t('state.starting');
       case 'running':
-        return '加速运行中';
+        return t('state.running');
       case 'stopping':
-        return '停止中…';
+        return t('state.stopping');
       case 'error':
-        return '错误';
+        return t('state.error');
     }
   });
 

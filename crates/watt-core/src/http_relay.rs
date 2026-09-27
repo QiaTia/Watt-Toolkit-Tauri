@@ -5,7 +5,7 @@
 
 use crate::inject::{inject_scripts, ContentCompression};
 use crate::local_domain::LocalDomainHandler;
-use crate::outbound::{OutboundConnector, OutboundTarget, UpstreamProxy};
+use crate::outbound::{CandidateHealth, OutboundConnector, OutboundTarget, UpstreamProxy};
 use crate::stats::FlowStats;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -13,6 +13,7 @@ use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue, HOST, USER_AGENT};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use std::sync::Arc;
+use std::time::Duration;
 use watt_config::domain_rule::DomainRule;
 use watt_config::DomainRules;
 use watt_script::hooks::{
@@ -35,6 +36,8 @@ pub struct RelayContext {
     pub server_side_proxy_token: Option<String>,
     pub dns: Arc<watt_dns::DnsResolver>,
     pub stats: Arc<FlowStats>,
+    /// 候选健康度记忆：请求阶段失败的出站候选短期降权（跨请求共享）
+    pub candidate_health: Arc<CandidateHealth>,
     /// 服务端脚本钩子引擎（Phase 4b；None = 无脚本能力）
     pub hooks: Option<Arc<HookEngine>>,
 }
@@ -57,6 +60,7 @@ impl RelayContext {
             server_side_proxy_token: None,
             dns: Arc::new(watt_dns::DnsResolver::system()),
             stats: Arc::new(FlowStats::default()),
+            candidate_health: Arc::new(CandidateHealth::new()),
             hooks: None,
         }
     }
@@ -336,22 +340,11 @@ impl RelayContext {
         let connector = OutboundConnector::new(
             Arc::new(RelayDnsAdapter(self.dns.clone())),
             self.upstream.clone(),
-        );
-        let stream = connector
-            .connect(&target)
-            .await
-            .map_err(|e| e.to_string())?;
+        )
+        .with_health(self.candidate_health.clone());
 
-        // —— HTTP/1.1 出站握手 ——
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                .await
-                .map_err(|e| format!("出站握手失败: {e}"))?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-
-        // 构造出站请求（origin-form，对齐 YARP：请求行仅 path_and_query，Host 指向目标权威）
+        // 构造出站请求模板（origin-form，对齐 YARP：请求行仅 path_and_query，
+        // Host 指向目标权威）。headers 每次连接尝试克隆复用。
         let outbound_path = destination_uri
             .path_and_query()
             .map(|p| p.as_str().to_string())
@@ -360,34 +353,118 @@ impl RelayContext {
             .authority()
             .map(|a| a.as_str().to_string())
             .unwrap_or_else(|| host.to_string());
-        let mut outbound_builder = Request::builder()
-            .method(parts.method.clone())
-            .uri(outbound_path)
-            .header(HOST, &outbound_authority);
+        let mut template_headers = HeaderMap::new();
+        template_headers.insert(
+            HOST,
+            HeaderValue::from_str(&outbound_authority).map_err(|e| e.to_string())?,
+        );
         for (k, v) in parts.headers.iter() {
             let name = k.as_str();
             if k == HOST || is_hop_by_hop(name) {
                 continue;
             }
-            outbound_builder = outbound_builder.header(k, v);
+            template_headers.insert(k.clone(), v.clone());
         }
-        let outbound_req = outbound_builder.body(body).map_err(|e| e.to_string())?;
 
         // 统计上行
-        self.stats
-            .add_up(outbound_req.size_hint().exact().unwrap_or(0));
+        self.stats.add_up(body.size_hint().exact().unwrap_or(0));
 
-        let response = sender
-            .send_request(outbound_req)
-            .await
-            .map_err(|e| format!("请求失败: {e}"))?;
+        // —— 转发（连接级失败对幂等请求自动重试一次）——
+        // TLS 竞速胜出 ≠ 连接可用：部分网络在握手完成后对首个 HTTP 数据注入 RST
+        // （按 SNI 限速/阻断），或 CDN 偶发断连，hyper 表现为「connection closed
+        // before message completed」。原版 C# 的 SocketsHttpHandler 对连接级失败
+        // 内建自动重试；此处对 GET/HEAD 对齐该语义：换一条新连接（重新竞速出站）再试。
+        // 连接建立阶段（connect）失败不重试——竞速已穷尽全部候选，重试只会加倍超时。
+        // 失败的候选经 mark_failed 短期降权，重试与其他后续请求不再优先选中它。
+        let idempotent = matches!(parts.method, Method::GET | Method::HEAD);
+        let header_wait = Duration::from_millis(target.timeout_ms.unwrap_or(30_000));
+        let mut body_opt = Some(body);
+        let mut outcome: Option<(hyper::http::response::Parts, Bytes)> = None;
+        for attempt in 0..2 {
+            let (stream, winner) = connector
+                .connect_tracked(&target)
+                .await
+                .map_err(|e| e.to_string())?;
 
-        let (mut resp_parts, resp_body) = response.into_parts();
-        let mut body_bytes = resp_body
-            .collect()
-            .await
-            .map_err(|e| format!("读取响应失败: {e}"))?
-            .to_bytes();
+            // —— HTTP/1.1 出站握手 ——
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                    .await
+                    .map_err(|e| format!("出站握手失败: {e}"))?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let req_body = body_opt.take().unwrap_or_else(|| {
+                // 重试路径：GET/HEAD 实际无 body，补一个空的
+                Full::new(Bytes::new()).map_err(|e| match e {}).boxed()
+            });
+            let mut outbound_builder = Request::builder()
+                .method(parts.method.clone())
+                .uri(outbound_path.as_str());
+            for (k, v) in &template_headers {
+                outbound_builder = outbound_builder.header(k, v);
+            }
+            let outbound_req = outbound_builder.body(req_body).map_err(|e| e.to_string())?;
+
+            // 响应头等待超时：把「僵尸候选静默挂死」从无限等待转为可重试错误。
+            // 幂等请求（GET/HEAD）或小 body 请求适用；大 body 上传可能本身就很慢，不设限。
+            // body 读取（collect）不设超时，避免误伤大文件下载。
+            let small_body = outbound_req
+                .body()
+                .size_hint()
+                .exact()
+                .is_some_and(|n| n < 64 * 1024);
+            let sent = if idempotent || small_body {
+                match tokio::time::timeout(header_wait, sender.send_request(outbound_req)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        if let Some(a) = winner {
+                            connector.mark_failed(a);
+                        }
+                        if attempt == 0 && idempotent {
+                            tracing::warn!("上游响应头等待超时，换连接重试: {host}");
+                            continue;
+                        }
+                        return Err(format!("等待上游响应头超时（{header_wait:?}）"));
+                    }
+                }
+            } else {
+                sender.send_request(outbound_req).await
+            };
+
+            let res = async {
+                let (resp_parts, resp_body) = sent?.into_parts();
+                let bytes = resp_body.collect().await?.to_bytes();
+                Ok::<_, hyper::Error>((resp_parts, bytes))
+            }
+            .await;
+
+            match res {
+                Ok(pair) => {
+                    outcome = Some(pair);
+                    break;
+                }
+                Err(e) => {
+                    // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
+                    // （RST 等，hyper display 为「connection error」）。
+                    // 注意 is_closed() 只匹配 ChannelClosed（我方通道关闭），不覆盖 Kind::Io。
+                    let transient =
+                        e.is_incomplete_message() || is_io_error(&e) || e.is_body_write_aborted();
+                    if transient {
+                        if let Some(a) = winner {
+                            connector.mark_failed(a);
+                        }
+                    }
+                    if attempt == 0 && idempotent && transient {
+                        tracing::warn!("出站连接中断，换连接重试: {host} ({e})");
+                        continue;
+                    }
+                    return Err(format!("请求失败: {e}"));
+                }
+            }
+        }
+        let (mut resp_parts, mut body_bytes) = outcome.expect("重试循环退出后必有转发结果");
 
         self.stats.add_down(body_bytes.len() as u64 + 128);
 
@@ -787,6 +864,19 @@ fn error_response(msg: &str) -> Response<Full<Bytes>> {
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Full::new(Bytes::from(msg.to_string())))
         .unwrap()
+}
+
+/// hyper 未公开 `Kind::Io` 判定（display 为「connection error」）。
+/// 沿 cause 链找 `std::io::Error`——Body 类错误也会包裹底层 Io 错误。
+fn is_io_error(e: &hyper::Error) -> bool {
+    let mut src: &(dyn std::error::Error + 'static) = e;
+    while let Some(s) = src.source() {
+        if s.is::<std::io::Error>() {
+            return true;
+        }
+        src = s;
+    }
+    false
 }
 
 /// 逐跳头（Connection 及其注册的头 + 常见逐跳头），代理转发时必须剥离
