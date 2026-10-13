@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "net.steampp.watttoolkit",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../ui dev",
-    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm --dir ../ui dev --host 127.0.0.1",
+    "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "pnpm --dir ../ui build",
     "frontendDist": "../ui/dist"
   },

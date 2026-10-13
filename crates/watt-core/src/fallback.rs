@@ -72,16 +72,42 @@ const GOOGLE_TRANSLATE_IPS: &[&str] = &[
     "120.253.253.250",
 ];
 
+/// Figma 全系（www / static / cdn / s3-alpha-sig / api）备用 IP：CloudFront
+/// 任播边缘段。2026-10 实测：任意 99.86.x 边缘 IP 凭 SNI + Host 对全部
+/// figma.com 加速域均出具有效证书（静态资源经覆盖 IP 取回内容与直连一致）。
+/// 99.86.24.5 实测不可达，不入池；个别 IP 失效由竞速自动跳过。
+const FIGMA_CF_IPS: &[&str] = &[
+    "99.86.18.30",
+    "99.86.18.5",
+    "99.86.18.28",
+    "99.86.18.67",
+    "99.86.19.5",
+    "99.86.20.5",
+    "99.86.21.5",
+    "99.86.22.5",
+    "99.86.23.5",
+];
+
+/// `api.figma.com` 的 AWS Global Accelerator 任播段（原生路径，实测最快）。
+/// 该段仅对 api.figma.com 有效（GA 任播 IP 按加速器绑定），只对 api 域返回。
+const FIGMA_API_GA_IPS: &[&str] = &[
+    "13.35.190.56",
+    "13.35.190.115",
+    "13.35.190.109",
+    "13.35.190.39",
+];
+
 /// 返回该 host 的备用 IP 列表（无匹配时为空）。
 ///
 /// 匹配按后缀进行，更具体的服务段优先：
 /// `*.githubusercontent.com` / `*.githubassets.com` 各有独立 IP 段，
-/// 不能与 `*.github.com` 混用。
+/// 不能与 `*.github.com` 混用；`api.figma.com` 走 Global Accelerator 段
+/// （前置）+ CloudFront 段兜底，其余 `*.figma.com` 走 CloudFront 段。
 pub fn fallback_ips(host: &str) -> Vec<IpAddr> {
     let host = host.split(':').next().unwrap_or(host);
     let host = host.trim_end_matches('.').to_ascii_lowercase();
 
-    let pool: &[&str] =
+    let pool: Vec<&str> =
         if host == "translate.googleapis.com"
             || host.ends_with(".translate.googleapis.com")
             || host == "translate.gstatic.com"
@@ -89,13 +115,22 @@ pub fn fallback_ips(host: &str) -> Vec<IpAddr> {
             || host == "translate.google.com"
             || host.ends_with(".translate.google.com")
         {
-            GOOGLE_TRANSLATE_IPS
+            GOOGLE_TRANSLATE_IPS.to_vec()
+        } else if host == "api.figma.com" || host.ends_with(".api.figma.com") {
+            // GA 任播段为原生路径（前置），CloudFront 边缘段兜底
+            FIGMA_API_GA_IPS
+                .iter()
+                .copied()
+                .chain(FIGMA_CF_IPS.iter().copied())
+                .collect()
+        } else if host == "figma.com" || host.ends_with(".figma.com") {
+            FIGMA_CF_IPS.to_vec()
         } else if host == "githubusercontent.com" || host.ends_with(".githubusercontent.com") {
-            GITHUB_USERCONTENT_IPS
+            GITHUB_USERCONTENT_IPS.to_vec()
         } else if host == "githubassets.com" || host.ends_with(".githubassets.com") {
-            GITHUB_ASSETS_IPS
+            GITHUB_ASSETS_IPS.to_vec()
         } else if host == "github.com" || host.ends_with(".github.com") {
-            GITHUB_WEB_IPS
+            GITHUB_WEB_IPS.to_vec()
         } else {
             return Vec::new();
         };
@@ -167,5 +202,57 @@ mod tests {
                 "{host} 应命中 Google 翻译段"
             );
         }
+    }
+
+    #[test]
+    fn test_figma_hosts_hit_cf_pool() {
+        for host in [
+            "www.figma.com",
+            "static.figma.com",
+            "cdn.figma.com",
+            "s3-alpha-sig.figma.com",
+            "figma.com",
+        ] {
+            let ips = fallback_ips(host);
+            assert!(!ips.is_empty(), "{host} 应有备用 IP");
+            assert!(
+                ips.iter().any(|ip| ip.to_string() == "99.86.18.30"),
+                "{host} 应命中 CloudFront 边缘段"
+            );
+        }
+    }
+
+    #[test]
+    fn test_figma_api_uses_ga_pool_first() {
+        let ips = fallback_ips("api.figma.com");
+        assert!(!ips.is_empty());
+        // GA 任播段前置（原生路径）
+        assert_eq!(ips[0].to_string(), "13.35.190.56", "GA 段应前置");
+        assert!(ips.iter().any(|ip| ip.to_string() == "13.35.190.39"));
+        // CloudFront 段兜底追加
+        assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
+        assert_eq!(ips.len(), FIGMA_API_GA_IPS.len() + FIGMA_CF_IPS.len());
+    }
+
+    #[test]
+    fn test_figma_pools_do_not_leak_to_other_domains() {
+        // 非 figma 域不得命中 Figma 池
+        for host in ["example.com", "google.com", "www.google.com", "github.com"] {
+            let ips = fallback_ips(host);
+            assert!(
+                !ips.iter().any(|ip| ip.to_string().starts_with("99.86.")),
+                "{host} 不应命中 CloudFront 段"
+            );
+            assert!(
+                !ips.iter().any(|ip| ip.to_string().starts_with("13.35.")),
+                "{host} 不应命中 GA 段"
+            );
+        }
+    }
+
+    #[test]
+    fn test_figma_case_and_port_insensitive() {
+        assert_eq!(fallback_ips("WWW.Figma.com").len(), FIGMA_CF_IPS.len());
+        assert_eq!(fallback_ips("www.figma.com:443").len(), FIGMA_CF_IPS.len());
     }
 }
