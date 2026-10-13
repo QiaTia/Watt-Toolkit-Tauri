@@ -46,7 +46,9 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 9
+          # 与本地工具链一致：ui/pnpm-workspace.yaml 仅含 allowBuilds 配置（无 packages 字段），
+          # pnpm 9 会报 "packages field missing or empty"，pnpm 10+ 支持 config-only workspace 文件
+          version: 11
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
