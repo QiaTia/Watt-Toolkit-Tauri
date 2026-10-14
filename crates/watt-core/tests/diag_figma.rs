@@ -74,12 +74,12 @@ async fn mitm_get(
 async fn diag_figma_via_hosts_mode() {
     let ca = Arc::new(CaCertificate::generate().unwrap());
 
-    // 生产路径：内置 Figma 分组 → 勾选全部 5 项 → 引擎规则
+    // 生产路径：内置 Figma 分组 → 勾选全部 7 项 → 引擎规则
     let group = watt_cloud::builtin::figma_group();
     let ids: Vec<String> = group.items.iter().map(|i| i.id.clone()).collect();
     let catalog = watt_cloud::model::AccelerateCatalog::new(vec![group]);
     let rules = catalog.to_domain_rules(Some(&ids));
-    assert_eq!(rules.len(), 5, "Figma 分组应展平为 5 条规则");
+    assert_eq!(rules.len(), 7, "Figma 分组应展平为 7 条规则");
 
     // 临时 hosts（绝不触碰系统 hosts 文件）
     let dir = std::env::temp_dir().join(format!("watt-diag-figma-{}", std::process::id()));
@@ -102,7 +102,7 @@ async fn diag_figma_via_hosts_mode() {
         .expect("引擎启动失败");
     assert!(matches!(engine.state(), EngineState::Running { .. }));
 
-    // 1) hosts 已写入 5 个 figma 加速域
+    // 1) hosts 已写入 7 个 figma 加速域
     let hosts = std::fs::read_to_string(&hosts_path).unwrap();
     for domain in [
         "www.figma.com",
@@ -110,10 +110,12 @@ async fn diag_figma_via_hosts_mode() {
         "s3-alpha-sig.figma.com",
         "static.figma.com",
         "cdn.figma.com",
+        "verify.figma.com",
+        "errors.figma.com",
     ] {
         assert!(hosts.contains(domain), "hosts 未写入 {domain}:\n{hosts}");
     }
-    println!("[diag-figma] hosts 已写入 5 个 figma 加速域");
+    println!("[diag-figma] hosts 已写入 7 个 figma 加速域");
 
     let connector = ca_trusting_connector(&ca);
 
@@ -144,7 +146,25 @@ async fn diag_figma_via_hosts_mode() {
         "经 MITM 访问 static.figma.com 应为 403（根路径拒绝），首行: {first_line}"
     );
 
-    // 5) stop 后必须还原 hosts（不留黑洞）
+    // 5) 人验域：Arkose 帧经 CF 覆盖 IP 应 200（日志症状 ERR_CONNECTION_CLOSED）
+    let resp = mitm_get(&connector, https_port, "verify.figma.com", "/arkose_frame.html").await;
+    let first_line = resp.lines().next().unwrap_or("<empty>").to_string();
+    println!("[diag-figma] verify.figma.com 响应: {first_line}");
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "经 MITM 访问 verify.figma.com/arkose_frame.html 应为 200，首行: {first_line}"
+    );
+
+    // 6) Sentry 上报域：403（根路径拒绝）即证明 S3 分发可达
+    let resp = mitm_get(&connector, https_port, "errors.figma.com", "/").await;
+    let first_line = resp.lines().next().unwrap_or("<empty>").to_string();
+    println!("[diag-figma] errors.figma.com 响应: {first_line}");
+    assert!(
+        resp.starts_with("HTTP/1.1 403"),
+        "经 MITM 访问 errors.figma.com 应为 403（根路径拒绝），首行: {first_line}"
+    );
+
+    // 7) stop 后必须还原 hosts（不留黑洞）
     engine.stop().await.unwrap();
     assert_eq!(engine.state(), EngineState::Stopped);
     let after = std::fs::read_to_string(&hosts_path).unwrap();

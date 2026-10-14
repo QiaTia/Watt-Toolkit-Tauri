@@ -61,6 +61,14 @@ async function onSave(): Promise<void> {
 
 .collapse-trigger {
   font-size: 16px;
+  /* 明确前景色：默认 text 按钮图标色可能随主题过浅，与头部背景混为一体 */
+  color: var(--text);
+}
+
+.collapse-trigger:hover,
+.collapse-trigger:focus-visible {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
 }
 
 .header-title {

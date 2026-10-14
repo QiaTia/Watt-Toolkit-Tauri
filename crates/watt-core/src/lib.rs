@@ -9,6 +9,7 @@
 
 pub mod connect_test;
 pub mod engine;
+pub mod access_log;
 pub mod fallback;
 pub mod forward_proxy;
 pub mod http_relay;
@@ -21,6 +22,8 @@ pub mod port_diag;
 pub mod sni;
 pub mod stats;
 pub mod system_proxy;
+pub mod upgrade;
 
 pub use engine::{EngineConfig, EngineState, ProxyEngine};
 pub use stats::FlowStats;
+pub use access_log::{AccessLogEntry, AccessLogFilter, AccessLogPage, AccessLogStore, Disposition};

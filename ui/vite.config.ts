@@ -14,8 +14,10 @@ export default defineConfig({
     // 编译期自动补 import，未用到的组件不进包。
     // importStyle 必须为 false —— v4 起样式由 CSS-in-JS 运行时注入，
     // 开启后插件会去找并不存在的 `es/xxx/style/css` 目录导致构建失败。
+    // resolveIcons 必须为 true —— 否则 <HomeOutlined /> 等 @ant-design/icons-vue
+    // 图标不会被自动导入，模板里渲染为空（折叠侧栏/顶栏按钮看不到图标）。
     Components({
-      resolvers: [AntDesignVueResolver({ importStyle: false })],
+      resolvers: [AntDesignVueResolver({ importStyle: false, resolveIcons: true })],
       dts: 'src/components.d.ts',
     }),
   ],

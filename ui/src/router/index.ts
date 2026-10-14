@@ -25,6 +25,12 @@ const router = createRouter({
       meta: { title: '设置', icon: '⚙️' },
     },
     {
+      path: '/logs',
+      name: 'logs',
+      component: () => import('@/views/LogsPage.vue'),
+      meta: { title: '日志', icon: '📄' },
+    },
+    {
       path: '/about',
       name: 'about',
       component: () => import('@/views/AboutPage.vue'),

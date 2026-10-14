@@ -4,6 +4,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AccelerateCatalogDto,
+  AccessLogFilter,
+  AccessLogPage,
   AppInfo,
   CertificateInfo,
   CertStatusDto,
@@ -13,6 +15,8 @@ import type {
   EngineStateDto,
   FlowStatsDto,
   ProxySettings,
+  RuntimeLogFilter,
+  RuntimeLogPage,
 } from '@/types/ipc';
 
 /* 应用 */
@@ -103,4 +107,34 @@ export function accelerateGetRules(enabledIds: string[]): Promise<DomainRule[]> 
 /** 分组连通性测试：并发对每个域名发起完整 HTTPS GET 并计时 */
 export function accelerateConnectivityTest(hosts: string[]): Promise<ConnectivityTestItem[]> {
   return invoke('accelerate_connectivity_test', { hosts });
+}
+
+/* 日志 */
+
+/** 查询代理访问日志（倒序 + 过滤 + 分页） */
+export function proxyAccessLogs(
+  filter: AccessLogFilter,
+  page: number,
+  pageSize: number,
+): Promise<AccessLogPage> {
+  return invoke('proxy_access_logs', { filter, page, pageSize });
+}
+
+/** 清空代理访问日志 */
+export function proxyAccessLogsClear(): Promise<void> {
+  return invoke('proxy_access_logs_clear');
+}
+
+/** 查询应用运行日志（tracing 采集，倒序 + 过滤 + 分页） */
+export function runtimeLogs(
+  filter: RuntimeLogFilter,
+  page: number,
+  pageSize: number,
+): Promise<RuntimeLogPage> {
+  return invoke('runtime_logs', { filter, page, pageSize });
+}
+
+/** 清空应用运行日志 */
+export function runtimeLogsClear(): Promise<void> {
+  return invoke('runtime_logs_clear');
 }

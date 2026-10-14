@@ -5,6 +5,7 @@
 
 use crate::inject::{inject_scripts, ContentCompression};
 use crate::local_domain::LocalDomainHandler;
+use crate::access_log::{now_ms, AccessLogEntry, AccessLogStore, Disposition, DEFAULT_CAPACITY};
 use crate::outbound::{CandidateHealth, OutboundConnector, OutboundTarget, UpstreamProxy};
 use crate::stats::FlowStats;
 use http_body_util::combinators::BoxBody;
@@ -40,6 +41,8 @@ pub struct RelayContext {
     pub candidate_health: Arc<CandidateHealth>,
     /// 服务端脚本钩子引擎（Phase 4b；None = 无脚本能力）
     pub hooks: Option<Arc<HookEngine>>,
+    /// 代理访问日志（每个经代理的请求记录一条，供 UI 查询）
+    pub access_log: Arc<AccessLogStore>,
 }
 
 impl RelayContext {
@@ -62,20 +65,61 @@ impl RelayContext {
             stats: Arc::new(FlowStats::default()),
             candidate_health: Arc::new(CandidateHealth::new()),
             hooks: None,
+            access_log: Arc::new(AccessLogStore::new(DEFAULT_CAPACITY)),
         }
     }
 
-    /// 处理单个请求（MITM 明文 HTTP 层）
+    /// 处理单个请求（MITM 明文 HTTP 层）：计时 + 记录访问日志，主体委派 `handle_request_inner`
     pub async fn handle_request(
         self: &Arc<Self>,
         req: Request<Incoming>,
         scheme: &str,
     ) -> Response<Full<Bytes>> {
+        let started = std::time::Instant::now();
         let host = request_host(&req);
+        let method = req.method().clone();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let up_bytes = req
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let (resp, disposition) = self.handle_request_inner(req, scheme, &host).await;
+
+        let status = resp.status().as_u16();
+        let down_bytes = resp.body().size_hint().exact().unwrap_or(0);
+        self.access_log.push(AccessLogEntry {
+            ts_ms: now_ms(),
+            host,
+            method: method.to_string(),
+            path,
+            status,
+            up_bytes,
+            down_bytes,
+            latency_ms: started.elapsed().as_millis() as u64,
+            disposition,
+        });
+        resp
+    }
+
+    /// 请求处理主体：返回响应 + 处置分类（供访问日志记录）
+    async fn handle_request_inner(
+        self: &Arc<Self>,
+        req: Request<Incoming>,
+        scheme: &str,
+        host: &str,
+    ) -> (Response<Full<Bytes>>, Disposition) {
+        let host = host.to_string();
 
         // —— 本地域名 / 注入脚本路径短路 ——
         if LocalDomainHandler::should_handle(&host, req.uri().path()) {
-            return self.local.handle(req, &host).await;
+            return (self.local.handle(req, &host).await, Disposition::Local);
         }
 
         let url = format!(
@@ -106,12 +150,21 @@ impl RelayContext {
         let Some((rule, is_default)) = matched else {
             // 未匹配：二级代理全局转发 或 404
             if self.two_level_agent_enable {
-                return self
-                    .forward_global(req, scheme, &host)
-                    .await
-                    .unwrap_or_else(|e| error_response(&format!("转发失败: {e}")));
+                return (
+                    self.forward_global(req, scheme, &host)
+                        .await
+                        .unwrap_or_else(|e| error_response(&format!("转发失败: {e}"))),
+                    Disposition::Unmatched,
+                );
             }
-            return not_found_response();
+            return (not_found_response(), Disposition::Unmatched);
+        };
+
+        // 命中具体规则 or default 规则（供日志处置分类）
+        let disp = if is_default {
+            Disposition::Default
+        } else {
+            Disposition::Matched
         };
 
         // —— DNS 污染判定（default 规则） ——
@@ -120,10 +173,16 @@ impl RelayContext {
         if is_default && !self.only_enable_proxy_script {
             if let Some(ip) = self.dns.resolve_first_clean(&host).await {
                 if watt_dns::is_polluted_ip(&ip) {
-                    return error_response(&watt_dns::pollution::pollution_error_body(&host));
+                    return (
+                        error_response(&watt_dns::pollution::pollution_error_body(&host)),
+                        disp,
+                    );
                 }
             } else {
-                return error_response(&watt_dns::pollution::pollution_error_body(&host));
+                return (
+                    error_response(&watt_dns::pollution::pollution_error_body(&host)),
+                    disp,
+                );
             }
         }
 
@@ -135,9 +194,12 @@ impl RelayContext {
             for (k, v) in &static_response.headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            return builder
-                .body(Full::new(Bytes::from(static_response.body.clone())))
-                .unwrap_or_else(|_| error_response("静态响应构造失败"));
+            return (
+                builder
+                    .body(Full::new(Bytes::from(static_response.body.clone())))
+                    .unwrap_or_else(|_| error_response("静态响应构造失败")),
+                disp,
+            );
         }
 
         // —— HTTP→HTTPS 重定向（对齐原版 Response.Redirect 的 302 临时跳转；
@@ -150,11 +212,14 @@ impl RelayContext {
                     .map(|p| p.as_str())
                     .unwrap_or("/")
             );
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(hyper::header::LOCATION, location)
-                .body(Full::new(Bytes::new()))
-                .unwrap();
+            return (
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(hyper::header::LOCATION, location)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+                disp,
+            );
         }
 
         // —— 转发 ——
@@ -162,8 +227,8 @@ impl RelayContext {
             .forward(req, scheme, &host, &url, &rule, &scripts, is_script_inject)
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => error_response(&format!("转发失败: {e}")),
+            Ok(resp) => (resp, disp),
+            Err(e) => (error_response(&format!("转发失败: {e}")), disp),
         }
     }
 
@@ -797,6 +862,18 @@ impl HookFetch for RelayFetch {
 
 /// Destination 解析（对齐 GetDestinationPrefix + YARP MakeDestinationAddress）。
 /// 返回完整出站 URI：前缀路径 + 原始请求 path_and_query。
+///
+/// `resolve_destination_pub` 为公开包装（供 upgrade 隧道的目标解析复用，
+/// 保持两条路径的 destination 语义一致）。
+pub fn resolve_destination_pub(
+    scheme: &str,
+    host: &str,
+    original: Uri,
+    destination: Option<&str>,
+) -> Uri {
+    resolve_destination(scheme, host, original, destination)
+}
+
 fn resolve_destination(scheme: &str, host: &str, original: Uri, destination: Option<&str>) -> Uri {
     // 原始请求 path_and_query
     let raw = original
@@ -901,7 +978,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// （ALPN 协商为 h2）的请求会得到空 host → 域名规则失配且不满足 default 规则的
 /// `host.contains('.')` 判定 → 回落 `not_found_response()`，症状是「加速后所有网站
 /// 都返回 404 空页」。故两者都取，Host 头优先以保持 HTTP/1.1 原有行为。
-fn request_host<B>(req: &Request<B>) -> String {
+pub fn request_host<B>(req: &Request<B>) -> String {
     if let Some(host) = req
         .headers()
         .get(HOST)

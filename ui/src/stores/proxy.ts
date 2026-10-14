@@ -1,8 +1,12 @@
 import { defineStore } from 'pinia';
 import { computed, onUnmounted, ref } from 'vue';
+import { listen } from '@tauri-apps/api/event';
 import { engineGetState, engineGetStats, engineStart, engineStop } from '@/api';
 import { i18n } from '@/locales';
 import type { EngineStartParams, EngineStateDto, FlowStatsDto } from '@/types/ipc';
+
+/** 后端托盘/命令启停引擎后广播的状态变更事件（与 Rust tray::ENGINE_STATE_EVENT 对齐） */
+const ENGINE_STATE_EVENT = 'watt://engine-state-changed';
 
 /** 代理引擎状态 store */
 export const useProxyStore = defineStore('proxy', () => {
@@ -96,6 +100,25 @@ export const useProxyStore = defineStore('proxy', () => {
     onUnmounted(stopStatsLoop);
   }
 
+  /**
+   * 外部（托盘菜单 / 其他入口）触发的引擎状态变更：
+   * 重新拉取状态并同步统计轮询，使面板与后台服务保持一致。
+   */
+  async function syncFromExternal(): Promise<void> {
+    await refreshState();
+    if (isRunning.value) {
+      startStatsLoop();
+    } else {
+      stopStatsLoop();
+      stats.value = { upBytes: 0, downBytes: 0 };
+    }
+  }
+
+  // 订阅后端状态广播（store 为应用级单例，随应用生命周期常驻，无需手动解绑）
+  void listen(ENGINE_STATE_EVENT, () => {
+    void syncFromExternal();
+  });
+
   return {
     state,
     stats,
@@ -109,5 +132,6 @@ export const useProxyStore = defineStore('proxy', () => {
     refreshState,
     refreshStats,
     useAutoClean,
+    syncFromExternal,
   };
 });

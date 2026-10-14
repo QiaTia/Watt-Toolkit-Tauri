@@ -97,12 +97,17 @@ const FIGMA_API_GA_IPS: &[&str] = &[
     "13.35.190.39",
 ];
 
+/// `errors.figma.com`（Sentry 错误上报）与 `s3-alpha-sig.figma.com`（预览图）
+/// 的 AWS S3 段。2026-10 实测：S3 段 IP 凭 SNI + Host 可服务两个域。
+const FIGMA_S3_IPS: &[&str] = &["65.8.76.37", "65.8.76.35", "65.8.76.16", "65.8.76.41"];
+
 /// 返回该 host 的备用 IP 列表（无匹配时为空）。
 ///
 /// 匹配按后缀进行，更具体的服务段优先：
 /// `*.githubusercontent.com` / `*.githubassets.com` 各有独立 IP 段，
 /// 不能与 `*.github.com` 混用；`api.figma.com` 走 Global Accelerator 段
-/// （前置）+ CloudFront 段兜底，其余 `*.figma.com` 走 CloudFront 段。
+/// （前置）+ CloudFront 段兜底；`errors.figma.com` / `s3-alpha-sig.figma.com`
+/// 走 S3 段（前置）+ CloudFront 段兜底；其余 `*.figma.com` 走 CloudFront 段。
 pub fn fallback_ips(host: &str) -> Vec<IpAddr> {
     let host = host.split(':').next().unwrap_or(host);
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -119,6 +124,13 @@ pub fn fallback_ips(host: &str) -> Vec<IpAddr> {
         } else if host == "api.figma.com" || host.ends_with(".api.figma.com") {
             // GA 任播段为原生路径（前置），CloudFront 边缘段兜底
             FIGMA_API_GA_IPS
+                .iter()
+                .copied()
+                .chain(FIGMA_CF_IPS.iter().copied())
+                .collect()
+        } else if host == "errors.figma.com" || host == "s3-alpha-sig.figma.com" {
+            // S3 段为原生路径（前置），CloudFront 边缘段兜底
+            FIGMA_S3_IPS
                 .iter()
                 .copied()
                 .chain(FIGMA_CF_IPS.iter().copied())
@@ -232,6 +244,28 @@ mod tests {
         // CloudFront 段兜底追加
         assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
         assert_eq!(ips.len(), FIGMA_API_GA_IPS.len() + FIGMA_CF_IPS.len());
+    }
+
+    #[test]
+    fn test_figma_s3_hosts_use_s3_pool_first() {
+        for host in ["errors.figma.com", "s3-alpha-sig.figma.com"] {
+            let ips = fallback_ips(host);
+            assert!(!ips.is_empty(), "{host} 应有备用 IP");
+            // S3 段前置（原生路径）
+            assert_eq!(ips[0].to_string(), "65.8.76.37", "{host} S3 段应前置");
+            assert!(ips.iter().any(|ip| ip.to_string() == "65.8.76.41"));
+            // CloudFront 段兜底追加（实测 S3 域亦可经 CF 边缘 IP 访问）
+            assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
+            assert_eq!(ips.len(), FIGMA_S3_IPS.len() + FIGMA_CF_IPS.len());
+        }
+    }
+
+    #[test]
+    fn test_figma_verify_uses_cf_pool() {
+        // verify.figma.com（Arkose 人验）在 CloudFront 上，走 CF 段
+        let ips = fallback_ips("verify.figma.com");
+        assert!(!ips.is_empty());
+        assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
     }
 
     #[test]

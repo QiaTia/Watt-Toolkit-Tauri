@@ -33,6 +33,7 @@ const navRoutes: ReadonlyArray<{ path: string; titleKey: string }> = [
   { path: '/', titleKey: 'nav.home' },
   { path: '/accelerator', titleKey: 'nav.accelerator' },
   { path: '/settings', titleKey: 'nav.settings' },
+  { path: '/logs', titleKey: 'nav.logs' },
   { path: '/about', titleKey: 'nav.about' },
 ];
 
@@ -126,6 +127,10 @@ onMounted(() => {
             <a-menu-item key="/settings">
               <template #icon><SettingOutlined /></template>
               <span>{{ $t('nav.settings') }}</span>
+            </a-menu-item>
+            <a-menu-item key="/logs">
+              <template #icon><FileTextOutlined /></template>
+              <span>{{ $t('nav.logs') }}</span>
             </a-menu-item>
             <a-menu-item key="/about">
               <template #icon><InfoCircleOutlined /></template>

@@ -4,6 +4,8 @@
 
 pub mod commands;
 pub mod migrate;
+pub mod runtime_log;
+pub mod tray;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,11 +45,15 @@ pub fn run() {
     // 进程级全局、幂等，覆盖 watt-cloud / watt-core 所有 TLS 客户端）
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,watt_core=debug".into()),
-        )
+    // 日志：stdout 格式化输出 + 运行日志采集层（写入环形缓冲供 UI 查询）
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,watt_core=debug".into());
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(runtime_log::RuntimeLogLayer)
         .init();
 
     let app = tauri::Builder::default()
@@ -87,7 +93,18 @@ pub fn run() {
                     migration,
                 }
             });
+
+            // 系统托盘（Windows / macOS）：左键唤起窗口，右键菜单启停/打开/退出
+            tray::create_tray(app.handle())?;
             Ok(())
+        })
+        // 关闭按钮仅隐藏窗口、保留后台服务；仅托盘「退出」才真正结束进程。
+        // macOS 下关闭窗口本就不退出应用，此处理对三端行为一致。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_info::get_app_info,
@@ -108,6 +125,10 @@ pub fn run() {
             commands::accelerate::accelerate_set_enabled,
             commands::accelerate::accelerate_get_rules,
             commands::accelerate::accelerate_connectivity_test,
+            commands::logs::proxy_access_logs,
+            commands::logs::proxy_access_logs_clear,
+            commands::logs::runtime_logs,
+            commands::logs::runtime_logs_clear,
             commands::migrate::migration_get_report,
         ])
         .build(tauri::generate_context!())

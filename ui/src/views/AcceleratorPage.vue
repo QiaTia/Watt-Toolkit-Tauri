@@ -93,10 +93,24 @@ function matchProject(p: AccelerateProject): AccelerateProject | null {
   return null;
 }
 
-/** 全部分组（按关键词过滤后的视图） */
+/** 已勾选分组置顶（Github 固定第一），未勾选分组保持原序在后。
+ *  依赖 accel.checkedIds（响应式），勾选变化时实时重排。 */
+function orderSelectedFirst(groups: AccelerateProjectGroup[]): AccelerateProjectGroup[] {
+  const selected = groups.filter((g) => accel.groupState(g) !== 'none');
+  const rest = groups.filter((g) => accel.groupState(g) === 'none');
+  // Github 固定排第一
+  const gh = selected.findIndex((g) => g.name.toLowerCase().includes('github'));
+  if (gh > 0) {
+    const g = selected.splice(gh, 1)[0];
+    if (g) selected.unshift(g);
+  }
+  return [...selected, ...rest];
+}
+
+/** 全部分组（按关键词过滤 + 已勾选置顶后的视图） */
 const visibleGroups = computed<AccelerateProjectGroup[]>(() => {
   const kw = normKeyword.value;
-  if (!kw) return accel.groups;
+  if (!kw) return orderSelectedFirst(accel.groups);
   const out: AccelerateProjectGroup[] = [];
   for (const g of accel.groups) {
     if (g.name.toLowerCase().includes(kw)) {
@@ -106,7 +120,7 @@ const visibleGroups = computed<AccelerateProjectGroup[]>(() => {
     const items = g.items.map(matchProject).filter((x): x is AccelerateProject => x !== null);
     if (items.length > 0) out.push({ ...g, items });
   }
-  return out;
+  return orderSelectedFirst(out);
 });
 
 /* ========== 分组展开（a-collapse 受控，持久化到 localStorage） ========== */

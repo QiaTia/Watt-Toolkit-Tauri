@@ -141,7 +141,7 @@ async fn handle_connect(
         let service = RelayService { ctx, scheme };
         let io = hyper_util::rt::TokioIo::new(tls_stream);
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection(io, service)
+            .serve_connection_with_upgrades(io, service)
             .await?;
         return Ok(());
     }
@@ -223,7 +223,7 @@ async fn handle_absolute_uri_request(
     let service = ForwardProxyService { ctx, scheme };
     let io = hyper_util::rt::TokioIo::new(stream);
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-        .serve_connection(io, service)
+        .serve_connection_with_upgrades(io, service)
         .await?;
     Ok(())
 }
@@ -254,6 +254,33 @@ impl Service<Request<Incoming>> for ForwardProxyService {
             if let Some(pq) = req.uri().path_and_query() {
                 if let Ok(origin) = pq.as_str().parse() {
                     *req.uri_mut() = origin;
+                }
+            }
+            // —— WebSocket / HTTP Upgrade 短路（同 listener::RelayService）——
+            if crate::upgrade::is_upgrade_request(&req) {
+                let host = crate::http_relay::request_host(&req);
+                match crate::listener::upgrade_target_pub(&ctx, &host, &req) {
+                    Ok((target, authority)) => {
+                        match crate::upgrade::handle_upgrade(
+                            req,
+                            target,
+                            authority,
+                            ctx.dns.clone(),
+                            ctx.upstream.clone(),
+                        )
+                        .await
+                        {
+                            Ok(resp) => return Ok(resp),
+                            Err(e) => {
+                                tracing::warn!("Upgrade 隧道失败 {host}: {e}");
+                                return Ok(crate::listener::upgrade_error_response_pub(&e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Upgrade 目标解析失败 {host}: {e}");
+                        return Ok(crate::listener::upgrade_error_response_pub(&e));
+                    }
                 }
             }
             let resp = ctx.handle_request(req, &scheme).await;

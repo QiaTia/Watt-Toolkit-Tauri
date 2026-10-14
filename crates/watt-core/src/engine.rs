@@ -12,6 +12,7 @@
 //! 停止时序：摘除 hosts（失败阻止停止）→ 取消系统代理/PAC → 关闭监听。
 
 use crate::http_relay::RelayContext;
+use crate::access_log::AccessLogStore;
 use crate::listener::{run_http_listener, run_mitm_listener, run_socks5_listener};
 use crate::local_domain::LocalDomainHandler;
 use crate::outbound::UpstreamProxy;
@@ -94,6 +95,8 @@ pub struct ProxyEngine {
     state_rx: tokio::sync::watch::Receiver<EngineState>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     stats: Arc<FlowStats>,
+    /// 代理访问日志（跨重启常驻，与 stats 同生命周期）
+    access_log: Arc<AccessLogStore>,
     running_task: Option<tokio::task::JoinHandle<()>>,
     /// 运行中模式（停止时用于模式化清理）
     running_mode: Option<ProxyMode>,
@@ -122,6 +125,7 @@ impl ProxyEngine {
             state_rx,
             shutdown_tx,
             stats: Arc::new(FlowStats::default()),
+            access_log: Arc::new(AccessLogStore::new(crate::access_log::DEFAULT_CAPACITY)),
             running_task: None,
             running_mode: None,
             hosts_written: None,
@@ -138,6 +142,11 @@ impl ProxyEngine {
 
     pub fn stats(&self) -> Arc<FlowStats> {
         self.stats.clone()
+    }
+
+    /// 代理访问日志存储（命令层查询/清空）
+    pub fn access_logs(&self) -> Arc<AccessLogStore> {
+        self.access_log.clone()
     }
 
     /// 异常退出兜底清理（应用启动 / 引擎启动前调用）。
@@ -318,6 +327,7 @@ impl ProxyEngine {
             stats: self.stats.clone(),
             candidate_health: Arc::new(crate::outbound::CandidateHealth::new()),
             hooks: Some(hooks),
+            access_log: self.access_log.clone(),
         });
 
         // —— 3. 按模式绑定监听 ——

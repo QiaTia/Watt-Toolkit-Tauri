@@ -192,3 +192,54 @@ export interface EngineStartParams {
   serverSideProxyToken?: string | null;
   rules: DomainRule[];
 }
+
+/* ========== 日志（访问日志 + 运行日志；命令层 camelCase） ========== */
+
+/** 访问日志处置分类 */
+export type Disposition = 'matched' | 'default' | 'unmatched' | 'local';
+
+export interface AccessLogEntry {
+  tsMs: number;
+  host: string;
+  method: string;
+  path: string;
+  status: number;
+  upBytes: number;
+  downBytes: number;
+  latencyMs: number;
+  disposition: Disposition;
+}
+
+export interface AccessLogFilter {
+  keyword?: string | null;
+  method?: string | null;
+  statusMin?: number | null;
+  statusMax?: number | null;
+  disposition?: Disposition | null;
+}
+
+export interface AccessLogPage {
+  items: AccessLogEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface RuntimeLogEntry {
+  tsMs: number;
+  level: string;
+  target: string;
+  message: string;
+}
+
+export interface RuntimeLogFilter {
+  keyword?: string | null;
+  minLevel?: string | null;
+}
+
+export interface RuntimeLogPage {
+  items: RuntimeLogEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+}

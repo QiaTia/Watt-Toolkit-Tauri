@@ -63,8 +63,12 @@ async fn handle_mitm_connection(
     let scheme = "https".to_string();
     let service = RelayService { ctx, scheme };
     let io = hyper_util::rt::TokioIo::new(tls_stream);
+    // 必须用 serve_connection_with_upgrades：WebSocket 的 101 响应会被 hyper
+    // 视为 last（写侧关闭），普通 serve_connection 会直接 shutdown 底层 IO，
+    // 客户端收到 UnexpectedEof（症状：wss 1006）。upgrade 变体把 IO 所有权
+    // 交还给 OnUpgrade future，由 upgrade 模块接管隧道。
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-        .serve_connection(io, service)
+        .serve_connection_with_upgrades(io, service)
         .await?;
     Ok(())
 }
@@ -95,7 +99,7 @@ pub async fn run_http_listener(
                     let _ = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     )
-                    .serve_connection(io, service)
+                    .serve_connection_with_upgrades(io, service)
                     .await;
                 });
             }
@@ -125,10 +129,99 @@ impl Service<Request<Incoming>> for RelayService {
         let ctx = self.ctx.clone();
         let scheme = self.scheme.clone();
         Box::pin(async move {
+            // —— WebSocket / HTTP Upgrade 短路 ——
+            // 升级请求没有可收集的 body（101 后即裸字节流），
+            // 走 http_relay 的 collect() 会挂死；改为直接隧道透传。
+            if crate::upgrade::is_upgrade_request(&req) {
+                let host = crate::http_relay::request_host(&req);
+                match upgrade_target(&ctx, &host, &req) {
+                    Ok((target, authority)) => {
+                        match crate::upgrade::handle_upgrade(
+                            req,
+                            target,
+                            authority,
+                            ctx.dns.clone(),
+                            ctx.upstream.clone(),
+                        )
+                        .await
+                        {
+                            Ok(resp) => return Ok(resp),
+                            Err(e) => {
+                                tracing::warn!("Upgrade 隧道失败 {host}: {e}");
+                                return Ok(upgrade_error_response(&e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Upgrade 目标解析失败 {host}: {e}");
+                        return Ok(upgrade_error_response(&e));
+                    }
+                }
+            }
             let resp = ctx.handle_request(req, &scheme).await;
             Ok(resp)
         })
     }
+}
+
+/// Upgrade 路径的出站目标解析（与 http_relay::forward 的规则语义一致）
+pub fn upgrade_target_pub(
+    ctx: &Arc<RelayContext>,
+    host: &str,
+    req: &Request<Incoming>,
+) -> Result<(crate::outbound::OutboundTarget, String), String> {
+    upgrade_target(ctx, host, req)
+}
+
+fn upgrade_target(
+    ctx: &Arc<RelayContext>,
+    host: &str,
+    req: &Request<Incoming>,
+) -> Result<(crate::outbound::OutboundTarget, String), String> {
+    let url = format!("https://{host}{}", req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+    let rule = ctx
+        .rules
+        .find_by_url(&url, host)
+        .cloned()
+        .unwrap_or_default();
+    let destination_uri = crate::http_relay::resolve_destination_pub("https", host, req.uri().clone(), rule.fields.destination.as_deref());
+    let dest_host = destination_uri
+        .host()
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| host.to_string());
+    let authority = destination_uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| host.to_string());
+    let target = crate::outbound::OutboundTarget {
+        host: dest_host,
+        port: destination_uri.port_u16().unwrap_or(
+            if destination_uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            },
+        ),
+        tls: destination_uri.scheme_str() == Some("https"),
+        tls_sni: crate::http_relay::resolve_tls_sni(&rule, host),
+        tls_ignore_name_mismatch: rule.fields.tls_ignore_name_mismatch,
+        override_ip: rule.fields.ip_address,
+        forward_destination: rule.fields.forward_destination.clone(),
+        timeout_ms: rule.fields.timeout_ms,
+    };
+    Ok((target, authority))
+}
+
+/// Upgrade 失败响应（对齐 http_relay 的错误页语义：500 + 纯文本）
+pub fn upgrade_error_response_pub(msg: &str) -> hyper::Response<Full<Bytes>> {
+    upgrade_error_response(msg)
+}
+
+fn upgrade_error_response(msg: &str) -> hyper::Response<Full<Bytes>> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Full::new(Bytes::from(format!("转发失败: {msg}"))))
+        .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::from("转发失败"))))
 }
 
 /// SOCKS5 入站监听（8868）—— Phase 5 实现

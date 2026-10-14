@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
+use tauri::Emitter;
 use watt_cert::ca::CaCertificate;
 use watt_config::{DnsSettings, DomainRule, ProxyMode, TwoLevelAgentSettings};
 use watt_core::engine::{EngineConfig, EngineState};
@@ -81,6 +82,7 @@ pub struct FlowStatsDto {
 #[tauri::command]
 pub async fn engine_start(
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     params: EngineStartParams,
 ) -> Result<EngineStateDto, String> {
     // 解析监听 IP
@@ -128,14 +130,26 @@ pub async fn engine_start(
 
     let mut engine = state.engine.lock().await;
     engine.start(config).await.map_err(|e| e.to_string())?;
-    Ok(engine.state().into())
+    let dto: EngineStateDto = engine.state().into();
+    drop(engine);
+    // 同步托盘菜单文案并广播状态变更（使面板与托盘一致）
+    crate::tray::sync_tray_label(&app, matches!(dto, EngineStateDto::Running { .. }));
+    let _ = app.emit(crate::tray::ENGINE_STATE_EVENT, ());
+    Ok(dto)
 }
 
 #[tauri::command]
-pub async fn engine_stop(state: tauri::State<'_, AppState>) -> Result<EngineStateDto, String> {
+pub async fn engine_stop(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<EngineStateDto, String> {
     let mut engine = state.engine.lock().await;
     engine.stop().await.map_err(|e| e.to_string())?;
-    Ok(engine.state().into())
+    let dto: EngineStateDto = engine.state().into();
+    drop(engine);
+    crate::tray::sync_tray_label(&app, false);
+    let _ = app.emit(crate::tray::ENGINE_STATE_EVENT, ());
+    Ok(dto)
 }
 
 #[tauri::command]
