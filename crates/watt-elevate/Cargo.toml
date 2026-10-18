@@ -1,0 +1,12 @@
+[package]
+name = "watt-elevate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# macOS：geteuid() 需要 libc；其余平台 is_elevated 用替代实现
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }

@@ -112,6 +112,7 @@ pub fn run() {
             commands::engine::engine_stop,
             commands::engine::engine_get_state,
             commands::engine::engine_get_stats,
+            commands::engine::engine_probe_summary,
             commands::cert::cert_get_status,
             commands::cert::cert_get_info,
             commands::cert::cert_install,

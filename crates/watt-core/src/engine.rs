@@ -64,6 +64,12 @@ pub struct EngineConfig {
     pub ca: Arc<CaCertificate>,
     /// hosts 文件路径（None=系统默认；测试注入）
     pub hosts_path: Option<std::path::PathBuf>,
+    /// 探测缓存落盘路径（P2；probe_cache_persist 开启才读写，None=不落盘）
+    pub probe_cache_path: Option<std::path::PathBuf>,
+    /// 探测缓存是否落盘（P2，默认关）
+    pub probe_cache_persist: bool,
+    /// top-K 裁剪（P2，默认关= None；None 或 0 = 不裁剪，全部候选参赛）
+    pub probe_top_k: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -85,6 +91,9 @@ impl Default for EngineConfig {
             scripts: Vec::new(),
             ca: Arc::new(CaCertificate::generate().expect("CA 生成失败")),
             hosts_path: None,
+            probe_cache_path: None,
+            probe_cache_persist: false,
+            probe_top_k: None,
         }
     }
 }
@@ -102,6 +111,14 @@ pub struct ProxyEngine {
     running_mode: Option<ProxyMode>,
     /// 本次运行写入的 hosts 文件路径（未写入为 None）
     hosts_written: Option<std::path::PathBuf>,
+    /// 启动预探测任务（stop 时 abort；探测结果写 ctx.probe_cache，请求竞速自动消费）
+    probe_task: Option<tokio::task::JoinHandle<()>>,
+    /// 探测缓存（与 ctx.probe_cache 同一 Arc；stop 落盘与摘要查询用）
+    probe_cache: Option<Arc<crate::probe_cache::ProbeCache>>,
+    /// 探测缓存落盘路径（P2；probe_cache_persist 开启才读写）
+    probe_cache_path: Option<std::path::PathBuf>,
+    /// 探测缓存是否落盘（P2，默认关）
+    probe_cache_persist: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +146,10 @@ impl ProxyEngine {
             running_task: None,
             running_mode: None,
             hosts_written: None,
+            probe_task: None,
+            probe_cache: None,
+            probe_cache_path: None,
+            probe_cache_persist: false,
         }
     }
 
@@ -162,6 +183,15 @@ impl ProxyEngine {
     /// 返回已清理项，供上层记录日志。
     pub fn cleanup_orphans(
         &self,
+        hosts_path: Option<&std::path::Path>,
+        proxy_ports: &[u16],
+    ) -> Vec<String> {
+        Self::cleanup_orphans_impl(hosts_path, proxy_ports)
+    }
+
+    /// [`ProxyEngine::cleanup_orphans`] 的无 self 实现（可在 `spawn_blocking` 中调用：
+    /// macOS 提权路径会弹系统密码框，绝不可阻塞 tokio worker）。
+    pub fn cleanup_orphans_impl(
         hosts_path: Option<&std::path::Path>,
         proxy_ports: &[u16],
     ) -> Vec<String> {
@@ -210,7 +240,16 @@ impl ProxyEngine {
             }
             tracing::warn!("退出时停止引擎失败，转为兜底清理");
         }
-        let cleaned = self.cleanup_orphans(hosts_path, proxy_ports);
+        let hosts_path_owned = hosts_path.map(std::path::Path::to_path_buf);
+        let ports: Vec<u16> = proxy_ports.to_vec();
+        let cleaned = tokio::task::spawn_blocking(move || {
+            Self::cleanup_orphans_impl(hosts_path_owned.as_deref(), &ports)
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            tracing::warn!("退出兜底清理任务异常: {join_err}");
+            Vec::new()
+        });
         if !cleaned.is_empty() {
             tracing::warn!("退出清理残留代理状态: {}", cleaned.join(", "));
         }
@@ -234,14 +273,20 @@ impl ProxyEngine {
         ip: IpAddr,
         port: u16,
     ) -> Result<tokio::net::TcpListener, EngineError> {
-        tokio::net::TcpListener::bind((ip, port))
-            .await
-            .map_err(|e| {
-                revert_proxy_settings(mode);
+        match tokio::net::TcpListener::bind((ip, port)).await {
+            Ok(listener) => Ok(listener),
+            Err(e) => {
+                // 回滚系统代理设置（阻塞操作放 spawn_blocking：macOS 提权路径可能弹窗）
+                if let Err(join_err) =
+                    tokio::task::spawn_blocking(move || revert_proxy_settings(mode)).await
+                {
+                    tracing::warn!("回滚系统代理设置任务异常: {join_err}");
+                }
                 let err = EngineError::BindPortError(port, describe_bind_error(e, port));
                 self.state.send_replace(EngineState::Error(err.to_string()));
-                err
-            })
+                Err(err)
+            }
+        }
     }
 
     /// 启动引擎
@@ -252,12 +297,24 @@ impl ProxyEngine {
 
         self.state.send_replace(EngineState::Starting);
         let mode = config.mode;
+        // 落盘配置存 engine（stop 时保存用；config 之后不再可用）
+        self.probe_cache_path = config.probe_cache_path.clone();
+        self.probe_cache_persist = config.probe_cache_persist;
 
         // —— 0. 启动前兜底清理 ——
         // 上次异常退出可能残留 hosts 标记块 / 系统代理：若不清掉，Hosts 模式下会先看到
         // 「域名指向 127.0.0.1 但 443 尚未监听」的短暂黑洞，其他模式则会残留误导性的
         // hosts 劫持（域名走本地却无服务）。这里统一摘除，随后按模式重新接入。
-        let cleaned = self.cleanup_orphans(config.hosts_path.as_deref(), &[config.forward_proxy_port]);
+        let hosts_path_owned = config.hosts_path.as_deref().map(std::path::Path::to_path_buf);
+        let forward_port = config.forward_proxy_port;
+        let cleaned = tokio::task::spawn_blocking(move || {
+            Self::cleanup_orphans_impl(hosts_path_owned.as_deref(), &[forward_port])
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            tracing::warn!("启动前兜底清理任务异常: {join_err}");
+            Vec::new()
+        });
         if !cleaned.is_empty() {
             tracing::info!("启动前清理残留代理状态: {}", cleaned.join(", "));
         }
@@ -274,11 +331,15 @@ impl ProxyEngine {
                 Self::check_port_available(config.listen_ip, config.https_port).await?;
             }
             ProxyMode::System => {
-                if let Err(e) = crate::system_proxy::set_system_proxy(
-                    true,
-                    &proxy_ip.to_string(),
-                    config.forward_proxy_port,
-                ) {
+                let proxy_ip_s = proxy_ip.to_string();
+                let forward_port = config.forward_proxy_port;
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::system_proxy::set_system_proxy(true, &proxy_ip_s, forward_port)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                if let Err(e) = result {
                     let msg = format!("设置系统代理失败: {e}");
                     self.state.send_replace(EngineState::Error(msg.clone()));
                     return Err(EngineError::Other(msg));
@@ -289,7 +350,13 @@ impl ProxyEngine {
                     "http://{}/pac",
                     authority(&proxy_ip, config.forward_proxy_port)
                 );
-                if let Err(e) = crate::system_proxy::set_system_pac(true, &pac_url) {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::system_proxy::set_system_pac(true, &pac_url)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                if let Err(e) = result {
                     let msg = format!("设置 PAC 系统代理失败: {e}");
                     self.state.send_replace(EngineState::Error(msg.clone()));
                     return Err(EngineError::Other(msg));
@@ -314,6 +381,14 @@ impl ProxyEngine {
         ));
 
         let two_level_agent_enable = config.two_level_agent.enable && upstream.is_some();
+        // 探测缓存：落盘热启动（P2，默认关）→ ctx 与探测任务共享同一实例
+        let probe_cache = Arc::new(crate::probe_cache::ProbeCache::new());
+        if config.probe_cache_persist {
+            if let Some(path) = config.probe_cache_path.as_deref() {
+                probe_cache.load_from(path);
+                tracing::debug!("探测缓存落盘加载: {}", path.display());
+            }
+        }
         let ctx = Arc::new(RelayContext {
             rules,
             local,
@@ -326,6 +401,8 @@ impl ProxyEngine {
             dns,
             stats: self.stats.clone(),
             candidate_health: Arc::new(crate::outbound::CandidateHealth::new()),
+            probe_cache,
+            probe_top_k: config.probe_top_k,
             hooks: Some(hooks),
             access_log: self.access_log.clone(),
         });
@@ -438,12 +515,33 @@ impl ProxyEngine {
             }
         }
 
+        // —— 6. 启动预探测（后台 best-effort：不阻塞启动路径，结果写 ctx.probe_cache，
+        //       请求竞速自动按 RTT 排序；P2-a 每 60s 周期重探；stop 时 abort）——
+        let probe_targets = crate::probe::probe_targets_from_rules(ctx.rules.all());
+        if !probe_targets.is_empty() {
+            let probe_connector = crate::outbound::OutboundConnector::new(
+                Arc::new(crate::http_relay::RelayDnsAdapter(ctx.dns.clone())),
+                ctx.upstream.clone(),
+            );
+            self.probe_cache = Some(ctx.probe_cache.clone());
+            self.probe_task = Some(crate::probe::spawn_probe_task(
+                Arc::new(probe_connector),
+                probe_targets,
+                ctx.probe_cache.clone(),
+            ));
+        }
+
         self.running_mode = Some(mode);
         self.state.send_replace(EngineState::Running {
             started_at: chrono::Utc::now(),
             mode,
         });
         Ok(())
+    }
+
+    /// 最近一次探测摘要（UI「已择优」展示；None = 尚未探测或无规则）
+    pub fn probe_summary(&self) -> Option<crate::probe_cache::ProbeSummary> {
+        self.probe_cache.as_ref().and_then(|c| c.latest_summary())
     }
 
     /// 停止引擎（先摘除接入再停监听，对齐 C# StopProxyServiceCoreAsync）
@@ -453,6 +551,18 @@ impl ProxyEngine {
             return Err(EngineError::NotRunning);
         }
         self.state.send_replace(EngineState::Stopping);
+
+        // 探测任务随停止取消（结果已无意义，避免后台空跑）
+        if let Some(task) = self.probe_task.take() {
+            task.abort();
+        }
+        // 探测缓存落盘（P2，默认关）：供下次启动热加载
+        if self.probe_cache_persist {
+            if let (Some(cache), Some(path)) = (&self.probe_cache, &self.probe_cache_path) {
+                cache.save_to(path);
+            }
+        }
+        self.probe_cache = None;
 
         // —— 1. 摘除 hosts（失败阻止停止：避免域名仍指向本地却无服务）——
         if let Some(path) = self.hosts_written.take() {
@@ -471,12 +581,24 @@ impl ProxyEngine {
         if let Some(mode) = self.running_mode {
             match mode {
                 ProxyMode::System => {
-                    if let Err(e) = crate::system_proxy::set_system_proxy(false, "", 0) {
+                    let result = tokio::task::spawn_blocking(|| {
+                        crate::system_proxy::set_system_proxy(false, "", 0)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r);
+                    if let Err(e) = result {
                         tracing::warn!("取消系统代理失败（继续停止）: {e}");
                     }
                 }
                 ProxyMode::Pac => {
-                    if let Err(e) = crate::system_proxy::set_system_pac(false, "") {
+                    let result = tokio::task::spawn_blocking(|| {
+                        crate::system_proxy::set_system_pac(false, "")
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r);
+                    if let Err(e) = result {
                         tracing::warn!("取消 PAC 代理失败（继续停止）: {e}");
                     }
                 }

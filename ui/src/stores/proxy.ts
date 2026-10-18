@@ -1,12 +1,22 @@
 import { defineStore } from 'pinia';
 import { computed, onUnmounted, ref } from 'vue';
 import { listen } from '@tauri-apps/api/event';
-import { engineGetState, engineGetStats, engineStart, engineStop } from '@/api';
+import {
+  engineGetState,
+  engineGetStats,
+  engineProbeSummary,
+  engineStart,
+  engineStop,
+} from '@/api';
 import { i18n } from '@/locales';
-import type { EngineStartParams, EngineStateDto, FlowStatsDto } from '@/types/ipc';
+import type { EngineStartParams, EngineStateDto, FlowStatsDto, ProbeSummaryDto } from '@/types/ipc';
 
 /** 后端托盘/命令启停引擎后广播的状态变更事件（与 Rust tray::ENGINE_STATE_EVENT 对齐） */
 const ENGINE_STATE_EVENT = 'watt://engine-state-changed';
+
+/** 探测摘要轮询上限（启动预探测整体预算 8s + 余量；拿到摘要或超时即停） */
+const PROBE_POLL_TIMEOUT_MS = 15_000;
+const PROBE_POLL_INTERVAL_MS = 1000;
 
 /** 代理引擎状态 store */
 export const useProxyStore = defineStore('proxy', () => {
@@ -14,9 +24,13 @@ export const useProxyStore = defineStore('proxy', () => {
   const stats = ref<FlowStatsDto>({ upBytes: 0, downBytes: 0 });
   const operating = ref(false);
   const error = ref<string | null>(null);
+  /** 最近一次候选探测摘要（null = 尚未拿到；UI 显示「探测中」） */
+  const probeSummary = ref<ProbeSummaryDto | null>(null);
 
   /** 1s 统计轮询句柄 */
   let statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** 探测摘要轮询句柄 */
+  let probeTimer: ReturnType<typeof setInterval> | null = null;
 
   const isRunning = computed(() => state.value.type === 'running');
   const isBusy = computed(
@@ -49,6 +63,7 @@ export const useProxyStore = defineStore('proxy', () => {
     try {
       state.value = await engineStart(params);
       startStatsLoop();
+      startProbePolling();
       return state.value.type === 'running';
     } catch (e) {
       error.value = String(e);
@@ -65,7 +80,9 @@ export const useProxyStore = defineStore('proxy', () => {
     try {
       state.value = await engineStop();
       stopStatsLoop();
+      stopProbePolling();
       stats.value = { upBytes: 0, downBytes: 0 };
+      probeSummary.value = null;
       return true;
     } catch (e) {
       error.value = String(e);
@@ -95,9 +112,41 @@ export const useProxyStore = defineStore('proxy', () => {
     }
   }
 
+  /**
+   * 探测摘要轮询：启动预探测整体预算 8s，1s 一拉；
+   * 拿到摘要（或超上限）即停——周期刷新（60s）的下次结果不追，
+   * 避免常驻轮询。
+   */
+  function startProbePolling(): void {
+    stopProbePolling();
+    const deadline = Date.now() + PROBE_POLL_TIMEOUT_MS;
+    const tick = async (): Promise<void> => {
+      try {
+        probeSummary.value = await engineProbeSummary();
+      } catch {
+        // 查询失败静默（引擎刚启动 / IPC 抖动），下个 tick 重试
+      }
+      if (probeSummary.value !== null || Date.now() >= deadline) {
+        stopProbePolling();
+      }
+    };
+    void tick();
+    probeTimer = setInterval(() => void tick(), PROBE_POLL_INTERVAL_MS);
+  }
+
+  function stopProbePolling(): void {
+    if (probeTimer !== null) {
+      clearInterval(probeTimer);
+      probeTimer = null;
+    }
+  }
+
   /** 组件内使用：自动清理轮询 */
   function useAutoClean(): void {
-    onUnmounted(stopStatsLoop);
+    onUnmounted(() => {
+      stopStatsLoop();
+      stopProbePolling();
+    });
   }
 
   /**
@@ -108,9 +157,12 @@ export const useProxyStore = defineStore('proxy', () => {
     await refreshState();
     if (isRunning.value) {
       startStatsLoop();
+      startProbePolling();
     } else {
       stopStatsLoop();
+      stopProbePolling();
       stats.value = { upBytes: 0, downBytes: 0 };
+      probeSummary.value = null;
     }
   }
 
@@ -124,6 +176,7 @@ export const useProxyStore = defineStore('proxy', () => {
     stats,
     operating,
     error,
+    probeSummary,
     isRunning,
     isBusy,
     stateLabel,

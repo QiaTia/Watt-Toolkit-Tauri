@@ -10,7 +10,9 @@ pub struct PortOccupant {
     pub name: String,
 }
 
-/// 查询监听指定端口的进程（仅 Windows；其他平台返回 None）
+/// 查询监听指定端口的进程
+///
+/// Windows：GetExtendedTcpTable；其他平台（macOS/Linux）：lsof。
 pub fn find_listener_process(port: u16) -> Option<PortOccupant> {
     #[cfg(target_os = "windows")]
     {
@@ -18,9 +20,47 @@ pub fn find_listener_process(port: u16) -> Option<PortOccupant> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = port;
-        None
+        find_listener_process_posix(port)
     }
+}
+
+/// lsof 查询监听进程（macOS/Linux；lsof 缺失或解析失败返回 None）
+#[cfg(not(target_os = "windows"))]
+fn find_listener_process_posix(port: u16) -> Option<PortOccupant> {
+    let out = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-F", "pcn"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_lsof_fields(&String::from_utf8_lossy(&out.stdout))
+        .map(|(pid, name)| PortOccupant { pid, name })
+}
+
+/// 解析 `lsof -F pcn` 字段输出（p=PID / c=COMMAND / n=NAME），取首个完整记录。
+///
+/// -F 字段模式无表头、无列对齐问题，进程名含空格也不会被拆列：
+/// ```text
+/// p1234
+/// cGoogle Chrome
+/// n*:8080
+/// ```
+pub fn parse_lsof_fields(text: &str) -> Option<(u32, String)> {
+    let mut pid: Option<u32> = None;
+    let mut name: Option<String> = None;
+    for line in text.lines() {
+        let Some(tag) = line.chars().next() else { continue };
+        match tag {
+            'p' => pid = line[1..].trim().parse().ok(),
+            'c' => name = Some(line[1..].to_string()),
+            _ => {}
+        }
+        if pid.is_some() && name.is_some() {
+            break;
+        }
+    }
+    pid.zip(name)
 }
 
 /// 生成端口占用错误信息（含进程名诊断；对齐 CommunityFix_StartProxyFaild443 文案）
@@ -123,6 +163,26 @@ fn process_name(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_lsof_fields_ok() {
+        let out = "p1234\ncGoogle Chrome\nn*:8080\n";
+        assert_eq!(parse_lsof_fields(out), Some((1234, "Google Chrome".to_string())));
+    }
+
+    #[test]
+    fn parse_lsof_fields_name_with_space_not_split() {
+        // c 行整体即进程名，含空格不拆列
+        let out = "p42\ncmy server\n";
+        assert_eq!(parse_lsof_fields(out), Some((42, "my server".to_string())));
+    }
+
+    #[test]
+    fn parse_lsof_fields_incomplete_or_empty() {
+        assert_eq!(parse_lsof_fields(""), None);
+        assert_eq!(parse_lsof_fields("garbage"), None);
+        assert_eq!(parse_lsof_fields("p99\n"), None);
+    }
 
     #[test]
     fn test_port_occupied_message_format() {

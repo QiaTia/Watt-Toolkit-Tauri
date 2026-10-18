@@ -70,6 +70,9 @@ const fr: Schema = {
         desc:
           'Pointe hosts vers le proxy inverse local 443 (le port 443 doit être libre ; ' +
           'écrire hosts peut nécessiter les droits administrateur)',
+        descMac:
+          'Sur macOS, écrire /etc/hosts nécessite les droits administrateur : une invite de ' +
+          'mot de passe au démarrage et à l’arrêt du moteur.',
       },
       system: {
         label: 'Proxy système',
@@ -88,6 +91,12 @@ const fr: Schema = {
           'Aucune modification système ; pointez manuellement le navigateur/client vers ' +
           '127.0.0.1:{port}',
       },
+    },
+    probe: {
+      running: 'Détection des nœuds et classement par latence…',
+      done: '{ok}/{total} nœuds optimisés, plus rapide {ms}ms',
+      failed: 'Détection incomplète ; course dans l’ordre par défaut',
+      partial: 'Détection tronquée par le budget ; résultats partiels utilisés',
     },
   },
   settings: {
@@ -144,8 +153,13 @@ const fr: Schema = {
     cancel: 'Annuler',
     certHint:
       "L'installation dans le magasin de confiance système est requise pour l'accélération " +
-      'HTTPS (MITM). Sous Windows, une invite UAC apparaîtra. Vous pouvez aussi exporter le ' +
-      'PEM et l’importer manuellement dans « Autorités de certification racines de confiance ».',
+      'HTTPS (MITM) : Windows affiche une invite UAC, macOS une boîte de dialogue de mot de ' +
+      'passe administrateur. Vous pouvez aussi exporter le PEM et l’importer manuellement ' +
+      'dans « Autorités de certification racines de confiance ».',
+    elevateMacHint:
+      "Sur macOS, l'installation ou la suppression du certificat racine demande le mot de " +
+      'passe administrateur (accès au trousseau système).',
+    elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
   },
   logs: {
     accessTab: 'Journal des accès',

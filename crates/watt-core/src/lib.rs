@@ -19,6 +19,8 @@ pub mod local_domain;
 pub mod outbound;
 pub mod pac;
 pub mod port_diag;
+pub mod probe;
+pub mod probe_cache;
 pub mod sni;
 pub mod stats;
 pub mod system_proxy;

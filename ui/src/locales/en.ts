@@ -69,6 +69,9 @@ const en: Schema = {
         desc:
           'Points hosts at the local 443 reverse proxy (port 443 must be free; writing hosts ' +
           'may require admin rights)',
+        descMac:
+          'On macOS, writing /etc/hosts requires administrator rights: one password prompt each ' +
+          'when starting and stopping the engine.',
       },
       system: {
         label: 'System Proxy',
@@ -86,6 +89,12 @@ const en: Schema = {
         desc:
           'No system changes; point your browser/client at 127.0.0.1:{port} manually',
       },
+    },
+    probe: {
+      running: 'Probing network nodes and ranking by latency…',
+      done: 'Optimized {ok}/{total} nodes, fastest {ms}ms',
+      failed: 'Probing incomplete; racing in default order',
+      partial: 'Probing truncated by budget; using partial results',
     },
   },
   settings: {
@@ -139,9 +148,13 @@ const en: Schema = {
     okRegenerate: 'Regenerate',
     cancel: 'Cancel',
     certHint:
-      'Installing to the system trust store is required for HTTPS boost (MITM). On Windows an ' +
-      'UAC prompt will appear. You can also export the PEM and import it into "Trusted Root ' +
-      'Certification Authorities" manually.',
+      'Installing to the system trust store is required for HTTPS boost (MITM): Windows shows ' +
+      'a UAC prompt, macOS shows an administrator password dialog. You can also export the ' +
+      'PEM and import it into "Trusted Root Certification Authorities" manually.',
+    elevateMacHint:
+      'On macOS, installing or removing the root certificate prompts for the administrator ' +
+      'password (system keychain access).',
+    elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
   },
   logs: {
     accessTab: 'Access Log',

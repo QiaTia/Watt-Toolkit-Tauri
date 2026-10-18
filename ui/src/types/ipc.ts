@@ -30,6 +30,15 @@ export interface FlowStatsDto {
   downBytes: number;
 }
 
+/** 候选探测摘要（启动预择优；UI 展示） */
+export interface ProbeSummaryDto {
+  hosts: number;
+  candidates: number;
+  ok: number;
+  fastestMs: number | null;
+  finished: boolean;
+}
+
 /* ========== 证书 ========== */
 
 export interface CertStatusDto {

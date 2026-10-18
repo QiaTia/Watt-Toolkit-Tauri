@@ -179,6 +179,11 @@ pub struct OutboundConnector {
     pub upstream: Option<UpstreamProxy>,
     /// 候选健康度记忆（None = 不跟踪，如探测/隧道场景）
     pub health: Option<Arc<CandidateHealth>>,
+    /// 候选探测结果缓存（None = 无预探测数据，竞速按原顺序）
+    pub probe: Option<Arc<crate::probe_cache::ProbeCache>>,
+    /// top-K 裁剪（P2，默认关= None）：只放 RTT 最优的 K 个候选参赛，
+    /// 溢出候选并入降级池，仅当 top-K 全灭时参与竞速
+    pub probe_top_k: Option<usize>,
 }
 
 /// 二级代理配置
@@ -212,12 +217,26 @@ impl OutboundConnector {
             dns,
             upstream,
             health: None,
+            probe: None,
+            probe_top_k: None,
         }
     }
 
     /// 启用候选健康度记忆（链式）
     pub fn with_health(mut self, health: Arc<CandidateHealth>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    /// 启用候选探测缓存（链式；引擎启动预探测写入，竞速按 RTT 排序）
+    pub fn with_probe(mut self, probe: Arc<crate::probe_cache::ProbeCache>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// 启用 top-K 裁剪（链式，P2 默认关；需配合 with_probe 生效）
+    pub fn with_probe_top_k(mut self, k: usize) -> Self {
+        self.probe_top_k = Some(k);
         self
     }
 
@@ -253,10 +272,22 @@ impl OutboundConnector {
         let addrs = self.resolve_candidates(target).await?;
 
         // 健康度降权：被标记失败的候选仅当健康候选全灭时才参与竞速
-        let (healthy, demoted) = match &self.health {
+        let (mut healthy, mut demoted) = match &self.health {
             Some(h) => h.partition(addrs),
             None => (addrs, Vec::new()),
         };
+
+        // 启动预择优：探测缓存按 RTT 升序排列健康候选（未探测沉底但仍在场），
+        // 最快候选最先 spawn，首个 TLS 完成者大概率即全局最快者。
+        // 竞速正确性不依赖顺序（并发胜出），缺失探测时保持原行为。
+        if let Some(probe) = &self.probe {
+            probe.sort_addrs(&target.host, &mut healthy);
+            // top-K 裁剪（P2，默认关）：溢出候选并入降级池，
+            // 仅当 top-K 全灭时才参与——与降权候选同路径，不丢可用候选
+            if let Some(k) = self.probe_top_k.filter(|k| *k > 0 && *k < healthy.len()) {
+                demoted.extend(healthy.split_off(k));
+            }
+        }
 
         // —— 竞速的胜出条件必须与「可用性」一致 ——
         // TCP 握手成功 ≠ 服务可达。部分网络只放行 TCP，TLS 之后的流量被阻断，
@@ -440,7 +471,9 @@ impl OutboundConnector {
 
     /// 候选地址解析（对齐 GetIPEndPointsAsync 并增强容错）：
     /// 覆盖 IP（云端静态值可能失效）→ 转发目标域名 → 原始 host DNS 解析 → 备用 IP 池兜底。
-    async fn resolve_candidates(
+    ///
+    /// `pub(crate)`：启动预探测（probe.rs）复用同一候选链，保证探测与竞速同源。
+    pub(crate) async fn resolve_candidates(
         &self,
         target: &OutboundTarget,
     ) -> Result<Vec<SocketAddr>, OutboundError> {
@@ -492,6 +525,64 @@ impl OutboundConnector {
             )));
         }
         Ok(addrs)
+    }
+
+    /// 候选探测：与 `race_tls_once` **同层**（TCP + TLS 握手），返回每个候选的 RTT。
+    ///
+    /// 只握手、不发应用数据；握手成功即记全链路 RTT（含 TCP+TLS）——
+    /// 探测通过的 IP 竞速必然可通过（同 TLS 配置与 SNI），探测结果经
+    /// [`crate::probe_cache::ProbeCache`] 供竞速排序。失败记 None（按未探测处理）。
+    ///
+    /// 有界并发（信号量）：候选多时避免同时打满本地端口/上游连接配额。
+    pub async fn probe_target(
+        &self,
+        target: &OutboundTarget,
+        timeout: Duration,
+    ) -> Vec<(IpAddr, Option<u64>)> {
+        const PROBE_CONCURRENCY: usize = 32;
+
+        let Ok(addrs) = self.resolve_candidates(target).await else {
+            return Vec::new();
+        };
+        // TLS 构造失败（如无效 SNI）不阻断探测：候选按未探测返回
+        let parts = Self::tls_parts(target).ok();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+
+        for addr in addrs {
+            let parts = parts.clone();
+            let sem = semaphore.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                let start = Instant::now();
+                let ok = async {
+                    let stream = tokio::time::timeout(
+                        timeout,
+                        tokio::net::TcpStream::connect(addr),
+                    )
+                    .await
+                    .ok()?
+                    .ok()?;
+                    let (connector, name) = parts?;
+                    tokio::time::timeout(timeout, connector.connect(name, stream))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    Some(())
+                }
+                .await
+                .is_some();
+                (addr.ip(), ok.then(|| start.elapsed().as_millis() as u64))
+            });
+        }
+
+        let mut out = Vec::with_capacity(set.len());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(v) = joined {
+                out.push(v);
+            }
+        }
+        out
     }
 
     /// TCP 竞速（happy-eyeballs）：候选并发连接，首个 TCP 握手成功者胜出。

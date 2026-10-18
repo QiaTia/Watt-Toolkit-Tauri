@@ -14,6 +14,7 @@ import type {
   EngineStartParams,
   EngineStateDto,
   FlowStatsDto,
+  ProbeSummaryDto,
   ProxySettings,
   RuntimeLogFilter,
   RuntimeLogPage,
@@ -41,6 +42,10 @@ export function engineGetState(): Promise<EngineStateDto> {
 
 export function engineGetStats(): Promise<FlowStatsDto> {
   return invoke('engine_get_stats');
+}
+
+export function engineProbeSummary(): Promise<ProbeSummaryDto | null> {
+  return invoke('engine_probe_summary');
 }
 
 /* 证书 */

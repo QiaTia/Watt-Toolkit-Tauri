@@ -39,6 +39,10 @@ pub struct RelayContext {
     pub stats: Arc<FlowStats>,
     /// 候选健康度记忆：请求阶段失败的出站候选短期降权（跨请求共享）
     pub candidate_health: Arc<CandidateHealth>,
+    /// 候选探测结果缓存：启动预择优写入，竞速按 RTT 排序（跨请求共享）
+    pub probe_cache: Arc<crate::probe_cache::ProbeCache>,
+    /// top-K 裁剪（P2，默认关= None；仅 probe_cache 启用时生效）
+    pub probe_top_k: Option<usize>,
     /// 服务端脚本钩子引擎（Phase 4b；None = 无脚本能力）
     pub hooks: Option<Arc<HookEngine>>,
     /// 代理访问日志（每个经代理的请求记录一条，供 UI 查询）
@@ -64,6 +68,8 @@ impl RelayContext {
             dns: Arc::new(watt_dns::DnsResolver::system()),
             stats: Arc::new(FlowStats::default()),
             candidate_health: Arc::new(CandidateHealth::new()),
+            probe_cache: Arc::new(crate::probe_cache::ProbeCache::new()),
+            probe_top_k: None,
             hooks: None,
             access_log: Arc::new(AccessLogStore::new(DEFAULT_CAPACITY)),
         }
@@ -406,7 +412,13 @@ impl RelayContext {
             Arc::new(RelayDnsAdapter(self.dns.clone())),
             self.upstream.clone(),
         )
-        .with_health(self.candidate_health.clone());
+        .with_health(self.candidate_health.clone())
+        .with_probe(self.probe_cache.clone());
+        // top-K 裁剪（P2，默认关）
+        let connector = match self.probe_top_k {
+            Some(k) => connector.with_probe_top_k(k),
+            None => connector,
+        };
 
         // 构造出站请求模板（origin-form，对齐 YARP：请求行仅 path_and_query，
         // Host 指向目标权威）。headers 每次连接尝试克隆复用。

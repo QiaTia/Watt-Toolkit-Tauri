@@ -168,7 +168,7 @@ impl HostsManager {
             Err(e) => return Err(e),
         };
 
-        std::fs::write(&self.path, new_content)?;
+        write_file(&self.path, &new_content)?;
         Ok(())
     }
 
@@ -194,8 +194,120 @@ impl HostsManager {
 
     /// 重置为默认内容
     pub fn reset_file(&self) -> Result<(), HostsError> {
-        std::fs::write(&self.path, default_hosts_content())?;
+        write_file(&self.path, default_hosts_content())?;
         Ok(())
+    }
+}
+
+/// hosts 落盘：先直写；权限拒绝时（macOS）经临时文件 + 提权单次弹窗完成。
+///
+/// 提权命令为单条 shell（白名单程序串联，一次弹窗）：
+/// `mv <tmp> <path> && chmod 644 <path> && dscacheutil -flushcache && killall -HUP mDNSResponder`
+/// ——`mv` 同卷 rename 原子替换（无 `cp` 的 truncate-write 窗口）、修权限、
+/// 刷 DNS 缓存一气呵成；临时文件随后删除。
+///
+/// **部分成功容忍**：`mv`/`chmod`（关键步骤）失败才算写入失败；`dscacheutil`/
+/// `killall` 仅刷 DNS 缓存（hosts 修改本身即时生效），其失败由回读校验兜底
+/// ——内容已落盘则警告放行。否则调用方会误判失败而回滚：回滚再弹一次窗，
+/// 且引擎停监听后 hosts 标记块残留会造成「域名指向 127.0.0.1 但无服务」的黑洞。
+/// 用户取消 → [`HostsError::Unauthorized`]（调用方按"无权限"处理，与现有语义一致）。
+fn write_file(path: &std::path::Path, content: &str) -> Result<(), HostsError> {
+    match std::fs::write(path, content) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            #[cfg(target_os = "macos")]
+            {
+                write_file_elevated(path, content)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(HostsError::Io(e))
+            }
+        }
+        Err(e) => Err(HostsError::Io(e)),
+    }
+}
+
+/// macOS 提权写入（[`write_file`] 的 PermissionDenied 兜底路径）
+#[cfg(target_os = "macos")]
+fn write_file_elevated(path: &std::path::Path, content: &str) -> Result<(), HostsError> {
+    // 临时文件：O_EXCL 创建（create_new），防符号链接/竞争攻击；
+    // 文件名只含 PID 与重试序号，无用户可控段
+    let tmp = create_exclusive_temp(content)?;
+
+    let tmp_q = watt_elevate::posix_shell_quote(&tmp.display().to_string());
+    let path_q = watt_elevate::posix_shell_quote(&path.display().to_string());
+    let script = format!(
+        "'mv' {tmp_q} {path_q} && 'chmod' '644' {path_q} && 'dscacheutil' '-flushcache' && 'killall' '-HUP' 'mDNSResponder'"
+    );
+    let result = watt_elevate::run_as_admin_shell(
+        &script,
+        Some(watt_elevate::ElevatePurpose::WriteHosts.prompt()),
+    );
+    // 无论成败都清理临时文件（mv 成功后文件已不在，remove 失败无妨）
+    let _ = std::fs::remove_file(&tmp);
+
+    match result {
+        Ok(_) => {
+            // 双保险：回读验证内容确实落盘（防 rename 假成功等极端情况）
+            verify_written(path, content)
+        }
+        Err(watt_elevate::ElevateError::Cancelled) => Err(HostsError::Unauthorized),
+        Err(e) => {
+            // 关键步骤可能已成功、仅缓存刷新失败：以回读结果为权威判据，
+            // 已落盘则警告放行（见 write_file 文档的黑洞说明）
+            match verify_written(path, content) {
+                Ok(()) => {
+                    tracing::warn!("hosts 提权写入后续步骤失败（{e}），但内容已落盘，按成功处理");
+                    Ok(())
+                }
+                Err(verify_err) => Err(HostsError::Other(format!(
+                    "提权写入 hosts 失败: {e}；回读校验也未通过: {verify_err}"
+                ))),
+            }
+        }
+    }
+}
+
+/// O_EXCL 创建临时文件并写入内容（`create_new` = O_EXCL，拒绝复用已存在路径）
+#[cfg(target_os = "macos")]
+fn create_exclusive_temp(content: &str) -> Result<std::path::PathBuf, HostsError> {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..8u32 {
+        let candidate = if attempt == 0 {
+            dir.join(format!("watt-hosts-{pid}.tmp"))
+        } else {
+            dir.join(format!("watt-hosts-{pid}-{attempt}.tmp"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut f) => {
+                f.write_all(content.as_bytes())?;
+                return Ok(candidate);
+            }
+            // 已存在（含恶意预建的符号链接）：换后缀重试，绝不覆盖
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(HostsError::Io(e)),
+        }
+    }
+    Err(HostsError::Other(
+        "无法创建 hosts 临时文件（重试多次仍被占用）".into(),
+    ))
+}
+
+/// 回读校验：hosts 文件内容与期望完全一致
+#[cfg(target_os = "macos")]
+fn verify_written(path: &std::path::Path, expected: &str) -> Result<(), HostsError> {
+    let actual = std::fs::read_to_string(path)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(HostsError::Other("hosts 回读内容与期望不一致".into()))
     }
 }
 

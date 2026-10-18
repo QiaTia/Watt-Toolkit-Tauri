@@ -65,6 +65,8 @@ const zhHant: Schema = {
       hosts: {
         label: 'Hosts 模式',
         desc: '修改 hosts 指向本機 443 反代（需 443 連接埠空閒，寫入 hosts 可能需要管理員權限）',
+        descMac:
+          'macOS 下寫入 /etc/hosts 需要管理員權限：啟動與停止引擎各會彈出一次系統密碼框。',
       },
       system: {
         label: '系統代理',
@@ -78,6 +80,12 @@ const zhHant: Schema = {
         label: '僅代理連接埠',
         desc: '不修改系統設定，手動將瀏覽器/用戶端代理指向 127.0.0.1:{port}',
       },
+    },
+    probe: {
+      running: '正在探測網路節點，按連線時長擇優排序…',
+      done: '已擇優 {ok}/{total} 個節點，最快 {ms}ms',
+      failed: '節點探測未完成，競速將按預設順序嘗試',
+      partial: '節點探測被預算截斷，已按已完成部分擇優',
     },
   },
   settings: {
@@ -130,8 +138,10 @@ const zhHant: Schema = {
     okRegenerate: '重新產生',
     cancel: '取消',
     certHint:
-      '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提，Windows 下安裝會彈出 UAC 提權確認。' +
-      '也可匯出 PEM 後手動匯入到「受信任的根憑證授權單位」。',
+      '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下會彈出 UAC 提權確認，' +
+      'macOS 下會彈出管理員密碼框。也可匯出 PEM 後手動匯入到「受信任的根憑證授權單位」。',
+    elevateMacHint: 'macOS 下安裝 / 移除根证书會彈出系統管理員密碼框（需寫入系統鑰匙圈）。',
+    elevateCancelled: '已取消管理員授權，操作未完成。',
   },
   logs: {
     accessTab: '存取日誌',

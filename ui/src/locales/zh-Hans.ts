@@ -67,6 +67,8 @@ const zhHans = {
       hosts: {
         label: 'Hosts 模式',
         desc: '修改 hosts 指向本地 443 反代（需 443 端口空闲，写入 hosts 可能需要管理员权限）',
+        descMac:
+          'macOS 下写入 /etc/hosts 需要管理员权限：启动与停止引擎各会弹出一次系统密码框。',
       },
       system: {
         label: '系统代理',
@@ -80,6 +82,12 @@ const zhHans = {
         label: '仅代理端口',
         desc: '不修改系统设置，手动将浏览器/客户端代理指向 127.0.0.1:{port}',
       },
+    },
+    probe: {
+      running: '正在探测网络节点，按连接时长择优排序…',
+      done: '已择优 {ok}/{total} 个节点，最快 {ms}ms',
+      failed: '节点探测未完成，竞速将按默认顺序尝试',
+      partial: '节点探测被预算截断，已按已完成部分择优',
     },
   },
   settings: {
@@ -132,8 +140,10 @@ const zhHans = {
     okRegenerate: '重新生成',
     cancel: '取消',
     certHint:
-      '安装到系统信任存储是 HTTPS 加速（MITM）的前提，Windows 下安装会弹出 UAC 提权确认。' +
-      '也可导出 PEM 后手动导入到「受信任的根证书颁发机构」。',
+      '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下会弹出 UAC 提权确认，' +
+      'macOS 下会弹出管理员密码框。也可导出 PEM 后手动导入到「受信任的根证书颁发机构」。',
+    elevateMacHint: 'macOS 下安装 / 卸载根证书会弹出系统管理员密码框（需写入系统钥匙串）。',
+    elevateCancelled: '已取消管理员授权，操作未完成。',
   },
   logs: {
     accessTab: '访问日志',

@@ -4,6 +4,7 @@ members = [
     "crates/watt-core",
     "crates/watt-cert",
     "crates/watt-hosts",
+    "crates/watt-elevate",
     "crates/watt-script",
     "crates/watt-dns",
     "crates/watt-config",
@@ -12,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0"
 repository = "https://github.com/WattToolkit/WattToolkit"
@@ -20,6 +21,7 @@ repository = "https://github.com/WattToolkit/WattToolkit"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+libc = "0.2"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
@@ -52,6 +54,7 @@ rquickjs = "0.12"
 watt-core = { path = "crates/watt-core" }
 watt-cert = { path = "crates/watt-cert" }
 watt-hosts = { path = "crates/watt-hosts" }
+watt-elevate = { path = "crates/watt-elevate" }
 watt-script = { path = "crates/watt-script" }
 watt-dns = { path = "crates/watt-dns" }
 watt-config = { path = "crates/watt-config" }

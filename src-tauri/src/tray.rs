@@ -205,6 +205,10 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         scripts: Vec::new(),
         ca,
         hosts_path: None,
+        // 托盘启动沿用 P2 默认关（不落盘、不裁剪）；如需开启经 engine_start 参数
+        probe_cache_path: None,
+        probe_cache_persist: false,
+        probe_top_k: None,
     };
 
     let mut engine = state.engine.lock().await;

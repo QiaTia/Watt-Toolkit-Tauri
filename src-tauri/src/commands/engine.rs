@@ -38,6 +38,12 @@ pub struct EngineStartParams {
     pub server_side_proxy_token: Option<String>,
     #[serde(default)]
     pub rules: Vec<DomainRule>,
+    /// 探测缓存落盘（P2，默认关）
+    #[serde(default)]
+    pub probe_cache_persist: bool,
+    /// top-K 裁剪（P2，默认关= None）
+    #[serde(default)]
+    pub probe_top_k: Option<usize>,
 }
 
 /// 引擎状态（Rust → 前端）
@@ -126,6 +132,12 @@ pub async fn engine_start(
         scripts: Vec::new(),
         ca,
         hosts_path: None,
+        // P2：探测缓存落盘（默认关；开启时路径为 {settings_dir}/probe-cache.json）
+        probe_cache_path: params.probe_cache_persist.then(|| {
+            watt_config::settings::settings_dir().join("probe-cache.json")
+        }),
+        probe_cache_persist: params.probe_cache_persist,
+        probe_top_k: params.probe_top_k.filter(|k| *k > 0),
     };
 
     let mut engine = state.engine.lock().await;
@@ -150,6 +162,15 @@ pub async fn engine_stop(
     crate::tray::sync_tray_label(&app, false);
     let _ = app.emit(crate::tray::ENGINE_STATE_EVENT, ());
     Ok(dto)
+}
+
+/// 最近一次候选探测摘要（UI「已择优」展示；None = 尚未探测或无规则）
+#[tauri::command]
+pub async fn engine_probe_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<watt_core::probe_cache::ProbeSummary>, String> {
+    let engine = state.engine.lock().await;
+    Ok(engine.probe_summary())
 }
 
 #[tauri::command]

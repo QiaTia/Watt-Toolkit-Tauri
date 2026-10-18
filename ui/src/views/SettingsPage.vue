@@ -5,6 +5,7 @@ import { useSettingsStore } from '@/stores/settings';
 import { useCertStore } from '@/stores/cert';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
+import { isMacOS } from '@/utils/platform';
 import type { ProxyMode } from '@/types/ipc';
 
 const settings = useSettingsStore();
@@ -12,6 +13,9 @@ const cert = useCertStore();
 // 主题/语言即时生效（localStorage 持久化），不走「保存设置」
 const theme = useThemeStore();
 const { t } = useI18n();
+
+/** macOS 提权提示（钥匙串写入弹管理员密码框） */
+const isMac = isMacOS();
 
 /** 语言选择器双向绑定（写 localStorage + 切 i18n locale） */
 const language = computed<LocaleCode>({
@@ -119,7 +123,9 @@ async function withCertError(action: () => Promise<void>): Promise<void> {
   try {
     await action();
   } catch (e) {
-    certError.value = e instanceof Error ? e.message : String(e);
+    const msg = e instanceof Error ? e.message : String(e);
+    // 提权取消：后端错误含"取消"，映射为本地化文案
+    certError.value = msg.includes('取消') ? t('settings.elevateCancelled') : msg;
   }
 }
 
@@ -335,6 +341,10 @@ function formatTime(iso: string): string {
         <template #message>{{ certError }}</template>
       </a-alert>
 
+      <a-typography-paragraph v-if="isMac" type="secondary" class="cert-elevate-hint">
+        {{ $t('settings.elevateMacHint') }}
+      </a-typography-paragraph>
+
       <a-space :size="12" wrap>
         <a-button v-if="!cert.status.installed" type="primary" :loading="cert.busy" @click="installCa">
           {{ $t('settings.install') }}
@@ -408,5 +418,8 @@ function formatTime(iso: string): string {
 .fp {
   font-size: 12px;
   letter-spacing: 0.5px;
+}
+.cert-elevate-hint {
+  margin-bottom: 4px;
 }
 </style>

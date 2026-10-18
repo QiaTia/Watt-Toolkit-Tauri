@@ -181,7 +181,12 @@ async fn tunnel_to(
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dns = Arc::new(RelayDnsAdapter(ctx.dns.clone()));
-    let outbound = crate::outbound::OutboundConnector::new(dns, ctx.upstream.clone());
+    let mut outbound = crate::outbound::OutboundConnector::new(dns, ctx.upstream.clone())
+        .with_probe(ctx.probe_cache.clone());
+    // top-K 裁剪（P2，默认关）
+    if let Some(k) = ctx.probe_top_k {
+        outbound = outbound.with_probe_top_k(k);
+    }
     let target = crate::outbound::OutboundTarget {
         host: host.to_string(),
         port,

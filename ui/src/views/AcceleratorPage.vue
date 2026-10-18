@@ -5,6 +5,7 @@ import AntApp from 'ant-design-vue/es/app';
 import { useProxyStore } from '@/stores/proxy';
 import { useSettingsStore } from '@/stores/settings';
 import { useAccelerateStore } from '@/stores/accelerate';
+import { isMacOS } from '@/utils/platform';
 import type {
   AccelerateProject,
   AccelerateProjectGroup,
@@ -71,12 +72,25 @@ const selectedMode = computed({
   },
 });
 
-const currentModeDescription = computed(
-  () => modeOptions.value.find((opt) => opt.value === selectedMode.value)?.description ?? '',
-);
+const currentModeDescription = computed(() => {
+  const desc =
+    modeOptions.value.find((opt) => opt.value === selectedMode.value)?.description ?? '';
+  // macOS 下 Hosts 模式写入 /etc/hosts 需提权，补充弹窗说明
+  if (isMacOS() && selectedMode.value === 'Hosts') {
+    return `${desc} ${t('accel.modes.hosts.descMac')}`;
+  }
+  return desc;
+});
+
+/* ========== 探测状态展示（启动预择优：探测中 / 已择优 N/M 最快 Xms） ========== */
+const probeStatusText = computed(() => {
+  const s = proxy.probeSummary;
+  if (s === null) return t('accel.probe.running');
+  if (s.ok === 0) return t('accel.probe.failed');
+  return t('accel.probe.done', { ok: s.ok, total: s.candidates, ms: s.fastestMs ?? 0 });
+});
 
 /* ========== 加速项目检索过滤（仅影响展示，不影响勾选与持久化） ========== */
-
 const keyword = ref('');
 const normKeyword = computed(() => keyword.value.trim().toLowerCase());
 const searching = computed(() => normKeyword.value.length > 0);
@@ -316,6 +330,12 @@ async function toggleEngine(): Promise<void> {
           {{ proxy.isRunning ? $t('accel.stop') : $t('accel.start') }}
         </a-button>
       </div>
+      <a-typography-paragraph v-if="proxy.isRunning" type="secondary" class="probe-hint">
+        <template v-if="proxy.probeSummary?.finished === false">
+          {{ t('accel.probe.partial') }}
+        </template>
+        <template v-else>{{ probeStatusText }}</template>
+      </a-typography-paragraph>
       <a-row v-if="proxy.isRunning" :gutter="32" class="stats-row">
         <a-col>
           <a-statistic :title="$t('common.up')" :value="formatBytes(proxy.stats.upBytes)" />
@@ -470,6 +490,11 @@ async function toggleEngine(): Promise<void> {
 
 .stats-row {
   margin-top: 16px;
+}
+
+.probe-hint {
+  margin-top: 8px;
+  margin-bottom: 0;
 }
 
 .search-input {

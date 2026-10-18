@@ -257,44 +257,169 @@ pub mod platform {
 
 #[cfg(target_os = "macos")]
 pub mod platform {
-    use super::TrustError;
+    use super::{sha1_hex, TrustError, CA_SUBJECT_CN};
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Output};
 
     const KEYCHAIN: &str = "/Library/Keychains/System.keychain";
 
+    /// 直接执行 security 命令（不提权），捕获输出便于诊断
+    fn security_output(args: &[&str]) -> Result<Output, TrustError> {
+        Command::new("security")
+            .args(args)
+            .output()
+            .map_err(|e| TrustError::Trust(format!("security: {e}")))
+    }
+
+    /// stderr 是否**疑似**权限问题（保守策略：无法明确判定时按权限处理，给提权重试机会）
+    ///
+    /// 注意与函数名的关系：返回 true 表示「不排除权限问题」，而非「确定是权限问题」。
+    /// 仅对明确的非权限错误（文件不存在/证书无法加载/格式无效）返回 false 直接报错，
+    /// 避免无谓弹窗；其余一概提权重试。
+    fn is_likely_permission_error(stderr: &str) -> bool {
+        let s = stderr.to_ascii_lowercase();
+        // 明确非权限错误：不弹窗，直接报错（"No matching certificates" = CN 不匹配，绝无提权必要）
+        !(s.contains("no such file")
+            || s.contains("unable to load")
+            || s.contains("invalid")
+            || s.contains("no matching certificates"))
+    }
+
     /// 安装根证书到系统钥匙串（对齐 security add-trusted-cert）
+    ///
+    /// 两段式：先直试（进程恰好有权限时免弹窗）；失败且疑似权限问题时经
+    /// `watt-elevate` 提权重试（osascript 弹一次管理员密码框）。
     pub fn install_root_cert(cert_pem_path: &Path) -> Result<(), TrustError> {
-        let status = Command::new("security")
-            .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k", KEYCHAIN])
-            .arg(cert_pem_path)
-            .status()
-            .map_err(|e| TrustError::Trust(format!("security: {e}")))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(TrustError::Elevation(
-                "security add-trusted-cert 失败".into(),
-            ))
+        let path = cert_pem_path.to_string_lossy().to_string();
+        let direct = security_output(&[
+            "add-trusted-cert",
+            "-d",
+            "-r",
+            "trustRoot",
+            "-k",
+            KEYCHAIN,
+            &path,
+        ]);
+        if let Ok(out) = &direct {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+        // 直试失败：判定是否值得提权重试
+        let direct_err = match &direct {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !is_likely_permission_error(&stderr) {
+                    return Err(TrustError::Trust(format!(
+                        "security add-trusted-cert 失败: {}",
+                        stderr.trim()
+                    )));
+                }
+                format!("security add-trusted-cert 失败: {}", stderr.trim())
+            }
+            Err(e) => e.to_string(),
+        };
+
+        match watt_elevate::run_as_admin_with_prompt(
+            "security",
+            &[
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                KEYCHAIN,
+                &path,
+            ],
+            Some(watt_elevate::ElevatePurpose::InstallCert.prompt()),
+        ) {
+            Ok(_) => Ok(()),
+            Err(watt_elevate::ElevateError::Cancelled) => {
+                Err(TrustError::Elevation("用户取消了管理员授权".into()))
+            }
+            Err(e) => Err(TrustError::Elevation(format!(
+                "{direct_err}；提权重试失败: {e}"
+            ))),
         }
     }
 
+    /// 卸载根证书：两段式（直试 → 提权重试），且必须补删证书本体。
+    ///
+    /// `security remove-trusted-cert` 只移除**信任设置**，证书本身可能仍留在
+    /// System.keychain，导致 `is_root_cert_installed`（钥匙串 SHA-1 比对）误报
+    /// "已安装"。因此提权命令串联删除证书本体（单次弹窗完成）：
+    /// `remove-trusted-cert -d CN=<CN> && delete-certificate -Z <sha1> <keychain>`。
     pub fn remove_root_cert() -> Result<(), TrustError> {
-        let status = Command::new("security")
-            .args([
-                "remove-trusted-cert",
-                "-d",
-                &format!("CN={}", super::CA_SUBJECT_CN),
-            ])
-            .status()
-            .map_err(|e| TrustError::Trust(format!("security: {e}")))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(TrustError::Trust(
-                "security remove-trusted-cert 失败".into(),
-            ))
+        let cn = format!("CN={CA_SUBJECT_CN}");
+
+        // 直试删信任设置（已 root 运行时免弹窗）
+        let direct = security_output(&["remove-trusted-cert", "-d", &cn]);
+        if let Ok(out) = &direct {
+            if out.status.success() {
+                // 信任设置删除成功；证书本体是否残留由 find-certificate 判定，
+                // 残留时仍需提权补删（见下方 hash 分支）。
+                if find_cert_hash().is_none() {
+                    return Ok(());
+                }
+            } else {
+                // 直试失败：与 install 对齐——明确非权限错误（如 CN 不匹配）不弹窗，
+                // 直接报错，避免无谓弹一次管理员密码框
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !is_likely_permission_error(&stderr) {
+                    return Err(TrustError::Trust(format!(
+                        "security remove-trusted-cert 失败: {}",
+                        stderr.trim()
+                    )));
+                }
+            }
         }
+
+        // 只读查询证书 SHA-1（无需提权），供 delete-certificate -Z 精确定位；
+        // 查询失败则退回 -c CN 名称匹配。
+        let mut del_args: Vec<String> = vec!["delete-certificate".into(), "-Z".into()];
+        match find_cert_hash() {
+            Some(hash) => del_args.push(hash),
+            None => {
+                del_args = vec!["delete-certificate".into(), "-c".into(), CA_SUBJECT_CN.into()];
+            }
+        }
+        del_args.push(KEYCHAIN.into());
+
+        // 单次弹窗完成：删信任设置 + 删证书本体
+        let script = format!(
+            "{} && {}",
+            watt_elevate::build_shell_command("security", &["remove-trusted-cert", "-d", &cn]),
+            watt_elevate::build_shell_command("security", &del_args.iter().map(String::as_str).collect::<Vec<_>>()),
+        );
+        match watt_elevate::run_as_admin_shell(
+            &script,
+            Some(watt_elevate::ElevatePurpose::RemoveCert.prompt()),
+        ) {
+            Ok(_) => Ok(()),
+            Err(watt_elevate::ElevateError::Cancelled) => {
+                Err(TrustError::Elevation("用户取消了管理员授权".into()))
+            }
+            Err(e) => Err(TrustError::Elevation(format!(
+                "security remove-trusted-cert 失败；提权重试失败: {e}"
+            ))),
+        }
+    }
+
+    /// 只读查询钥匙串中本 CA 的 SHA-1（find-certificate -c <CN> -Z <keychain>）
+    fn find_cert_hash() -> Option<String> {
+        let out = security_output(&["find-certificate", "-c", CA_SUBJECT_CN, "-Z", KEYCHAIN]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().find_map(|l| {
+            l.split_once(':').and_then(|(k, v)| {
+                k.trim()
+                    .eq_ignore_ascii_case("SHA-1 hash")
+                    .then(|| v.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
     }
 
     /// 检查根证书是否已安装（钥匙串中存在同 SHA-1 指纹证书）
@@ -308,7 +433,7 @@ pub mod platform {
         else {
             return false;
         };
-        let sha1 = super::sha1_hex(&der);
+        let sha1 = sha1_hex(&der);
         match Command::new("security")
             .args(["find-certificate", "-a", "-Z", KEYCHAIN])
             .output()
