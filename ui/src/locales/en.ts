@@ -126,6 +126,16 @@ const en: Schema = {
     masterDns: 'Custom Primary DNS',
     useDoh: 'Use DoH',
     dohAddr: 'Custom DoH Address',
+    ipPoolTitle: 'IP Pool Update',
+    ipPoolHint:
+      'Resolve the domains of enabled acceleration projects via healthy DNS, probe each IP ' +
+      'locally (TCP + TLS handshake), and write the usable IPs into the outbound IP pool.',
+    ipPoolRefresh: 'Refresh IP Pool',
+    ipPoolSummary: '{hosts} domains, {ok}/{candidates} candidates usable',
+    ipPoolHost: 'Domain',
+    ipPoolUsable: 'Usable',
+    ipPoolFastest: 'Fastest',
+    ipPoolNone: 'None',
     certTitle: 'CA Certificate',
     trustStatus: 'Trust Status',
     trusted: 'Installed & Trusted',

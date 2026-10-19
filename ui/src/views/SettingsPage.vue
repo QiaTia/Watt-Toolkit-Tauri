@@ -6,7 +6,8 @@ import { useCertStore } from '@/stores/cert';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
 import { isMacOS } from '@/utils/platform';
-import type { ProxyMode } from '@/types/ipc';
+import { ipPoolRefresh } from '@/api';
+import type { IpPoolHostResult, ProxyMode } from '@/types/ipc';
 
 const settings = useSettingsStore();
 const cert = useCertStore();
@@ -152,6 +153,45 @@ function groupFingerprint(hex: string): string {
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleString();
+}
+
+/* ———— 动态 IP 池：从健康 DNS 解析 + 本地探测 → 更新出站 IP 池 ———— */
+
+/** 刷新忙碌态 */
+const poolRefreshing = ref(false);
+/** 逐域名刷新结果 */
+const poolResults = ref<IpPoolHostResult[]>([]);
+/** 刷新错误（命令层异常） */
+const poolError = ref<string | null>(null);
+/** 最近一次刷新完成时间（null = 本次会话尚未刷新） */
+const poolDoneAt = ref<number | null>(null);
+
+const poolColumns = computed(() => [
+  { key: 'host', title: t('settings.ipPoolHost') },
+  { key: 'ok', title: t('settings.ipPoolUsable'), width: 110 },
+  { key: 'fastest', title: t('settings.ipPoolFastest'), width: 120 },
+]);
+
+const poolOkTotal = computed(() => poolResults.value.reduce((n, r) => n + r.ok, 0));
+const poolCandidateTotal = computed(() => poolResults.value.reduce((n, r) => n + r.candidates, 0));
+
+/** 该域名通过候选中的最小 RTT（无通过者 = null） */
+function fastestRtt(r: IpPoolHostResult): number | null {
+  const rtts = r.ips.filter((i) => i.rttMs !== null).map((i) => i.rttMs as number);
+  return rtts.length ? Math.min(...rtts) : null;
+}
+
+async function refreshIpPool(): Promise<void> {
+  poolRefreshing.value = true;
+  poolError.value = null;
+  try {
+    poolResults.value = await ipPoolRefresh();
+    poolDoneAt.value = Date.now();
+  } catch (e) {
+    poolError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    poolRefreshing.value = false;
+  }
 }
 </script>
 
@@ -308,6 +348,61 @@ function formatTime(iso: string): string {
       </a-form>
     </a-card>
 
+    <a-card :bordered="false" :title="$t('settings.ipPoolTitle')" class="panel">
+      <a-typography-paragraph type="secondary" class="field-hint">
+        {{ $t('settings.ipPoolHint') }}
+      </a-typography-paragraph>
+
+      <a-space :size="12" wrap align="center">
+        <a-button type="primary" :loading="poolRefreshing" @click="refreshIpPool">
+          {{ $t('settings.ipPoolRefresh') }}
+        </a-button>
+        <a-typography-text v-if="poolDoneAt !== null" type="secondary">
+          {{
+            $t('settings.ipPoolSummary', {
+              hosts: poolResults.length,
+              ok: poolOkTotal,
+              candidates: poolCandidateTotal,
+            })
+          }}
+        </a-typography-text>
+      </a-space>
+
+      <a-alert v-if="poolError" type="error" show-icon class="cert-error pool-error">
+        <template #message>{{ poolError }}</template>
+      </a-alert>
+
+      <a-table
+        v-if="poolResults.length"
+        size="small"
+        row-key="host"
+        :pagination="false"
+        :columns="poolColumns"
+        :data-source="poolResults"
+        class="pool-table"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'host'">
+            <span class="mono">{{ record.host }}</span>
+            <a-typography-text v-if="record.source" type="secondary" class="pool-source">
+              · {{ record.source }}
+            </a-typography-text>
+          </template>
+          <template v-else-if="column.key === 'ok'">
+            <a-tag :color="record.ok > 0 ? 'success' : 'error'">
+              {{ record.ok }} / {{ record.candidates }}
+            </a-tag>
+          </template>
+          <template v-else-if="column.key === 'fastest'">
+            <span v-if="fastestRtt(record as IpPoolHostResult) !== null">
+              {{ fastestRtt(record as IpPoolHostResult) }} ms
+            </span>
+            <a-typography-text v-else type="secondary">{{ $t('settings.ipPoolNone') }}</a-typography-text>
+          </template>
+        </template>
+      </a-table>
+    </a-card>
+
     <a-card v-if="cert.status" :bordered="false" :title="$t('settings.certTitle')" class="panel">
       <a-descriptions :column="{ xs: 1, sm: 2 }" size="small" bordered class="cert-desc">
         <a-descriptions-item :label="$t('settings.trustStatus')">
@@ -393,6 +488,18 @@ function formatTime(iso: string): string {
 
 .cert-desc {
   margin-bottom: 16px;
+}
+
+.pool-table {
+  margin-top: 16px;
+}
+
+.pool-source {
+  font-size: 12px;
+}
+
+.pool-error {
+  margin-top: 12px;
 }
 
 .cert-error {

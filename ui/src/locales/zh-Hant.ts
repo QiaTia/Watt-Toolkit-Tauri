@@ -117,6 +117,16 @@ const zhHant: Schema = {
     masterDns: '自訂主 DNS',
     useDoh: '使用 DoH',
     dohAddr: '自訂 DoH 位址',
+    ipPoolTitle: 'IP 池更新',
+    ipPoolHint:
+      '從健康 DNS 解析目前勾選加速專案的網域 IP，逐一在本機探測（TCP + TLS 握手），' +
+      '將可用 IP 寫入出站 IP 池，供加速連線擇優使用。',
+    ipPoolRefresh: '重新整理 IP 池',
+    ipPoolSummary: '共 {hosts} 個網域，{ok}/{candidates} 個候選可用',
+    ipPoolHost: '網域',
+    ipPoolUsable: '可用',
+    ipPoolFastest: '最快',
+    ipPoolNone: '無',
     certTitle: 'CA 憑證',
     trustStatus: '信任狀態',
     trusted: '已安裝並信任',

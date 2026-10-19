@@ -14,6 +14,7 @@ import type {
   EngineStartParams,
   EngineStateDto,
   FlowStatsDto,
+  IpPoolHostResult,
   ProbeSummaryDto,
   ProxySettings,
   RuntimeLogFilter,
@@ -112,6 +113,13 @@ export function accelerateGetRules(enabledIds: string[]): Promise<DomainRule[]> 
 /** 分组连通性测试：并发对每个域名发起完整 HTTPS GET 并计时 */
 export function accelerateConnectivityTest(hosts: string[]): Promise<ConnectivityTestItem[]> {
   return invoke('accelerate_connectivity_test', { hosts });
+}
+
+/* 动态 IP 池 */
+
+/** 从健康 DNS 解析已勾选项目域名 → 本地探测可用 IP → 更新出站 IP 池 */
+export function ipPoolRefresh(): Promise<IpPoolHostResult[]> {
+  return invoke('ip_pool_refresh');
 }
 
 /* 日志 */

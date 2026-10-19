@@ -64,6 +64,9 @@ pub fn run() {
             // 首启迁移：旧版设置 + CA PFX 导入（PFX 成功后由 load_or_generate 加载）
             let migration = migrate::run_startup_migration(&data_dir);
 
+            // 动态 IP 池热启动：加载上次刷新的结果（供引擎出站候选直接使用）
+            watt_core::ip_pool::load_from(&data_dir.join("Settings").join("IpPool.json"));
+
             // CA 加载或生成
             let cert_dir = data_dir.join("Certificates");
             let ca = Arc::new(
@@ -126,6 +129,7 @@ pub fn run() {
             commands::accelerate::accelerate_set_enabled,
             commands::accelerate::accelerate_get_rules,
             commands::accelerate::accelerate_connectivity_test,
+            commands::ip_pool::ip_pool_refresh,
             commands::logs::proxy_access_logs,
             commands::logs::proxy_access_logs_clear,
             commands::logs::runtime_logs,

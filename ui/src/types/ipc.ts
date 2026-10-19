@@ -202,6 +202,30 @@ export interface EngineStartParams {
   rules: DomainRule[];
 }
 
+/* ========== 动态 IP 池（命令层 camelCase） ========== */
+
+/** 单个候选 IP 的探测结果 */
+export interface IpPoolProbeItem {
+  ip: string;
+  /** 握手全链路 RTT（毫秒）；null = 未通过 */
+  rttMs: number | null;
+}
+
+/** 单个域名的 IP 池刷新结果 */
+export interface IpPoolHostResult {
+  host: string;
+  /** DNS 解析到的候选数（去重 + 过滤后） */
+  candidates: number;
+  /** 探测通过的候选数 */
+  ok: number;
+  /** 全部候选及探测结果（通过者在前、按 RTT 升序） */
+  ips: IpPoolProbeItem[];
+  /** 命中的解析来源（如 `DoH https://223.5.5.5/dns-query`） */
+  source: string | null;
+  /** 失败原因：dns_resolve_empty（无解析结果）/ all_unreachable（全部不可达） */
+  error: string | null;
+}
+
 /* ========== 日志（访问日志 + 运行日志；命令层 camelCase） ========== */
 
 /** 访问日志处置分类 */

@@ -497,7 +497,20 @@ impl OutboundConnector {
             Ok(addrs) if !addrs.is_empty() => candidate_groups.push(addrs),
             _ => {}
         }
-        // 备用 IP 池兜底：部分服务的权威 DNS 只返回单个 A 记录，一旦该 IP 被阻断，
+        // 动态 IP 池（设置页「刷新 IP 池」由健康 DNS 解析 + 本地探测写入）：
+        // 优先于内置静态备用池——它是按当前网络实测得来的可用 IP，时效性更好。
+        // 与静态池同为竞速候选，追加不增加成功路径的延迟。
+        let dynamic = crate::ip_pool::dynamic_ips(&target.host);
+        if !dynamic.is_empty() {
+            candidate_groups.push(
+                dynamic
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, target.port))
+                    .collect(),
+            );
+        }
+
+        // 内置静态备用 IP 池兜底：部分服务的权威 DNS 只返回单个 A 记录，一旦该 IP 被阻断，
         // 上面的覆盖 IP 与 DNS 候选会一起失败（现象为 500 连接失败），但同期该服务的
         // 其他入口 IP 往往仍然可达。竞速下追加候选不增加成功路径的延迟。
         let fallback = crate::fallback::fallback_ips(&target.host);

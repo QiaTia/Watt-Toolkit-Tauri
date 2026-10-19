@@ -119,6 +119,16 @@ const zhHans = {
     masterDns: '自定义主 DNS',
     useDoh: '使用 DoH',
     dohAddr: '自定义 DoH 地址',
+    ipPoolTitle: 'IP 池更新',
+    ipPoolHint:
+      '从健康 DNS 解析当前已勾选加速项目的域名 IP，逐 IP 在本地探测（TCP + TLS 握手），' +
+      '把可用 IP 写入出站 IP 池，供加速连接择优使用。',
+    ipPoolRefresh: '刷新 IP 池',
+    ipPoolSummary: '共 {hosts} 个域名，{ok}/{candidates} 个候选可用',
+    ipPoolHost: '域名',
+    ipPoolUsable: '可用',
+    ipPoolFastest: '最快',
+    ipPoolNone: '无',
     certTitle: 'CA 证书',
     trustStatus: '信任状态',
     trusted: '已安装并信任',

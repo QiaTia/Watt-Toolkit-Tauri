@@ -124,6 +124,16 @@ const ja: Schema = {
     masterDns: 'カスタム メイン DNS',
     useDoh: 'DoH を使用',
     dohAddr: 'カスタム DoH アドレス',
+    ipPoolTitle: 'IP プール更新',
+    ipPoolHint:
+      '選択中の加速プロジェクトのドメインを健全な DNS で解決し、各 IP をローカルで検証' +
+      '（TCP + TLS ハンドシェイク）して、利用可能な IP を送信 IP プールに書き込みます。',
+    ipPoolRefresh: 'IP プールを更新',
+    ipPoolSummary: '{hosts} ドメイン、{ok}/{candidates} 候補が利用可能',
+    ipPoolHost: 'ドメイン',
+    ipPoolUsable: '利用可能',
+    ipPoolFastest: '最速',
+    ipPoolNone: 'なし',
     certTitle: 'CA 証明書',
     trustStatus: '信頼状態',
     trusted: 'インストール済み（信頼済み）',

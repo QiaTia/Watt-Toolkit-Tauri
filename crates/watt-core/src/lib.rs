@@ -14,6 +14,7 @@ pub mod fallback;
 pub mod forward_proxy;
 pub mod http_relay;
 pub mod inject;
+pub mod ip_pool;
 pub mod listener;
 pub mod local_domain;
 pub mod outbound;

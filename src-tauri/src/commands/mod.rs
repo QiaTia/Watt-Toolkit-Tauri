@@ -4,6 +4,7 @@ pub mod accelerate;
 pub mod app_info;
 pub mod cert;
 pub mod engine;
+pub mod ip_pool;
 pub mod logs;
 pub mod migrate;
 pub mod settings;

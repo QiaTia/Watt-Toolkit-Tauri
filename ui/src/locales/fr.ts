@@ -129,6 +129,16 @@ const fr: Schema = {
     masterDns: 'DNS principal personnalisé',
     useDoh: 'Utiliser DoH',
     dohAddr: 'Adresse DoH personnalisée',
+    ipPoolTitle: 'Mise à jour du pool d’IP',
+    ipPoolHint:
+      'Résout les domaines des projets d’accélération cochés via un DNS sain, teste chaque IP ' +
+      'localement (handshake TCP + TLS) et écrit les IP utilisables dans le pool d’IP sortant.',
+    ipPoolRefresh: 'Rafraîchir le pool d’IP',
+    ipPoolSummary: '{hosts} domaines, {ok}/{candidates} candidats utilisables',
+    ipPoolHost: 'Domaine',
+    ipPoolUsable: 'Utilisable',
+    ipPoolFastest: 'Le plus rapide',
+    ipPoolNone: 'Aucun',
     certTitle: 'Certificat CA',
     trustStatus: 'État de confiance',
     trusted: 'Installé et approuvé',
