@@ -18,14 +18,25 @@
 //!
 //! Figma 各域分处不同 AWS 基础设施，但均可由「域名 → 覆盖 IP」直达：
 //! - `www.figma.com` / `static.figma.com` / `cdn.figma.com` 位于 CloudFront
-//!   （`99.86.x` / `18.65.x` 任播段），任意边缘 IP 均可凭 SNI + Host 出具有
-//!   效证书并路由到对应分发；
+//!   任播段，任意边缘 IP 均可凭 SNI + Host 出具有效证书并路由到对应分发；
 //! - `api.figma.com` 位于 AWS Global Accelerator（`13.35.190.x` 任播段，
 //!   实测亦可经 CloudFront 边缘 IP 访问）；
 //! - `s3-alpha-sig.figma.com`（预览图）位于 AWS S3（`65.8.76.35`，
 //!   实测同样可经 CloudFront 边缘 IP 访问）。
 //!
 //! 因此每个加速项各自携带覆盖 IP，出站候选链再叠加 `fallback.rs` 的 Figma 备用 IP 池竞速兜底（个别 CloudFront 任播 IP 不可达时自动跳过）。
+//!
+//! **覆盖 IP 选型铁律（2026-10 修正）**：`99.86.x` 段（原选型）在部分网络下只放行
+//! 小请求——TCP/TLS 握手与 ≤1KB 请求正常，**上行负载 >~1.2KB 被静默黑洞**（约 19s
+//! 后连接被重置，且无 ICMP 分片不可达）。由于竞速的胜出条件是「TLS 握手完成」，
+//! 该段 IP 必然胜出（握手快），导致所有带较大请求体的 POST 失败——登录
+//! `POST /api/session/login` 正是这种情况，浏览器表现为「无法登录」。
+//! 实测该段全部黑洞，而 `18.65.14.x` 段（CloudFront 标准边缘）在 16KB 上行负载下
+//! 正常。故 Figma 全系覆盖 IP 与备用池统一改用 `18.65.14.x`；`api.figma.com` 的
+//! GA 段亦剔除实测黑洞的 `13.35.190.56`。
+//!
+//! （判定方法：不经引擎直连候选 IP 发 >1.2KB 的 POST，对比 `18.65.14.x` 与
+//! `99.86.x`；`diag_post_body` 测试保留该回归点。）
 //!
 //! **注意**：不得向监听域名写入裸 `figma.com`——`help.figma.com` 等营销/帮助
 //! 子域不在 CloudFront 上，经边缘 IP 访问会因证书 SNI 不匹配而 TLS 失败。
@@ -118,10 +129,11 @@ pub fn google_translate_group() -> AccelerateProjectGroup {
 /// 内置「Figma」分组 Id（固定 GUID，持久化键）
 pub const FIGMA_GROUP_ID: &str = "d155261c-1e3c-4318-b2c9-e8bd060eada7";
 
-/// Figma 各加速项的覆盖 IP（2026-10 实测：TLS 全证书验证通过 + HTTP 可达）。
+/// Figma 各加速项的覆盖 IP（2026-10 实测：TLS 证书验证通过 + HTTP 可达 +
+/// **上行负载 >1KB 不被黑洞**——后者是登录类 POST 的必要条件，见模块文档）。
 /// 覆盖 IP 仅作为出站候选链首选项，失效时由 DNS 与 `fallback.rs` 备用池接力。
-const FIGMA_WEB_IP: &str = "99.86.18.30"; // CloudFront（www.figma.com）
-const FIGMA_API_IP: &str = "13.35.190.56"; // AWS Global Accelerator（api.figma.com）
+const FIGMA_WEB_IP: &str = "18.65.14.118"; // CloudFront（www.figma.com）
+const FIGMA_API_IP: &str = "13.35.190.115"; // AWS Global Accelerator（api.figma.com）
 const FIGMA_THUMBNAIL_IP: &str = "65.8.76.35"; // AWS S3（s3-alpha-sig.figma.com）
 const FIGMA_STATIC_IP: &str = "18.65.14.118"; // CloudFront（static.figma.com）
 const FIGMA_CDN_IP: &str = "18.65.14.71"; // CloudFront（cdn.figma.com）
@@ -456,8 +468,8 @@ mod tests {
                 .find(|i| i.rule.match_domain_names.contains(&domain.to_string()))
                 .and_then(|i| i.rule.fields.ip_address.map(|ip| ip.to_string()))
         };
-        assert_eq!(ip_of("www.figma.com").as_deref(), Some("99.86.18.30"));
-        assert_eq!(ip_of("api.figma.com").as_deref(), Some("13.35.190.56"));
+        assert_eq!(ip_of("www.figma.com").as_deref(), Some("18.65.14.118"));
+        assert_eq!(ip_of("api.figma.com").as_deref(), Some("13.35.190.115"));
         assert_eq!(
             ip_of("s3-alpha-sig.figma.com").as_deref(),
             Some("65.8.76.35")

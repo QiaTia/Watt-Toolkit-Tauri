@@ -73,29 +73,31 @@ const GOOGLE_TRANSLATE_IPS: &[&str] = &[
 ];
 
 /// Figma 全系（www / static / cdn / s3-alpha-sig / api）备用 IP：CloudFront
-/// 任播边缘段。2026-10 实测：任意 99.86.x 边缘 IP 凭 SNI + Host 对全部
-/// figma.com 加速域均出具有效证书（静态资源经覆盖 IP 取回内容与直连一致）。
-/// 99.86.24.5 实测不可达，不入池；个别 IP 失效由竞速自动跳过。
+/// 标准边缘段。2026-10 实测：任意 `18.65.14.x` 边缘 IP 凭 SNI + Host 对全部
+/// figma.com 加速域均出具有效证书，且 **上行负载 16KB 仍可正常送达**。
+///
+/// **不得使用 `99.86.x` 段**：该段在部分网络下只放行小请求——TCP/TLS 握手与
+/// ≤1KB 请求正常，上行负载 >~1.2KB 被静默黑洞（约 19s 后连接被重置）。由于
+/// 竞速的胜出条件是「TLS 握手完成」，该段 IP 握手最快、必然胜出，会导致所有
+/// 带较大请求体的 POST（如登录 `POST /api/session/login`）失败。详见
+/// `watt-cloud::builtin` 模块文档的「覆盖 IP 选型铁律」。
 const FIGMA_CF_IPS: &[&str] = &[
-    "99.86.18.30",
-    "99.86.18.5",
-    "99.86.18.28",
-    "99.86.18.67",
-    "99.86.19.5",
-    "99.86.20.5",
-    "99.86.21.5",
-    "99.86.22.5",
-    "99.86.23.5",
+    "18.65.14.5",
+    "18.65.14.30",
+    "18.65.14.50",
+    "18.65.14.71",
+    "18.65.14.100",
+    "18.65.14.102",
+    "18.65.14.118",
+    "18.65.14.150",
+    "18.65.14.200",
 ];
 
 /// `api.figma.com` 的 AWS Global Accelerator 任播段（原生路径，实测最快）。
 /// 该段仅对 api.figma.com 有效（GA 任播 IP 按加速器绑定），只对 api 域返回。
-const FIGMA_API_GA_IPS: &[&str] = &[
-    "13.35.190.56",
-    "13.35.190.115",
-    "13.35.190.109",
-    "13.35.190.39",
-];
+/// **已剔除实测黑洞的 `13.35.190.56`**（同 `99.86.x`，TCP/TLS 可完成但
+/// 上行负载 >1.2KB 被静默黑洞）。
+const FIGMA_API_GA_IPS: &[&str] = &["13.35.190.115", "13.35.190.109", "13.35.190.39"];
 
 /// `errors.figma.com`（Sentry 错误上报）与 `s3-alpha-sig.figma.com`（预览图）
 /// 的 AWS S3 段。2026-10 实测：S3 段 IP 凭 SNI + Host 可服务两个域。
@@ -228,7 +230,7 @@ mod tests {
             let ips = fallback_ips(host);
             assert!(!ips.is_empty(), "{host} 应有备用 IP");
             assert!(
-                ips.iter().any(|ip| ip.to_string() == "99.86.18.30"),
+                ips.iter().any(|ip| ip.to_string() == "18.65.14.118"),
                 "{host} 应命中 CloudFront 边缘段"
             );
         }
@@ -239,10 +241,10 @@ mod tests {
         let ips = fallback_ips("api.figma.com");
         assert!(!ips.is_empty());
         // GA 任播段前置（原生路径）
-        assert_eq!(ips[0].to_string(), "13.35.190.56", "GA 段应前置");
+        assert_eq!(ips[0].to_string(), "13.35.190.115", "GA 段应前置");
         assert!(ips.iter().any(|ip| ip.to_string() == "13.35.190.39"));
         // CloudFront 段兜底追加
-        assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
+        assert!(ips.iter().any(|ip| ip.to_string() == "18.65.14.118"));
         assert_eq!(ips.len(), FIGMA_API_GA_IPS.len() + FIGMA_CF_IPS.len());
     }
 
@@ -255,7 +257,7 @@ mod tests {
             assert_eq!(ips[0].to_string(), "65.8.76.37", "{host} S3 段应前置");
             assert!(ips.iter().any(|ip| ip.to_string() == "65.8.76.41"));
             // CloudFront 段兜底追加（实测 S3 域亦可经 CF 边缘 IP 访问）
-            assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
+            assert!(ips.iter().any(|ip| ip.to_string() == "18.65.14.118"));
             assert_eq!(ips.len(), FIGMA_S3_IPS.len() + FIGMA_CF_IPS.len());
         }
     }
@@ -265,7 +267,7 @@ mod tests {
         // verify.figma.com（Arkose 人验）在 CloudFront 上，走 CF 段
         let ips = fallback_ips("verify.figma.com");
         assert!(!ips.is_empty());
-        assert!(ips.iter().any(|ip| ip.to_string() == "99.86.18.30"));
+        assert!(ips.iter().any(|ip| ip.to_string() == "18.65.14.118"));
     }
 
     #[test]
@@ -274,7 +276,7 @@ mod tests {
         for host in ["example.com", "google.com", "www.google.com", "github.com"] {
             let ips = fallback_ips(host);
             assert!(
-                !ips.iter().any(|ip| ip.to_string().starts_with("99.86.")),
+                !ips.iter().any(|ip| ip.to_string().starts_with("18.65.")),
                 "{host} 不应命中 CloudFront 段"
             );
             assert!(
