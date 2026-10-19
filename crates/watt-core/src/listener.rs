@@ -115,12 +115,13 @@ pub struct RelayService {
 }
 
 impl Service<Request<Incoming>> for RelayService {
-    type Response = hyper::Response<Full<Bytes>>;
+    type Response = crate::http_relay::RelayResponse;
     type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<hyper::Response<Full<Bytes>>, std::convert::Infallible>,
+                    Output =
+                        Result<crate::http_relay::RelayResponse, std::convert::Infallible>,
                 > + Send,
         >,
     >;
@@ -145,7 +146,7 @@ impl Service<Request<Incoming>> for RelayService {
                         )
                         .await
                         {
-                            Ok(resp) => return Ok(resp),
+                            Ok(resp) => return Ok(resp.map(crate::http_relay::boxed_full)),
                             Err(e) => {
                                 tracing::warn!("Upgrade 隧道失败 {host}: {e}");
                                 return Ok(upgrade_error_response(&e));
@@ -213,15 +214,15 @@ fn upgrade_target(
 }
 
 /// Upgrade 失败响应（对齐 http_relay 的错误页语义：500 + 纯文本）
-pub fn upgrade_error_response_pub(msg: &str) -> hyper::Response<Full<Bytes>> {
+pub fn upgrade_error_response_pub(msg: &str) -> crate::http_relay::RelayResponse {
     upgrade_error_response(msg)
 }
 
-fn upgrade_error_response(msg: &str) -> hyper::Response<Full<Bytes>> {
-    hyper::Response::builder()
-        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Full::new(Bytes::from(format!("转发失败: {msg}"))))
-        .unwrap_or_else(|_| hyper::Response::new(Full::new(Bytes::from("转发失败"))))
+fn upgrade_error_response(msg: &str) -> crate::http_relay::RelayResponse {
+    let body = crate::http_relay::boxed_full(Full::new(Bytes::from(format!("转发失败: {msg}"))));
+    let mut resp = hyper::Response::new(body);
+    *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+    resp
 }
 
 /// SOCKS5 入站监听（8868）—— Phase 5 实现

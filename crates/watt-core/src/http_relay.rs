@@ -25,6 +25,61 @@ use watt_script::hooks::{
 /// 转发请求体：无钩子时保持流式，有钩子时缓冲（避免无谓开销）
 type ForwardBody = BoxBody<Bytes, hyper::Error>;
 
+/// 代理响应体：静态 / 本地 / 错误响应为 `Full`，**转发响应为流式**（边收边发）。
+///
+/// 整包缓冲会让浏览器在响应体到齐前收不到任何字节——对 1.8MB 的 Figma 首页
+/// 这类大响应，在带宽受限时表现为长时间白屏。改为流式后首字节立刻下发，
+/// 浏览器可边收边解析。
+pub type RelayBody = BoxBody<Bytes, hyper::Error>;
+/// 代理响应（[`RelayBody`]）
+pub type RelayResponse = Response<RelayBody>;
+
+/// `Full<Bytes>` → 统一响应体
+pub fn boxed_full(b: Full<Bytes>) -> RelayBody {
+    b.map_err(|e| match e {}).boxed()
+}
+
+/// `Response<Full<Bytes>>` → 统一响应（响应体转 [`RelayBody`]）
+pub fn boxed_response(resp: Response<Full<Bytes>>) -> RelayResponse {
+    resp.map(boxed_full)
+}
+
+/// 流式响应体：边转发边累计下行字节（保持流量统计与整包路径一致）
+struct CountingBody {
+    inner: RelayBody,
+    stats: Arc<FlowStats>,
+    head_counted: bool,
+}
+
+impl Body for CountingBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        if !this.head_counted {
+            this.head_counted = true;
+            this.stats.add_down(128);
+        }
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(d) = frame.data_ref() {
+                    this.stats.add_down(d.len() as u64);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// 引擎运行时上下文（每引擎一份，请求间共享）
 pub struct RelayContext {
     pub rules: DomainRules,
@@ -80,7 +135,7 @@ impl RelayContext {
         self: &Arc<Self>,
         req: Request<Incoming>,
         scheme: &str,
-    ) -> Response<Full<Bytes>> {
+    ) -> RelayResponse {
         let started = std::time::Instant::now();
         let host = request_host(&req);
         let method = req.method().clone();
@@ -120,12 +175,15 @@ impl RelayContext {
         req: Request<Incoming>,
         scheme: &str,
         host: &str,
-    ) -> (Response<Full<Bytes>>, Disposition) {
+    ) -> (RelayResponse, Disposition) {
         let host = host.to_string();
 
         // —— 本地域名 / 注入脚本路径短路 ——
         if LocalDomainHandler::should_handle(&host, req.uri().path()) {
-            return (self.local.handle(req, &host).await, Disposition::Local);
+            return (
+                self.local.handle(req, &host).await.map(boxed_full),
+                Disposition::Local,
+            );
         }
 
         let url = format!(
@@ -203,6 +261,7 @@ impl RelayContext {
             return (
                 builder
                     .body(Full::new(Bytes::from(static_response.body.clone())))
+                    .map(boxed_response)
                     .unwrap_or_else(|_| error_response("静态响应构造失败")),
                 disp,
             );
@@ -223,6 +282,7 @@ impl RelayContext {
                     .status(StatusCode::FOUND)
                     .header(hyper::header::LOCATION, location)
                     .body(Full::new(Bytes::new()))
+                    .map(boxed_response)
                     .unwrap(),
                 disp,
             );
@@ -266,7 +326,7 @@ impl RelayContext {
         rule: &DomainRule,
         scripts: &[String],
         is_script_inject: bool,
-    ) -> Result<Response<Full<Bytes>>, String> {
+    ) -> Result<RelayResponse, String> {
         let (mut parts, incoming_body) = req.into_parts();
         let mut scheme = scheme.to_string();
         let mut host = host.to_string();
@@ -302,12 +362,14 @@ impl RelayContext {
                             .status(StatusCode::FOUND)
                             .header(hyper::header::LOCATION, location)
                             .body(Full::new(Bytes::new()))
+                            .map(boxed_response)
                             .map_err(|e| e.to_string());
                     }
                     RequestHookOutcome::Block { status, body } => {
                         return Response::builder()
                             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN))
                             .body(Full::new(Bytes::from(body)))
+                            .map(boxed_response)
                             .map_err(|e| e.to_string());
                     }
                     RequestHookOutcome::Modified(snap) => {
@@ -455,8 +517,14 @@ impl RelayContext {
         // 失败的候选经 mark_failed 短期降权，重试与其他后续请求不再优先选中它。
         let idempotent = matches!(parts.method, Method::GET | Method::HEAD);
         let header_wait = Duration::from_millis(target.timeout_ms.unwrap_or(30_000));
+        // 只有「脚本注入」或「onResponse 钩子」需要完整 body 才能处理；
+        // 其余情况一律流式转发（边收边发）——整包缓冲会让浏览器在大响应
+        // 到齐前收不到任何字节，在带宽受限链路上表现为长时间白屏。
+        let has_resp_hooks = self
+            .hooks
+            .as_ref()
+            .is_some_and(|h| h.has_response_hooks(scripts));
         let mut body_opt = Some(body);
-        let mut outcome: Option<(hyper::http::response::Parts, Bytes)> = None;
         for attempt in 0..2 {
             let (stream, winner) = connector
                 .connect_tracked(&target)
@@ -510,17 +578,146 @@ impl RelayContext {
                 sender.send_request(outbound_req).await
             };
 
-            let res = async {
-                let (resp_parts, resp_body) = sent?.into_parts();
-                let bytes = resp_body.collect().await?.to_bytes();
-                Ok::<_, hyper::Error>((resp_parts, bytes))
-            }
-            .await;
+            match sent {
+                Ok(resp) => {
+                    let (mut resp_parts, resp_body) = resp.into_parts();
+                    let content_encoding = resp_parts
+                        .headers
+                        .get(hyper::header::CONTENT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let content_type = resp_parts
+                        .headers
+                        .get(hyper::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let should_inject = is_script_inject
+                        && !scripts.is_empty()
+                        && parts.method == Method::GET
+                        && resp_parts.status == StatusCode::OK
+                        && content_type.to_ascii_lowercase().contains("text/html")
+                        && (!self.is_only_work_steam_browser
+                            || parts
+                                .headers
+                                .get(USER_AGENT)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|ua| ua.contains("Valve Steam")));
 
-            match res {
-                Ok(pair) => {
-                    outcome = Some(pair);
-                    break;
+                    if !has_resp_hooks && !should_inject {
+                        // —— 流式转发：边收边发，首字节随响应头立刻下发 ——
+                        // Content-Length/Transfer-Encoding 交由 hyper 重新决定
+                        // （body 长度未知 → chunked）。下行字节在 CountingBody
+                        // 内累计，保持与整包路径一致的流量统计。
+                        resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                        resp_parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                        return Ok(Response::from_parts(
+                            resp_parts,
+                            BoxBody::new(CountingBody {
+                                inner: resp_body.boxed(),
+                                stats: self.stats.clone(),
+                                head_counted: false,
+                            }),
+                        ));
+                    }
+
+                    // —— 缓冲路径：脚本注入 / onResponse 钩子需要完整 body ——
+                    let mut body_bytes = match resp_body.collect().await {
+                        Ok(b) => b.to_bytes(),
+                        Err(e) => {
+                            // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
+                            // （RST 等，hyper display 为「connection error」）。
+                            // 注意 is_closed() 只匹配 ChannelClosed（我方通道关闭），不覆盖 Kind::Io。
+                            let transient = e.is_incomplete_message()
+                                || is_io_error(&e)
+                                || e.is_body_write_aborted();
+                            if transient {
+                                if let Some(a) = winner {
+                                    connector.mark_failed(a);
+                                }
+                            }
+                            if attempt == 0 && idempotent && transient {
+                                tracing::warn!("出站连接中断，换连接重试: {host} ({e})");
+                                continue;
+                            }
+                            return Err(format!("请求失败: {e}"));
+                        }
+                    };
+                    self.stats.add_down(body_bytes.len() as u64 + 128);
+
+                    // —— 服务端脚本 onResponse 钩子（Phase 4b 新增能力）——
+                    // 二进制/压缩 body 跳过（UTF-8 约定：无法以字符串安全传递）
+                    if let Some(hooks) = &self.hooks {
+                        if hooks.has_response_hooks(scripts)
+                            && std::str::from_utf8(&body_bytes).is_ok()
+                        {
+                            let snapshot = ResponseSnapshot {
+                                status: resp_parts.status.as_u16(),
+                                headers: header_pairs(&resp_parts.headers),
+                                body: body_bytes.to_vec(),
+                            };
+                            match hooks.on_response(scripts, snapshot).await {
+                                ResponseHookOutcome::Passthrough => {}
+                                ResponseHookOutcome::Modified(snap) => {
+                                    if let Ok(s) = StatusCode::from_u16(snap.status) {
+                                        resp_parts.status = s;
+                                    }
+                                    resp_parts.headers = headermap_from_pairs(&snap.headers);
+                                    body_bytes = Bytes::from(snap.body);
+                                    tracing::debug!(
+                                        "onResponse 钩子修改响应: {}",
+                                        resp_parts.status
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // —— 脚本注入 ——
+                    if should_inject {
+                        match inject_scripts(
+                            &body_bytes,
+                            &content_encoding,
+                            &content_type,
+                            scripts,
+                            &host,
+                        ) {
+                            Ok(injected) => {
+                                let mut builder = Response::builder().status(resp_parts.status);
+                                let mut headers = resp_parts.headers.clone();
+                                // 移除 CSP（对齐原实现）
+                                headers.remove("Content-Security-Policy");
+                                headers.remove(hyper::header::CONTENT_LENGTH);
+                                if injected.compression == ContentCompression::None {
+                                    headers.remove(hyper::header::CONTENT_ENCODING);
+                                }
+                                for (k, v) in headers.iter() {
+                                    builder = builder.header(k, v);
+                                }
+                                return builder
+                                    .body(Full::new(Bytes::from(injected.body)))
+                                    .map(boxed_response)
+                                    .map_err(|e| e.to_string());
+                            }
+                            Err(e) => {
+                                tracing::warn!("脚本注入失败（原样返回）: {e}");
+                            }
+                        }
+                    }
+
+                    // 原样返回（缓冲路径）
+                    let mut builder = Response::builder().status(resp_parts.status);
+                    let mut headers = resp_parts.headers.clone();
+                    headers.remove(hyper::header::CONTENT_LENGTH);
+                    headers.remove(hyper::header::TRANSFER_ENCODING);
+                    for (k, v) in headers.iter() {
+                        builder = builder.header(k, v);
+                    }
+                    return builder
+                        .body(Full::new(body_bytes))
+                        .map(boxed_response)
+                        .map_err(|e| e.to_string());
                 }
                 Err(e) => {
                     // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
@@ -541,100 +738,8 @@ impl RelayContext {
                 }
             }
         }
-        let (mut resp_parts, mut body_bytes) = outcome.expect("重试循环退出后必有转发结果");
 
-        self.stats.add_down(body_bytes.len() as u64 + 128);
-
-        // —— 服务端脚本 onResponse 钩子（Phase 4b 新增能力）——
-        // 二进制/压缩 body 跳过（UTF-8 约定：无法以字符串安全传递）
-        if let Some(hooks) = &self.hooks {
-            if hooks.has_response_hooks(scripts) && std::str::from_utf8(&body_bytes).is_ok() {
-                let snapshot = ResponseSnapshot {
-                    status: resp_parts.status.as_u16(),
-                    headers: header_pairs(&resp_parts.headers),
-                    body: body_bytes.to_vec(),
-                };
-                match hooks.on_response(scripts, snapshot).await {
-                    ResponseHookOutcome::Passthrough => {}
-                    ResponseHookOutcome::Modified(snap) => {
-                        if let Ok(s) = StatusCode::from_u16(snap.status) {
-                            resp_parts.status = s;
-                        }
-                        resp_parts.headers = headermap_from_pairs(&snap.headers);
-                        body_bytes = Bytes::from(snap.body);
-                        tracing::debug!("onResponse 钩子修改响应: {}", resp_parts.status);
-                    }
-                }
-            }
-        }
-
-        // —— 脚本注入 ——
-        let content_encoding = resp_parts
-            .headers
-            .get(hyper::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let content_type = resp_parts
-            .headers
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-
-        let should_inject = is_script_inject
-            && !scripts.is_empty()
-            && parts.method == Method::GET
-            && resp_parts.status == StatusCode::OK
-            && content_type.to_ascii_lowercase().contains("text/html")
-            && (!self.is_only_work_steam_browser
-                || parts
-                    .headers
-                    .get(USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ua| ua.contains("Valve Steam")));
-
-        if should_inject {
-            match inject_scripts(
-                &body_bytes,
-                &content_encoding,
-                &content_type,
-                scripts,
-                &host,
-            ) {
-                Ok(injected) => {
-                    let mut builder = Response::builder().status(resp_parts.status);
-                    let mut headers = resp_parts.headers.clone();
-                    // 移除 CSP（对齐原实现）
-                    headers.remove("Content-Security-Policy");
-                    headers.remove(hyper::header::CONTENT_LENGTH);
-                    if injected.compression == ContentCompression::None {
-                        headers.remove(hyper::header::CONTENT_ENCODING);
-                    }
-                    for (k, v) in headers.iter() {
-                        builder = builder.header(k, v);
-                    }
-                    return builder
-                        .body(Full::new(Bytes::from(injected.body)))
-                        .map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    tracing::warn!("脚本注入失败（原样返回）: {e}");
-                }
-            }
-        }
-
-        // 原样返回
-        let mut builder = Response::builder().status(resp_parts.status);
-        let mut headers = resp_parts.headers.clone();
-        headers.remove(hyper::header::CONTENT_LENGTH);
-        headers.remove(hyper::header::TRANSFER_ENCODING);
-        for (k, v) in headers.iter() {
-            builder = builder.header(k, v);
-        }
-        builder
-            .body(Full::new(body_bytes))
-            .map_err(|e| e.to_string())
+        Err(format!("{host}: 出站重试后仍失败"))
     }
 
     /// 未匹配域名的全局二级代理转发
@@ -643,7 +748,7 @@ impl RelayContext {
         req: Request<Incoming>,
         scheme: &str,
         host: &str,
-    ) -> Result<Response<Full<Bytes>>, String> {
+    ) -> Result<RelayResponse, String> {
         let default_rule = DomainRule::default();
         // 走默认规则（TlsSni=true）的全局转发
         self.forward(req, scheme, host, "", &default_rule, &[], false)
@@ -948,10 +1053,11 @@ fn resolve_relative(scheme: &str, host: &str, dest: &str) -> Option<Uri> {
     format!("{scheme}://{host}{path}").parse().ok()
 }
 
-fn error_response(msg: &str) -> Response<Full<Bytes>> {
+fn error_response(msg: &str) -> RelayResponse {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Full::new(Bytes::from(msg.to_string())))
+        .map(boxed_response)
         .unwrap()
 }
 
@@ -1005,10 +1111,11 @@ pub fn request_host<B>(req: &Request<B>) -> String {
         .unwrap_or_default()
 }
 
-fn not_found_response() -> Response<Full<Bytes>> {
+fn not_found_response() -> RelayResponse {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Full::new(Bytes::new()))
+        .map(boxed_response)
         .unwrap()
 }
 

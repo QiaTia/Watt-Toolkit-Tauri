@@ -17,8 +17,7 @@
 
 use crate::http_relay::{RelayContext, RelayDnsAdapter};
 use crate::listener::RelayService;
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper::Request;
 use std::sync::Arc;
@@ -241,12 +240,13 @@ struct ForwardProxyService {
 }
 
 impl Service<Request<Incoming>> for ForwardProxyService {
-    type Response = hyper::Response<Full<Bytes>>;
+    type Response = crate::http_relay::RelayResponse;
     type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<hyper::Response<Full<Bytes>>, std::convert::Infallible>,
+                    Output =
+                        Result<crate::http_relay::RelayResponse, std::convert::Infallible>,
                 > + Send,
         >,
     >;
@@ -275,7 +275,7 @@ impl Service<Request<Incoming>> for ForwardProxyService {
                         )
                         .await
                         {
-                            Ok(resp) => return Ok(resp),
+                            Ok(resp) => return Ok(resp.map(crate::http_relay::boxed_full)),
                             Err(e) => {
                                 tracing::warn!("Upgrade 隧道失败 {host}: {e}");
                                 return Ok(crate::listener::upgrade_error_response_pub(&e));
