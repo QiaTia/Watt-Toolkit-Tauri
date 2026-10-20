@@ -55,6 +55,14 @@ pnpm install --dir ui
 cargo tauri dev
 ```
 
+> **Windows 注意**：应用清单声明了 `requireAdministrator`（Hosts 模式需要写系统 hosts），
+> 因此 `cargo tauri dev` / 直接运行 `target\debug\watt-toolkit-app.exe` 都必须在
+> **管理员权限的终端**里执行（非提权终端下 CreateProcess 会以 `os error 740`
+> 「请求的操作需要提升」失败）。macOS / Linux 不受影响。
+>
+> `cargo test` 同理：`--lib` 目标的测试可在普通终端跑，但 bin 目标的测试二进制同样带清单，
+> 在非管理员终端会以 740 失败（`cargo test -p watt-toolkit-app --lib` 可绕过）。
+
 如果你希望单独启动前端：
 
 ```bash

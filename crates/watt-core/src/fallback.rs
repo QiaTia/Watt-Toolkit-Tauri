@@ -103,6 +103,57 @@ const FIGMA_API_GA_IPS: &[&str] = &["13.35.190.115", "13.35.190.109", "13.35.190
 /// 的 AWS S3 段。2026-10 实测：S3 段 IP 凭 SNI + Host 可服务两个域。
 const FIGMA_S3_IPS: &[&str] = &["65.8.76.37", "65.8.76.35", "65.8.76.16", "65.8.76.41"];
 
+/// 内置备用池的分组描述（**仅供 UI 展示**；与 [`fallback_ips`] 的匹配规则一一对应）。
+///
+/// 之前这七组只存在于编译期常量里，管理页只能看到动态池，用户会误以为「内置 IP 池
+/// 没生效」。这里把常量本身导出成可枚举结构，页面按只读列表展示，不参与任何写路径。
+pub struct BuiltinPoolGroup {
+    /// 展示用匹配模式（真实匹配逻辑见 [`fallback_ips`]）
+    pub pattern: &'static str,
+    /// IP 段来源 / 选型说明
+    pub note: &'static str,
+    pub ips: &'static [&'static str],
+}
+
+/// 全部内置备用池分组（顺序 = 页面展示顺序）
+pub const BUILTIN_POOL_GROUPS: &[BuiltinPoolGroup] = &[
+    BuiltinPoolGroup {
+        pattern: "*.github.com",
+        note: "GitHub 官方 meta 的 web 段（140.82.112.0/20 与 Azure 20.x），主站 / API / 页面",
+        ips: GITHUB_WEB_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "*.githubusercontent.com",
+        note: "Fastly 段，raw / camo / objects 等",
+        ips: GITHUB_USERCONTENT_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "*.githubassets.com",
+        note: "Fastly 段，静态资源 CDN",
+        ips: GITHUB_ASSETS_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "translate.google.com · translate.googleapis.com · translate.gstatic.com",
+        note: "Google China 边缘段（部分 IP 仅覆盖特定 SNI，由竞速自动跳过）",
+        ips: GOOGLE_TRANSLATE_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "*.figma.com",
+        note: "CloudFront 标准边缘段（禁用 99.86.x：上行 >1.2KB 会被静默黑洞）",
+        ips: FIGMA_CF_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "api.figma.com",
+        note: "AWS Global Accelerator 任播段（前置），另叠加 *.figma.com 的 CloudFront 段兜底",
+        ips: FIGMA_API_GA_IPS,
+    },
+    BuiltinPoolGroup {
+        pattern: "errors.figma.com · s3-alpha-sig.figma.com",
+        note: "AWS S3 段（前置），另叠加 *.figma.com 的 CloudFront 段兜底",
+        ips: FIGMA_S3_IPS,
+    },
+];
+
 /// 返回该 host 的备用 IP 列表（无匹配时为空）。
 ///
 /// 匹配按后缀进行，更具体的服务段优先：
@@ -283,6 +334,21 @@ mod tests {
                 !ips.iter().any(|ip| ip.to_string().starts_with("13.35.")),
                 "{host} 不应命中 GA 段"
             );
+        }
+    }
+
+    #[test]
+    fn test_builtin_pool_groups_are_valid() {
+        // 7 组：github 三组 + 翻译一组 + figma 三组
+        assert_eq!(BUILTIN_POOL_GROUPS.len(), 7);
+        assert!(!BUILTIN_POOL_GROUPS.is_empty());
+        for g in BUILTIN_POOL_GROUPS {
+            assert!(!g.pattern.is_empty(), "分组缺少展示模式");
+            assert!(!g.note.is_empty(), "{} 缺少说明", g.pattern);
+            assert!(!g.ips.is_empty(), "{} 的 IP 列表为空", g.pattern);
+            for ip in g.ips {
+                assert!(ip.parse::<IpAddr>().is_ok(), "{} 含非法 IP: {ip}", g.pattern);
+            }
         }
     }
 

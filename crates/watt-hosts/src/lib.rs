@@ -23,6 +23,11 @@ pub enum HostsError {
     FileTooLarge,
     #[error("无权限访问 hosts 文件")]
     Unauthorized,
+    /// Windows：进程未以管理员身份运行（或 hosts 被安全软件锁定）。
+    /// 应用清单已声明 requireAdministrator，正常情况下不会出现；
+    /// 命中说明进程被以 asInvoker 方式拉起（受限终端 / 调试器 / 计划任务）。
+    #[error("需要管理员权限才能写入 hosts（请以管理员身份运行 Watt Toolkit 后重试）: {0}")]
+    ElevationRequired(String),
     #[error("{0}")]
     Other(String),
 }
@@ -219,7 +224,15 @@ fn write_file(path: &std::path::Path, content: &str) -> Result<(), HostsError> {
             {
                 write_file_elevated(path, content)
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            {
+                // Windows 无按需提权：hosts 位于受保护目录，只有管理员令牌可写。
+                // 正常入口（应用清单 requireAdministrator）不会命中此分支；
+                // 命中时给出可执行的中文指引，避免 UI 只看到裸 `os error 5`。
+                tracing::error!(path = %path.display(), error = %e, "hosts 写入被拒绝");
+                Err(HostsError::ElevationRequired(e.to_string()))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 Err(HostsError::Io(e))
             }

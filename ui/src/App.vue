@@ -32,6 +32,7 @@ const collapsed = ref(false);
 const navRoutes: ReadonlyArray<{ path: string; titleKey: string }> = [
   { path: '/', titleKey: 'nav.home' },
   { path: '/accelerator', titleKey: 'nav.accelerator' },
+  { path: '/pool', titleKey: 'nav.pool' },
   { path: '/settings', titleKey: 'nav.settings' },
   { path: '/logs', titleKey: 'nav.logs' },
   { path: '/about', titleKey: 'nav.about' },
@@ -123,6 +124,10 @@ onMounted(() => {
             <a-menu-item key="/accelerator">
               <template #icon><RocketOutlined /></template>
               <span>{{ $t('nav.accelerator') }}</span>
+            </a-menu-item>
+            <a-menu-item key="/pool">
+              <template #icon><ClusterOutlined /></template>
+              <span>{{ $t('nav.pool') }}</span>
             </a-menu-item>
             <a-menu-item key="/settings">
               <template #icon><SettingOutlined /></template>

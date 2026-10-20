@@ -99,6 +99,8 @@ export interface ProxySettings {
   is_proxy_gog: boolean;
   /** 用户勾选的加速项目 Id 集合（空 = 未设置，回退云端默认） */
   enabled_accelerate_ids: string[];
+  /** 终端（CLI）代理环境变量 + 证书注入（git/curl/npm/pip 等） */
+  terminal_proxy_enable: boolean;
 }
 
 /* ========== 域名规则（watt-config，snake_case） ========== */
@@ -200,9 +202,46 @@ export interface EngineStartParams {
   dns: DnsSettings;
   serverSideProxyToken?: string | null;
   rules: DomainRule[];
+  /** 启动时注入终端代理环境变量 + CLI 证书（默认 true） */
+  terminalProxyEnable?: boolean;
 }
 
 /* ========== 动态 IP 池（命令层 camelCase） ========== */
+
+/** IP 池内的一个域名条目（IP 池管理页列表行） */
+export interface IpPoolDomain {
+  host: string;
+  /** 池内 IP（写入顺序 = 上次刷新的 RTT 升序） */
+  ips: string[];
+  /** 该条目最近一次写入时刻（unix 毫秒） */
+  refreshedAtMs: number;
+}
+
+/** IP 池管理页：版本内置的备用池分组（编译期常量，只读） */
+export interface BuiltinPoolGroup {
+  /** 展示用匹配模式（如 `*.github.com`） */
+  pattern: string;
+  /** IP 段来源 / 选型说明 */
+  note: string;
+  /** 该组的 IP 列表（已按实测可达性排序） */
+  ips: string[];
+}
+
+/** IP 池管理页：加速域名 → IP 来源总览 */
+export interface DomainPoolOverview {
+  /** 规则里的原始匹配模式（可能含 `*.`） */
+  pattern: string;
+  /** 规范化域名 */
+  host: string;
+  /** 规则写死的覆盖 IP */
+  overrideIps: string[];
+  /** 动态池命中的 IP */
+  dynamicIps: string[];
+  /** 内置备用池命中的 IP */
+  builtinIps: string[];
+  /** 生效来源（有序）：override / dynamic / builtin / dns */
+  sources: Array<'override' | 'dynamic' | 'builtin' | 'dns'>;
+}
 
 /** 单个候选 IP 的探测结果 */
 export interface IpPoolProbeItem {

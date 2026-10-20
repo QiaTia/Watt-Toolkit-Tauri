@@ -5,6 +5,7 @@ const zhHans = {
   nav: {
     home: '首页',
     accelerator: '网络加速',
+    pool: 'IP 池管理',
     settings: '设置',
     about: '关于',
     logs: '日志',
@@ -69,6 +70,8 @@ const zhHans = {
         desc: '修改 hosts 指向本地 443 反代（需 443 端口空闲，写入 hosts 可能需要管理员权限）',
         descMac:
           'macOS 下写入 /etc/hosts 需要管理员权限：启动与停止引擎各会弹出一次系统密码框。',
+        descWin:
+          'Windows 下程序以管理员身份运行（启动时弹一次 UAC），以便写入与还原 hosts。',
       },
       system: {
         label: '系统代理',
@@ -106,6 +109,11 @@ const zhHans = {
     httpRedirect: 'HTTP→HTTPS 重定向 (80)',
     socks5Enable: '启用 SOCKS5',
     socks5Port: 'SOCKS5 端口',
+    terminalProxy: '终端代理（命令行）',
+    terminalProxyHint:
+      '为 git / curl / npm / pip 等命令行工具注入 HTTP(S)_PROXY 与 CA 证书变量，'
+      + '让终端流量也能走加速（已打开的终端需重开才生效）。System / PAC / 仅代理端口模式下'
+      + '指向本地正向代理；Hosts 模式下只注入证书。',
     twoLevelTitle: '二级代理（上游）',
     twoLevelEnable: '启用二级代理',
     protocol: '协议类型',
@@ -119,16 +127,6 @@ const zhHans = {
     masterDns: '自定义主 DNS',
     useDoh: '使用 DoH',
     dohAddr: '自定义 DoH 地址',
-    ipPoolTitle: 'IP 池更新',
-    ipPoolHint:
-      '从健康 DNS 解析当前已勾选加速项目的域名 IP，逐 IP 在本地探测（TCP + TLS 握手），' +
-      '把可用 IP 写入出站 IP 池，供加速连接择优使用。',
-    ipPoolRefresh: '刷新 IP 池',
-    ipPoolSummary: '共 {hosts} 个域名，{ok}/{candidates} 个候选可用',
-    ipPoolHost: '域名',
-    ipPoolUsable: '可用',
-    ipPoolFastest: '最快',
-    ipPoolNone: '无',
     certTitle: 'CA 证书',
     trustStatus: '信任状态',
     trusted: '已安装并信任',
@@ -154,6 +152,80 @@ const zhHans = {
       'macOS 下会弹出管理员密码框。也可导出 PEM 后手动导入到「受信任的根证书颁发机构」。',
     elevateMacHint: 'macOS 下安装 / 卸载根证书会弹出系统管理员密码框（需写入系统钥匙串）。',
     elevateCancelled: '已取消管理员授权，操作未完成。',
+  },
+  pool: {
+    summary: '共 {hosts} 个域名、{ips} 个 IP',
+    lastRefreshSummary: '最近一次刷新：{hosts} 个域名，{ok}/{candidates} 个候选可用',
+    hint:
+      '按域名维护出站 IP 池：加速连接时优先从池内择优（TLS 握手 RTT 最短者胜出）。' +
+      '右上角「刷新 IP 池」会从健康 DNS 解析当前已勾选加速项目的域名并本地探测；' +
+      '单个域名也可手动增删 IP 或从 DNS 重刷。',
+    refreshAll: '刷新 IP 池',
+    refreshDone: '刷新完成：{hosts} 个域名，{ok}/{candidates} 个候选可用',
+    refreshEmpty: '没有可刷新的域名：请先在加速页勾选加速项目',
+    refreshFailed: '刷新 IP 池失败',
+    addDomain: '新增域名',
+    clearAll: '清空全部',
+    clearConfirm: '清空全部 IP 池？加速将回退到内置备用池与系统 DNS。',
+    colHost: '域名',
+    colIps: 'IP 数',
+    colRefreshed: '最近刷新',
+    colActions: '操作',
+    builtinTitle: '内置备用池',
+    builtinSummary: '{groups} 组 / {ips} 个 IP',
+    builtinHint:
+      '随版本发布、只读：每个域名先走动态池，动态池无命中或候选全部失效时，' +
+      '出站竞速用这组 IP 兜底（失败候选会被自动跳过，不增加成功路径的延迟）。' +
+      '这里只覆盖确实需要人工兜底的少数服务（GitHub 三组 / Google 翻译 / Figma 三组）——' +
+      '它不是加速域名清单，完整域名见上方「加速域名 IP 总览」。',
+    overviewTitle: '加速域名 IP 总览',
+    overviewSummary: '共 {hosts} 个域名，{withIp} 个已有静态/池 IP，{dnsOnly} 个仅走 DNS',
+    overviewHint:
+      '列出当前已勾选加速项目（含内置分组）的全部域名及各自的 IP 来源。' +
+      '「覆盖 IP」是内置加速服务为域名写死的首选 IP；「动态池」来自右上角刷新；' +
+      '「内置备用池」是版本内置的兜底清单；三者都没有的域名由抗污染 DNS 解析 + 竞速决定。',
+    searchPlaceholder: '搜索域名',
+    colSource: '生效来源',
+    srcAll: '全部',
+    srcOverride: '覆盖 IP',
+    srcDynamic: '动态池',
+    srcBuiltin: '内置备用池',
+    srcDns: 'DNS 解析',
+    srcDnsOnly: '仅 DNS',
+    dnsAlwaysHint: 'DNS 解析始终是候选之一（抗污染解析 + 竞速择优）',
+    ipCountDns: '仅 DNS',
+    readonly: '只读',
+    colPattern: '匹配模式',
+    colNote: '说明',
+    edit: '编辑',
+    probe: '探测',
+    refreshHost: '从 DNS 刷新',
+    remove: '删除',
+    removeConfirm: '删除 {host} 的 IP 池？该域名将回退到内置备用池与系统 DNS。',
+    removeIp: '移除',
+    unreachable: '不可用',
+    notProbed: '未探测',
+    rtt: '{ms} ms',
+    prune: '移除 {n} 个不可用 IP',
+    pruneDone: '已移除 {n} 个不可用 IP',
+    probeOk: '{ok}/{total} 个 IP 可用',
+    probeAllFailed: '{total} 个 IP 全部不可用，建议从 DNS 重刷',
+    refreshHostEmpty: '{host} 未解析到可用 IP，池条目已清除',
+    refreshedHost: '{host} 已更新：{ok}/{total} 个候选可用',
+    removed: '已删除',
+    saved: '已保存',
+    cleared: 'IP 池已清空',
+    empty: '还没有任何域名 IP 池，可新增域名或点右上角「刷新 IP 池」',
+    editTitleNew: '新增域名 IP 池',
+    editTitleEdit: '编辑 {host} 的 IP 池',
+    hostLabel: '域名',
+    hostPlaceholder: 'example.com（不含协议与路径）',
+    ipsLabel: 'IP 列表',
+    ipsPlaceholder: '每行一个 IP，例如：\n18.65.14.118\n13.35.190.56',
+    ipsHint: '支持 IPv4 / IPv6，每行一个（也接受逗号或空格分隔），保存时自动去重。',
+    hostRequired: '请填写域名',
+    save: '保存',
+    cancel: '取消',
   },
   logs: {
     accessTab: '访问日志',

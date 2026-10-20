@@ -7,14 +7,18 @@ import type {
   AccessLogFilter,
   AccessLogPage,
   AppInfo,
+  BuiltinPoolGroup,
   CertificateInfo,
   CertStatusDto,
   ConnectivityTestItem,
+  DomainPoolOverview,
   DomainRule,
   EngineStartParams,
   EngineStateDto,
   FlowStatsDto,
+  IpPoolDomain,
   IpPoolHostResult,
+  IpPoolProbeItem,
   ProbeSummaryDto,
   ProxySettings,
   RuntimeLogFilter,
@@ -120,6 +124,46 @@ export function accelerateConnectivityTest(hosts: string[]): Promise<Connectivit
 /** 从健康 DNS 解析已勾选项目域名 → 本地探测可用 IP → 更新出站 IP 池 */
 export function ipPoolRefresh(): Promise<IpPoolHostResult[]> {
   return invoke('ip_pool_refresh');
+}
+
+/** 列出池内全部域名条目 */
+export function ipPoolList(): Promise<IpPoolDomain[]> {
+  return invoke('ip_pool_list');
+}
+
+/** 列出版本内置的备用池分组（只读常量） */
+export function ipPoolBuiltinList(): Promise<BuiltinPoolGroup[]> {
+  return invoke('ip_pool_builtin_list');
+}
+
+/** 列出已勾选加速项目的全部域名及其 IP 来源（覆盖 IP / 动态池 / 备用池 / DNS） */
+export function ipPoolDomainOverview(): Promise<DomainPoolOverview[]> {
+  return invoke('ip_pool_domain_overview');
+}
+
+/** 保存某域名的 IP 池（新增或覆盖；ips 支持整段文本，后端逐行解析去重） */
+export function ipPoolSaveDomain(host: string, ips: string[]): Promise<IpPoolDomain> {
+  return invoke('ip_pool_save_domain', { host, ips });
+}
+
+/** 删除某域名的 IP 池 */
+export function ipPoolRemoveDomain(host: string): Promise<void> {
+  return invoke('ip_pool_remove_domain', { host });
+}
+
+/** 清空全部 IP 池 */
+export function ipPoolClear(): Promise<void> {
+  return invoke('ip_pool_clear');
+}
+
+/** 从 DNS 重新解析并探测单个域名，覆盖该域名的池 */
+export function ipPoolRefreshHost(host: string): Promise<IpPoolHostResult> {
+  return invoke('ip_pool_refresh_host', { host });
+}
+
+/** 探测某域名池内全部 IP（只读，返回逐 IP RTT） */
+export function ipPoolProbeDomain(host: string): Promise<IpPoolProbeItem[]> {
+  return invoke('ip_pool_probe_domain', { host });
 }
 
 /* 日志 */

@@ -134,6 +134,26 @@ pub fn snapshot() -> HashMap<String, PoolEntry> {
     pool().read().unwrap().clone()
 }
 
+/// 某域名的池内 IP（**精确匹配**，不做后缀匹配；管理页编辑/探测用）。
+///
+/// 与 [`dynamic_ips`] 的区别：后者服务出站竞速（子域要能继承父域池），
+/// 本函数只回该域名自己的条目，避免「编辑 api.figma.com 却被 figma.com 的 IP 干扰」。
+pub fn entry_ips(host: &str) -> Vec<IpAddr> {
+    let host = normalize(host);
+    pool()
+        .read()
+        .unwrap()
+        .get(&host)
+        .map(|e| e.ips.clone())
+        .unwrap_or_default()
+}
+
+/// 某域名的池条目（精确匹配；含刷新时刻），不存在为 None
+pub fn entry(host: &str) -> Option<PoolEntry> {
+    let host = normalize(host);
+    pool().read().unwrap().get(&host).cloned()
+}
+
 /// 清空池（诊断用）
 pub fn clear() {
     pool().write().unwrap().clear();

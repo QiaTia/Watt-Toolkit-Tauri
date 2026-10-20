@@ -4,6 +4,7 @@ const en: Schema = {
   nav: {
     home: 'Home',
     accelerator: 'Network Boost',
+    pool: 'IP Pools',
     settings: 'Settings',
     about: 'About',
     logs: 'Logs',
@@ -72,6 +73,9 @@ const en: Schema = {
         descMac:
           'On macOS, writing /etc/hosts requires administrator rights: one password prompt each ' +
           'when starting and stopping the engine.',
+        descWin:
+          'On Windows the app runs as administrator (one UAC prompt at launch) so it can write ' +
+          'and restore the hosts file.',
       },
       system: {
         label: 'System Proxy',
@@ -113,6 +117,12 @@ const en: Schema = {
     httpRedirect: 'HTTP→HTTPS Redirect (80)',
     socks5Enable: 'Enable SOCKS5',
     socks5Port: 'SOCKS5 Port',
+    terminalProxy: 'Terminal proxy (CLI)',
+    terminalProxyHint:
+      'Injects HTTP(S)_PROXY and CA certificate variables for git / curl / npm / pip so '
+      + 'terminal traffic is accelerated too (already-open terminals must be restarted). '
+      + 'System / PAC / proxy-port-only modes point at the local forward proxy; Hosts mode '
+      + 'only injects the certificate.',
     twoLevelTitle: 'Upstream (Two-level Proxy)',
     twoLevelEnable: 'Enable Upstream Proxy',
     protocol: 'Protocol',
@@ -126,16 +136,6 @@ const en: Schema = {
     masterDns: 'Custom Primary DNS',
     useDoh: 'Use DoH',
     dohAddr: 'Custom DoH Address',
-    ipPoolTitle: 'IP Pool Update',
-    ipPoolHint:
-      'Resolve the domains of enabled acceleration projects via healthy DNS, probe each IP ' +
-      'locally (TCP + TLS handshake), and write the usable IPs into the outbound IP pool.',
-    ipPoolRefresh: 'Refresh IP Pool',
-    ipPoolSummary: '{hosts} domains, {ok}/{candidates} candidates usable',
-    ipPoolHost: 'Domain',
-    ipPoolUsable: 'Usable',
-    ipPoolFastest: 'Fastest',
-    ipPoolNone: 'None',
     certTitle: 'CA Certificate',
     trustStatus: 'Trust Status',
     trusted: 'Installed & Trusted',
@@ -165,6 +165,86 @@ const en: Schema = {
       'On macOS, installing or removing the root certificate prompts for the administrator ' +
       'password (system keychain access).',
     elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
+  },
+  pool: {
+    summary: '{hosts} domains, {ips} IPs',
+    lastRefreshSummary: 'Last refresh: {hosts} domains, {ok}/{candidates} candidates usable',
+    hint:
+      'IP pools are kept per domain: acceleration picks the fastest reachable IP from the pool ' +
+      '(shortest TLS handshake RTT wins). “Refresh IP Pools” at the top right resolves the ' +
+      'domains of enabled projects via healthy DNS and probes them locally; single domains ' +
+      'can also be edited or re-resolved individually.',
+    refreshAll: 'Refresh IP Pools',
+    refreshDone: 'Refresh done: {hosts} domains, {ok}/{candidates} candidates usable',
+    refreshEmpty: 'Nothing to refresh: enable acceleration projects on the Boost page first',
+    refreshFailed: 'Failed to refresh IP pools',
+    addDomain: 'Add Domain',
+    clearAll: 'Clear All',
+    clearConfirm: 'Clear all IP pools? Acceleration falls back to built-in backups and system DNS.',
+    colHost: 'Domain',
+    colIps: 'IPs',
+    colRefreshed: 'Last Refresh',
+    colActions: 'Actions',
+    builtinTitle: 'Built-in Backup Pools',
+    builtinSummary: '{groups} groups / {ips} IPs',
+    builtinHint:
+      'Shipped with each release and read-only: a domain tries its dynamic pool first; when the ' +
+      'dynamic pool has no match or every candidate fails, these IPs back up the outbound race ' +
+      '(failed candidates are skipped automatically, so the successful path is not slowed down). ' +
+      'This covers only the few services that genuinely need a hand-curated backup (three GitHub ' +
+      'groups / Google Translate / three Figma groups) — it is not the domain list; see “Accelerated ' +
+      'Domain IP Overview” above for every domain.',
+    overviewTitle: 'Accelerated Domain IP Overview',
+    overviewSummary:
+      '{hosts} domains: {withIp} have static/pool IPs, {dnsOnly} rely on DNS only',
+    overviewHint:
+      'Every domain of the currently enabled acceleration projects (built-in groups included) and ' +
+      'where its IPs come from. “Override IP” is a pinned first-choice IP baked into the built-in ' +
+      'service; “Dynamic pool” comes from the refresh action; “Built-in backup pool” is the ' +
+      'release-shipped fallback list. Domains with none of these are resolved by the ' +
+      'anti-poisoning DNS plus racing.',
+    searchPlaceholder: 'Search domain',
+    colSource: 'Sources',
+    srcAll: 'All',
+    srcOverride: 'Override IP',
+    srcDynamic: 'Dynamic pool',
+    srcBuiltin: 'Built-in backup',
+    srcDns: 'DNS',
+    srcDnsOnly: 'DNS only',
+    dnsAlwaysHint: 'DNS resolution is always one of the candidates (anti-poisoning DNS + racing)',
+    ipCountDns: 'DNS only',
+    readonly: 'Read-only',
+    colPattern: 'Pattern',
+    colNote: 'Notes',
+    edit: 'Edit',
+    probe: 'Probe',
+    refreshHost: 'Re-resolve',
+    remove: 'Delete',
+    removeConfirm: 'Delete the IP pool of {host}? It falls back to built-in backups and system DNS.',
+    removeIp: 'Remove',
+    unreachable: 'Unreachable',
+    notProbed: 'Not probed',
+    rtt: '{ms} ms',
+    prune: 'Remove {n} unreachable IPs',
+    pruneDone: 'Removed {n} unreachable IPs',
+    probeOk: '{ok}/{total} IPs usable',
+    probeAllFailed: 'All {total} IPs are unreachable — try re-resolving from DNS',
+    refreshHostEmpty: 'No usable IP resolved for {host}; its pool entry was cleared',
+    refreshedHost: '{host} updated: {ok}/{total} candidates usable',
+    removed: 'Deleted',
+    saved: 'Saved',
+    cleared: 'IP pools cleared',
+    empty: 'No domain pools yet — add a domain or use “Refresh IP Pools” at the top right',
+    editTitleNew: 'Add Domain IP Pool',
+    editTitleEdit: 'Edit IP pool of {host}',
+    hostLabel: 'Domain',
+    hostPlaceholder: 'example.com (no scheme or path)',
+    ipsLabel: 'IP list',
+    ipsPlaceholder: 'One IP per line, e.g.\n18.65.14.118\n13.35.190.56',
+    ipsHint: 'IPv4 / IPv6, one per line (commas or spaces also work); duplicates are dropped on save.',
+    hostRequired: 'Please enter a domain',
+    save: 'Save',
+    cancel: 'Cancel',
   },
   logs: {
     accessTab: 'Access Log',

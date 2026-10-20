@@ -151,6 +151,13 @@ pub struct ProxySettings {
     /// 勾选的加速项目 Id 集合（对齐旧版 SupportProxyServicesStatus）
     #[serde(default)]
     pub enabled_accelerate_ids: Vec<String>,
+    /// 终端（CLI）代理环境变量 + 证书注入（默认开）
+    #[serde(default = "default_true")]
+    pub terminal_proxy_enable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ProxySettings {
@@ -166,6 +173,7 @@ impl Default for ProxySettings {
             dns: DnsSettings::default(),
             is_proxy_gog: false,
             enabled_accelerate_ids: Vec::new(),
+            terminal_proxy_enable: true,
         }
     }
 }

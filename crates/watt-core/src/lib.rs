@@ -25,6 +25,7 @@ pub mod probe_cache;
 pub mod sni;
 pub mod stats;
 pub mod system_proxy;
+pub mod terminal_proxy;
 pub mod upgrade;
 
 pub use engine::{EngineConfig, EngineState, ProxyEngine};

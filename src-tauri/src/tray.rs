@@ -19,6 +19,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 use watt_cert::ca::CaCertificate;
+use watt_config::ProxyMode;
 use watt_core::engine::{EngineConfig, EngineState};
 use watt_dns::DnsConfig;
 
@@ -176,6 +177,21 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         settings.system_proxy_port
     };
 
+    // 终端（CLI）接入面：托盘恢复加速时同样按设置注入（与 engine_start 一致）
+    let terminal_proxy = settings.terminal_proxy_enable.then(|| {
+        let ca_pem = CaCertificate::cert_path(&state.cert_dir());
+        watt_core::terminal_proxy::TerminalProxyPlan {
+            backup_path: state
+                .data_dir
+                .join("Settings")
+                .join("TerminalProxyEnv.backup.json"),
+            proxy_url: (!matches!(settings.proxy_mode, ProxyMode::Hosts))
+                .then(|| format!("http://127.0.0.1:{forward_proxy_port}")),
+            no_proxy: watt_core::terminal_proxy::default_no_proxy(),
+            ca_pem: ca_pem.exists().then_some(ca_pem),
+        }
+    });
+
     let config = EngineConfig {
         mode: settings.proxy_mode,
         listen_ip,
@@ -209,6 +225,7 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         probe_cache_path: None,
         probe_cache_persist: false,
         probe_top_k: None,
+        terminal_proxy,
     };
 
     let mut engine = state.engine.lock().await;

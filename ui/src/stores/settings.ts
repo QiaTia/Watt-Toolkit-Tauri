@@ -28,6 +28,7 @@ export function defaultProxySettings(): ProxySettings {
     },
     is_proxy_gog: false,
     enabled_accelerate_ids: [],
+    terminal_proxy_enable: true,
   };
 }
 

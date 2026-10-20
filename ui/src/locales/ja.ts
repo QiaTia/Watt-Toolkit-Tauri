@@ -4,6 +4,7 @@ const ja: Schema = {
   nav: {
     home: 'ホーム',
     accelerator: 'ネットワーク加速',
+    pool: 'IP プール管理',
     settings: '設定',
     about: '情報',
     logs: 'ログ',
@@ -72,6 +73,9 @@ const ja: Schema = {
         descMac:
           'macOS では /etc/hosts の書き込みに管理者権限が必要です。エンジンの開始と停止時に' +
           'それぞれパスワード入力が表示されます。',
+        descWin:
+          'Windows では hosts の書き込みと復元のため、アプリは管理者として起動します' +
+          '（起動時に UAC が 1 回表示されます）。',
       },
       system: {
         label: 'システムプロキシ',
@@ -111,6 +115,11 @@ const ja: Schema = {
     httpRedirect: 'HTTP→HTTPS リダイレクト (80)',
     socks5Enable: 'SOCKS5 を有効化',
     socks5Port: 'SOCKS5 ポート',
+    terminalProxy: 'ターミナルプロキシ（CLI）',
+    terminalProxyHint:
+      'git / curl / npm / pip などの CLI に HTTP(S)_PROXY と CA 証明書の環境変数を注入し、'
+      + 'ターミナルの通信も加速します（既に開いているターミナルは再起動が必要）。'
+      + 'System / PAC / プロキシポートのみモードではローカル転送プロキシを指し、Hosts モードでは証明書のみ注入します。',
     twoLevelTitle: '上位プロキシ（二次プロキシ）',
     twoLevelEnable: '二次プロキシを有効化',
     protocol: 'プロトコル種別',
@@ -124,16 +133,6 @@ const ja: Schema = {
     masterDns: 'カスタム メイン DNS',
     useDoh: 'DoH を使用',
     dohAddr: 'カスタム DoH アドレス',
-    ipPoolTitle: 'IP プール更新',
-    ipPoolHint:
-      '選択中の加速プロジェクトのドメインを健全な DNS で解決し、各 IP をローカルで検証' +
-      '（TCP + TLS ハンドシェイク）して、利用可能な IP を送信 IP プールに書き込みます。',
-    ipPoolRefresh: 'IP プールを更新',
-    ipPoolSummary: '{hosts} ドメイン、{ok}/{candidates} 候補が利用可能',
-    ipPoolHost: 'ドメイン',
-    ipPoolUsable: '利用可能',
-    ipPoolFastest: '最速',
-    ipPoolNone: 'なし',
     certTitle: 'CA 証明書',
     trustStatus: '信頼状態',
     trusted: 'インストール済み（信頼済み）',
@@ -163,6 +162,85 @@ const ja: Schema = {
       'macOS ではルート証明書のインストール / 削除時に管理者パスワードの入力画面が表示されます' +
       '（システムキーチェーンへの書き込み）。',
     elevateCancelled: '管理者の承認がキャンセルされました。操作は完了していません。',
+  },
+  pool: {
+    summary: '{hosts} ドメイン、{ips} 個の IP',
+    lastRefreshSummary: '前回の更新：{hosts} ドメイン、{ok}/{candidates} 候補が利用可能',
+    hint:
+      'ドメインごとに送信 IP プールを管理します。加速接続時はプール内から最速の IP を' +
+      '選択します（TLS ハンドシェイクの RTT が最短のものが勝ちます）。右上の' +
+      '「IP プールを更新」は選択中の加速プロジェクトのドメインを健全な DNS で解決し、' +
+      'ローカルで検証します。単一ドメインの編集や再解決も可能です。',
+    refreshAll: 'IP プールを更新',
+    refreshDone: '更新完了：{hosts} ドメイン、{ok}/{candidates} 候補が利用可能',
+    refreshEmpty: '更新対象がありません。先に加速ページでプロジェクトを選択してください',
+    refreshFailed: 'IP プールの更新に失敗しました',
+    addDomain: 'ドメイン追加',
+    clearAll: 'すべて消去',
+    clearConfirm: 'すべての IP プールを消去しますか？加速は内蔵バックアップとシステム DNS に戻ります。',
+    colHost: 'ドメイン',
+    colIps: 'IP 数',
+    colRefreshed: '前回の更新',
+    colActions: '操作',
+    builtinTitle: '内蔵バックアッププール',
+    builtinSummary: '{groups} グループ / {ips} 個の IP',
+    builtinHint:
+      'リリースに同梱され、読み取り専用です。各ドメインはまず動的プールを使い、動的プールに' +
+      '該当がない、または候補が全滅した場合に、この IP 群が送信競速のバックアップになります' +
+      '（失敗した候補は自動で除外されるため、成功経路の遅延は増えません）。' +
+      'ここは人手で用意したバックアップが必要な少数のサービス（GitHub 3 グループ / ' +
+      'Google 翻訳 / Figma 3 グループ）のみで、加速ドメインの一覧ではありません。' +
+      '全ドメインは上の「加速ドメイン IP 概要」を参照してください。',
+    overviewTitle: '加速ドメイン IP 概要',
+    overviewSummary:
+      '全 {hosts} ドメイン：{withIp} 件は静的/プール IP あり、{dnsOnly} 件は DNS のみ',
+    overviewHint:
+      '現在選択中の加速プロジェクト（内蔵グループを含む）の全ドメインと、それぞれの IP 供給元を' +
+      '示します。「上書き IP」は内蔵サービスがドメインに固定指定した優先 IP、「動的プール」は' +
+      '右上の更新で取得、「内蔵バックアッププール」はリリース同梱のフォールバックです。' +
+      'いずれも無いドメインは、汚染対策 DNS 解決 + 競速で決まります。',
+    searchPlaceholder: 'ドメイン検索',
+    colSource: '供給元',
+    srcAll: 'すべて',
+    srcOverride: '上書き IP',
+    srcDynamic: '動的プール',
+    srcBuiltin: '内蔵バックアップ',
+    srcDns: 'DNS 解決',
+    srcDnsOnly: 'DNS のみ',
+    dnsAlwaysHint: 'DNS 解決は常に候補のひとつです（汚染対策 DNS + 競速）',
+    ipCountDns: 'DNS のみ',
+    readonly: '読み取り専用',
+    colPattern: 'マッチパターン',
+    colNote: '説明',
+    edit: '編集',
+    probe: '検証',
+    refreshHost: 'DNS から再取得',
+    remove: '削除',
+    removeConfirm: '{host} の IP プールを削除しますか？内蔵バックアップとシステム DNS に戻ります。',
+    removeIp: '削除',
+    unreachable: '利用不可',
+    notProbed: '未検証',
+    rtt: '{ms} ms',
+    prune: '利用不可の {n} 件を削除',
+    pruneDone: '利用不可の IP を {n} 件削除しました',
+    probeOk: '{ok}/{total} 個の IP が利用可能',
+    probeAllFailed: '{total} 個すべて利用不可です。DNS から再取得してください',
+    refreshHostEmpty: '{host} は利用可能な IP を解決できず、プール項目を削除しました',
+    refreshedHost: '{host} を更新しました：{ok}/{total} 候補が利用可能',
+    removed: '削除しました',
+    saved: '保存しました',
+    cleared: 'IP プールを消去しました',
+    empty: 'ドメインの IP プールがありません。ドメインを追加するか、右上の「IP プールを更新」を実行してください',
+    editTitleNew: 'ドメイン IP プールを追加',
+    editTitleEdit: '{host} の IP プールを編集',
+    hostLabel: 'ドメイン',
+    hostPlaceholder: 'example.com（スキームとパスは不要）',
+    ipsLabel: 'IP リスト',
+    ipsPlaceholder: '1 行に 1 つの IP、例：\n18.65.14.118\n13.35.190.56',
+    ipsHint: 'IPv4 / IPv6 に対応。1 行に 1 つ（カンマや空白区切りも可）。保存時に重複を除去します。',
+    hostRequired: 'ドメインを入力してください',
+    save: '保存',
+    cancel: 'キャンセル',
   },
   logs: {
     accessTab: 'アクセスログ',

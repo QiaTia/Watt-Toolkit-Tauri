@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import AntApp from 'ant-design-vue/es/app';
 import { useSettingsStore } from '@/stores/settings';
+import { useIpPoolStore } from '@/stores/ipPool';
 
 defineProps<{ title: string; collapsed: boolean }>();
 
@@ -12,11 +13,14 @@ const emit = defineEmits<{ (e: 'toggle'): void }>();
 const route = useRoute();
 const { t } = useI18n();
 const settings = useSettingsStore();
+const pool = useIpPoolStore();
 // 由 <a-app>（App.vue）提供的上下文创建，跟随全局主题
 const { message } = AntApp.useApp();
 
 /** 仅设置页在顶栏右上角显示保存入口（原页面底部保存栏已移除） */
 const showSave = computed(() => route.path === '/settings');
+/** IP 池管理页：顶栏右上角显示「刷新 IP 池」（原设置页 IP 池卡片迁移至此） */
+const showPoolRefresh = computed(() => route.path === '/pool');
 
 async function onSave(): Promise<void> {
   const ok = await settings.save();
@@ -25,6 +29,26 @@ async function onSave(): Promise<void> {
   } else {
     void message.error(t('common.saveFailed'));
   }
+}
+
+async function onRefreshPool(): Promise<void> {
+  const results = await pool.refreshAll();
+  // null = 命令失败，错误已进 store（页面顶部 alert 展示）
+  if (results === null) {
+    void message.error(pool.error ?? t('pool.refreshFailed'));
+    return;
+  }
+  if (results.length === 0) {
+    void message.info(t('pool.refreshEmpty'));
+    return;
+  }
+  void message.success(
+    t('pool.refreshDone', {
+      hosts: results.length,
+      ok: results.reduce((n, r) => n + r.ok, 0),
+      candidates: results.reduce((n, r) => n + r.candidates, 0),
+    }),
+  );
 }
 </script>
 
@@ -41,6 +65,15 @@ async function onSave(): Promise<void> {
     <div class="header-right">
       <a-button v-if="showSave" type="primary" :loading="settings.saving" @click="onSave">
         {{ $t('common.save') }}
+      </a-button>
+      <a-button
+        v-if="showPoolRefresh"
+        type="primary"
+        :loading="pool.refreshing"
+        @click="onRefreshPool"
+      >
+        <template #icon><ReloadOutlined /></template>
+        {{ $t('pool.refreshAll') }}
       </a-button>
     </div>
   </a-layout-header>

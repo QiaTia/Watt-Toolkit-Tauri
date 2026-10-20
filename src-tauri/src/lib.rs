@@ -89,6 +89,18 @@ pub fn run() {
                     tracing::warn!("启动清理残留代理状态: {}", cleaned.join(", "));
                 }
 
+                // 终端代理环境变量残留：上次进程被强杀时可能还留着指向已停端口的
+                // HTTP_PROXY（会让新开的终端全部走一个死代理）→ 按备份还原。
+                let tp_backup = data_dir
+                    .join("Settings")
+                    .join("TerminalProxyEnv.backup.json");
+                if watt_core::terminal_proxy::is_enabled(&tp_backup) {
+                    match watt_core::terminal_proxy::disable(&tp_backup) {
+                        Ok(()) => tracing::warn!("启动清理：已还原上次残留的终端代理环境变量"),
+                        Err(e) => tracing::warn!("启动清理终端代理环境变量失败: {e}"),
+                    }
+                }
+
                 AppState {
                     engine: tokio::sync::Mutex::new(engine),
                     ca: tokio::sync::RwLock::new(ca),
@@ -130,6 +142,14 @@ pub fn run() {
             commands::accelerate::accelerate_get_rules,
             commands::accelerate::accelerate_connectivity_test,
             commands::ip_pool::ip_pool_refresh,
+            commands::ip_pool::ip_pool_builtin_list,
+            commands::ip_pool::ip_pool_domain_overview,
+            commands::ip_pool::ip_pool_list,
+            commands::ip_pool::ip_pool_save_domain,
+            commands::ip_pool::ip_pool_remove_domain,
+            commands::ip_pool::ip_pool_clear,
+            commands::ip_pool::ip_pool_refresh_host,
+            commands::ip_pool::ip_pool_probe_domain,
             commands::logs::proxy_access_logs,
             commands::logs::proxy_access_logs_clear,
             commands::logs::runtime_logs,
@@ -152,6 +172,16 @@ pub fn run() {
                 let mut engine = state.engine.lock().await;
                 engine.shutdown(None, &[port]).await;
             });
+            // 兜底：引擎非运行态时 shutdown 不会走 stop()，终端代理环境变量需单独还原
+            let tp_backup = state
+                .data_dir
+                .join("Settings")
+                .join("TerminalProxyEnv.backup.json");
+            if watt_core::terminal_proxy::is_enabled(&tp_backup) {
+                if let Err(e) = watt_core::terminal_proxy::disable(&tp_backup) {
+                    tracing::warn!("退出时还原终端代理环境变量失败: {e}");
+                }
+            }
         }
     });
 }

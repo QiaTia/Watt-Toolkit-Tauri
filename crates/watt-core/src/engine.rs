@@ -70,6 +70,8 @@ pub struct EngineConfig {
     pub probe_cache_persist: bool,
     /// top-K 裁剪（P2，默认关= None；None 或 0 = 不裁剪，全部候选参赛）
     pub probe_top_k: Option<usize>,
+    /// 终端（CLI）接入面：用户级代理环境变量 + CLI 证书注入（None = 不启用）
+    pub terminal_proxy: Option<crate::terminal_proxy::TerminalProxyPlan>,
 }
 
 impl Default for EngineConfig {
@@ -94,6 +96,7 @@ impl Default for EngineConfig {
             probe_cache_path: None,
             probe_cache_persist: false,
             probe_top_k: None,
+            terminal_proxy: None,
         }
     }
 }
@@ -119,6 +122,8 @@ pub struct ProxyEngine {
     probe_cache_path: Option<std::path::PathBuf>,
     /// 探测缓存是否落盘（P2，默认关）
     probe_cache_persist: bool,
+    /// 本次运行注入的终端代理环境变量备份路径（未注入为 None）
+    terminal_proxy_backup: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +155,7 @@ impl ProxyEngine {
             probe_cache: None,
             probe_cache_path: None,
             probe_cache_persist: false,
+            terminal_proxy_backup: None,
         }
     }
 
@@ -515,7 +521,20 @@ impl ProxyEngine {
             }
         }
 
-        // —— 6. 启动预探测（后台 best-effort：不阻塞启动路径，结果写 ctx.probe_cache，
+        // —— 6. 终端（CLI）接入面：用户级代理环境变量 + CLI 证书注入 ——
+        //
+        // 系统代理只写 WinINET，`git`/`curl`/`npm`/`pip` 都不读它（上游同样如此），
+        // 因此终端命令在 System/PAC 模式下天然不会被代理。这里补第二条接入面：
+        // 有正向代理在听时注入 HTTP(S)_PROXY/ALL_PROXY/NO_PROXY，并给 CLI 注入 CA
+        // 覆盖变量。失败不阻断启动（终端覆盖是增强能力，核心加速不受影响）。
+        if let Some(plan) = &config.terminal_proxy {
+            match crate::terminal_proxy::enable(plan) {
+                Ok(()) => self.terminal_proxy_backup = Some(plan.backup_path.clone()),
+                Err(e) => tracing::warn!("终端代理环境变量注入失败（忽略，不影响加速）: {e}"),
+            }
+        }
+
+        // —— 7. 启动预探测（后台 best-effort：不阻塞启动路径，结果写 ctx.probe_cache，
         //       请求竞速自动按 RTT 排序；P2-a 每 60s 周期重探；stop 时 abort）——
         let probe_targets = crate::probe::probe_targets_from_rules(ctx.rules.all());
         if !probe_targets.is_empty() {
@@ -606,7 +625,14 @@ impl ProxyEngine {
             }
         }
 
-        // —— 3. 关闭监听 ——
+        // —— 3. 还原终端代理环境变量（CLI 接入面）——
+        if let Some(path) = self.terminal_proxy_backup.take() {
+            if let Err(e) = crate::terminal_proxy::disable(&path) {
+                tracing::warn!("还原终端代理环境变量失败: {e}");
+            }
+        }
+
+        // —— 4. 关闭监听 ——
         self.shutdown_tx.send_replace(true);
         if let Some(task) = self.running_task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;

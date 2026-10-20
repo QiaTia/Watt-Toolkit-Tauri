@@ -20,6 +20,12 @@ const router = createRouter({
       meta: { title: '网络加速', icon: '🚀' },
     },
     {
+      path: '/pool',
+      name: 'pool',
+      component: () => import('@/views/IpPoolPage.vue'),
+      meta: { title: 'IP 池管理', icon: '🗂️' },
+    },
+    {
       path: '/settings',
       name: 'settings',
       component: () => import('@/views/SettingsPage.vue'),

@@ -44,6 +44,13 @@ pub struct EngineStartParams {
     /// top-K 裁剪（P2，默认关= None）
     #[serde(default)]
     pub probe_top_k: Option<usize>,
+    /// 终端（CLI）代理环境变量 + 证书注入（默认开：让 git/curl/npm/pip 也能走加速）
+    #[serde(default = "default_true")]
+    pub terminal_proxy_enable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 引擎状态（Rust → 前端）
@@ -114,6 +121,22 @@ pub async fn engine_start(
         .forward_proxy_port
         .unwrap_or(watt_config::constants::DEFAULT_HTTP_PROXY_PORT);
 
+    // 终端（CLI）接入面：仅当存在正向代理监听时注入代理变量；
+    // 证书变量在所有模式下都注入（Hosts 模式终端仍需信任 MITM 根证书）。
+    let terminal_proxy = params.terminal_proxy_enable.then(|| {
+        let ca_pem = CaCertificate::cert_path(&state.cert_dir());
+        watt_core::terminal_proxy::TerminalProxyPlan {
+            backup_path: state
+                .data_dir
+                .join("Settings")
+                .join("TerminalProxyEnv.backup.json"),
+            proxy_url: (!matches!(params.mode, ProxyMode::Hosts))
+                .then(|| format!("http://127.0.0.1:{forward_proxy_port}")),
+            no_proxy: watt_core::terminal_proxy::default_no_proxy(),
+            ca_pem: ca_pem.exists().then_some(ca_pem),
+        }
+    });
+
     let config = EngineConfig {
         mode: params.mode,
         listen_ip,
@@ -138,6 +161,7 @@ pub async fn engine_start(
         }),
         probe_cache_persist: params.probe_cache_persist,
         probe_top_k: params.probe_top_k.filter(|k| *k > 0),
+        terminal_proxy,
     };
 
     let mut engine = state.engine.lock().await;

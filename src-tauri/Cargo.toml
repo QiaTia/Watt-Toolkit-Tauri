@@ -1,6 +1,6 @@
 [package]
 name = "watt-toolkit-app"
-version = "0.2.0"
+version = "0.4.0"
 description = "Watt Toolkit（网络加速服务 Tauri 版）"
 edition = "2021"
 license = "GPL-3.0"

@@ -4,6 +4,7 @@ const fr: Schema = {
   nav: {
     home: 'Accueil',
     accelerator: 'Accélération réseau',
+    pool: 'Pools d’IP',
     settings: 'Paramètres',
     about: 'À propos',
     logs: 'Journaux',
@@ -73,6 +74,9 @@ const fr: Schema = {
         descMac:
           'Sur macOS, écrire /etc/hosts nécessite les droits administrateur : une invite de ' +
           'mot de passe au démarrage et à l’arrêt du moteur.',
+        descWin:
+          'Sur Windows, l’application s’exécute en tant qu’administrateur (une invite UAC au ' +
+          'lancement) afin d’écrire et de restaurer le fichier hosts.',
       },
       system: {
         label: 'Proxy système',
@@ -116,6 +120,12 @@ const fr: Schema = {
     httpRedirect: 'Redirection HTTP→HTTPS (80)',
     socks5Enable: 'Activer SOCKS5',
     socks5Port: 'Port SOCKS5',
+    terminalProxy: 'Proxy terminal (CLI)',
+    terminalProxyHint:
+      'Injecte HTTP(S)_PROXY et les variables de certificat CA pour git / curl / npm / pip '
+      + 'afin d’accélérer aussi le trafic du terminal (les terminaux déjà ouverts doivent être '
+      + 'redémarrés). Les modes System / PAC / port proxy uniquement pointent vers le proxy '
+      + 'local ; le mode Hosts n’injecte que le certificat.',
     twoLevelTitle: 'Proxy amont (secondaire)',
     twoLevelEnable: 'Activer le proxy amont',
     protocol: 'Protocole',
@@ -129,16 +139,6 @@ const fr: Schema = {
     masterDns: 'DNS principal personnalisé',
     useDoh: 'Utiliser DoH',
     dohAddr: 'Adresse DoH personnalisée',
-    ipPoolTitle: 'Mise à jour du pool d’IP',
-    ipPoolHint:
-      'Résout les domaines des projets d’accélération cochés via un DNS sain, teste chaque IP ' +
-      'localement (handshake TCP + TLS) et écrit les IP utilisables dans le pool d’IP sortant.',
-    ipPoolRefresh: 'Rafraîchir le pool d’IP',
-    ipPoolSummary: '{hosts} domaines, {ok}/{candidates} candidats utilisables',
-    ipPoolHost: 'Domaine',
-    ipPoolUsable: 'Utilisable',
-    ipPoolFastest: 'Le plus rapide',
-    ipPoolNone: 'Aucun',
     certTitle: 'Certificat CA',
     trustStatus: 'État de confiance',
     trusted: 'Installé et approuvé',
@@ -170,6 +170,91 @@ const fr: Schema = {
       "Sur macOS, l'installation ou la suppression du certificat racine demande le mot de " +
       'passe administrateur (accès au trousseau système).',
     elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
+  },
+  pool: {
+    summary: '{hosts} domaines, {ips} IP',
+    lastRefreshSummary: 'Dernier rafraîchissement : {hosts} domaines, {ok}/{candidates} candidats utilisables',
+    hint:
+      'Les pools d’IP sont gérés par domaine : l’accélération choisit l’IP la plus rapide du ' +
+      'pool (RTT de handshake TLS le plus court). Le bouton « Rafraîchir les pools d’IP » en ' +
+      'haut à droite résout les domaines des projets cochés via un DNS sain et les teste ' +
+      'localement ; un domaine peut aussi être modifié ou re-résolu individuellement.',
+    refreshAll: 'Rafraîchir les pools d’IP',
+    refreshDone: 'Rafraîchissement terminé : {hosts} domaines, {ok}/{candidates} candidats utilisables',
+    refreshEmpty: 'Rien à rafraîchir : cochez d’abord des projets sur la page d’accélération',
+    refreshFailed: 'Échec du rafraîchissement des pools d’IP',
+    addDomain: 'Ajouter un domaine',
+    clearAll: 'Tout effacer',
+    clearConfirm:
+      'Effacer tous les pools d’IP ? L’accélération reviendra aux sauvegardes intégrées et au DNS système.',
+    colHost: 'Domaine',
+    colIps: 'IP',
+    colRefreshed: 'Dernier rafraîchissement',
+    colActions: 'Actions',
+    builtinTitle: 'Pools de secours intégrés',
+    builtinSummary: '{groups} groupes / {ips} IP',
+    builtinHint:
+      'Livrés avec chaque version et en lecture seule : un domaine utilise d’abord son pool ' +
+      'dynamique ; si celui-ci n’a aucune correspondance ou si tous les candidats échouent, ces ' +
+      'IP servent de secours à la course sortante (les candidats en échec sont ignorés, donc le ' +
+      'chemin réussi n’est pas ralenti). Cela ne couvre que les rares services nécessitant un ' +
+      'secours manuel (trois groupes GitHub / Google Traduction / trois groupes Figma) — ce n’est ' +
+      'pas la liste des domaines, voir « Aperçu IP des domaines accélérés » ci-dessus.',
+    overviewTitle: 'Aperçu IP des domaines accélérés',
+    overviewSummary:
+      '{hosts} domaines : {withIp} avec IP statiques/pool, {dnsOnly} via DNS seulement',
+    overviewHint:
+      'Tous les domaines des projets d’accélération cochés (groupes intégrés compris) et l’origine ' +
+      'de leurs IP. « IP imposée » est l’IP prioritaire fixée par le service intégré ; « Pool ' +
+      'dynamique » provient du rafraîchissement ; « Pool de secours intégré » est la liste livrée ' +
+      'avec la version. Les domaines sans aucune de ces sources passent par le DNS anti-empoisonnement ' +
+      'et la course de candidats.',
+    searchPlaceholder: 'Rechercher un domaine',
+    colSource: 'Sources',
+    srcAll: 'Tout',
+    srcOverride: 'IP imposée',
+    srcDynamic: 'Pool dynamique',
+    srcBuiltin: 'Secours intégré',
+    srcDns: 'DNS',
+    srcDnsOnly: 'DNS seul',
+    dnsAlwaysHint:
+      'La résolution DNS reste toujours candidate (DNS anti-empoisonnement + course de candidats)',
+    ipCountDns: 'DNS seul',
+    readonly: 'Lecture seule',
+    colPattern: 'Motif',
+    colNote: 'Notes',
+    edit: 'Modifier',
+    probe: 'Tester',
+    refreshHost: 'Re-résoudre',
+    remove: 'Supprimer',
+    removeConfirm:
+      'Supprimer le pool d’IP de {host} ? Il reviendra aux sauvegardes intégrées et au DNS système.',
+    removeIp: 'Retirer',
+    unreachable: 'Injoignable',
+    notProbed: 'Non testé',
+    rtt: '{ms} ms',
+    prune: 'Retirer {n} IP injoignables',
+    pruneDone: '{n} IP injoignables retirées',
+    probeOk: '{ok}/{total} IP utilisables',
+    probeAllFailed: 'Les {total} IP sont injoignables — relancez une résolution DNS',
+    refreshHostEmpty: 'Aucune IP utilisable pour {host} ; son entrée de pool a été supprimée',
+    refreshedHost: '{host} mis à jour : {ok}/{total} candidats utilisables',
+    removed: 'Supprimé',
+    saved: 'Enregistré',
+    cleared: 'Pools d’IP effacés',
+    empty:
+      'Aucun pool de domaine — ajoutez un domaine ou utilisez « Rafraîchir les pools d’IP » en haut à droite',
+    editTitleNew: 'Ajouter un pool d’IP de domaine',
+    editTitleEdit: 'Modifier le pool d’IP de {host}',
+    hostLabel: 'Domaine',
+    hostPlaceholder: 'example.com (sans schéma ni chemin)',
+    ipsLabel: 'Liste d’IP',
+    ipsPlaceholder: 'Une IP par ligne, par ex.\n18.65.14.118\n13.35.190.56',
+    ipsHint:
+      'IPv4 / IPv6, une par ligne (virgules ou espaces acceptés) ; les doublons sont supprimés à l’enregistrement.',
+    hostRequired: 'Veuillez saisir un domaine',
+    save: 'Enregistrer',
+    cancel: 'Annuler',
   },
   logs: {
     accessTab: 'Journal des accès',

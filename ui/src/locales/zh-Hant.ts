@@ -4,6 +4,7 @@ const zhHant: Schema = {
   nav: {
     home: '首頁',
     accelerator: '網路加速',
+    pool: 'IP 池管理',
     settings: '設定',
     about: '關於',
     logs: '日誌',
@@ -67,6 +68,8 @@ const zhHant: Schema = {
         desc: '修改 hosts 指向本機 443 反代（需 443 連接埠空閒，寫入 hosts 可能需要管理員權限）',
         descMac:
           'macOS 下寫入 /etc/hosts 需要管理員權限：啟動與停止引擎各會彈出一次系統密碼框。',
+        descWin:
+          'Windows 下程式以管理員身分執行（啟動時彈出一次 UAC），以便寫入與還原 hosts。',
       },
       system: {
         label: '系統代理',
@@ -104,6 +107,11 @@ const zhHant: Schema = {
     httpRedirect: 'HTTP→HTTPS 重新導向 (80)',
     socks5Enable: '啟用 SOCKS5',
     socks5Port: 'SOCKS5 連接埠',
+    terminalProxy: '終端機代理（命令列）',
+    terminalProxyHint:
+      '為 git / curl / npm / pip 等命令列工具注入 HTTP(S)_PROXY 與 CA 憑證變數，'
+      + '讓終端機流量也能走加速（已開啟的終端機需重開才生效）。System / PAC / 僅代理連接埠模式下'
+      + '指向本機正向代理；Hosts 模式下只注入憑證。',
     twoLevelTitle: '二級代理（上游）',
     twoLevelEnable: '啟用二級代理',
     protocol: '協定類型',
@@ -117,16 +125,6 @@ const zhHant: Schema = {
     masterDns: '自訂主 DNS',
     useDoh: '使用 DoH',
     dohAddr: '自訂 DoH 位址',
-    ipPoolTitle: 'IP 池更新',
-    ipPoolHint:
-      '從健康 DNS 解析目前勾選加速專案的網域 IP，逐一在本機探測（TCP + TLS 握手），' +
-      '將可用 IP 寫入出站 IP 池，供加速連線擇優使用。',
-    ipPoolRefresh: '重新整理 IP 池',
-    ipPoolSummary: '共 {hosts} 個網域，{ok}/{candidates} 個候選可用',
-    ipPoolHost: '網域',
-    ipPoolUsable: '可用',
-    ipPoolFastest: '最快',
-    ipPoolNone: '無',
     certTitle: 'CA 憑證',
     trustStatus: '信任狀態',
     trusted: '已安裝並信任',
@@ -152,6 +150,80 @@ const zhHant: Schema = {
       'macOS 下會彈出管理員密碼框。也可匯出 PEM 後手動匯入到「受信任的根憑證授權單位」。',
     elevateMacHint: 'macOS 下安裝 / 移除根证书會彈出系統管理員密碼框（需寫入系統鑰匙圈）。',
     elevateCancelled: '已取消管理員授權，操作未完成。',
+  },
+  pool: {
+    summary: '共 {hosts} 個網域、{ips} 個 IP',
+    lastRefreshSummary: '最近一次重新整理：{hosts} 個網域，{ok}/{candidates} 個候選可用',
+    hint:
+      '依網域維護出站 IP 池：加速連線時優先從池內擇優（TLS 握手 RTT 最短者勝出）。' +
+      '右上角「重新整理 IP 池」會從健康 DNS 解析目前勾選加速專案的網域並在本機探測；' +
+      '單一網域也可手動增刪 IP 或從 DNS 重刷。',
+    refreshAll: '重新整理 IP 池',
+    refreshDone: '重新整理完成：{hosts} 個網域，{ok}/{candidates} 個候選可用',
+    refreshEmpty: '沒有可重新整理的網域：請先在加速頁勾選加速專案',
+    refreshFailed: '重新整理 IP 池失敗',
+    addDomain: '新增網域',
+    clearAll: '清空全部',
+    clearConfirm: '清空全部 IP 池？加速將回退到內建備用池與系統 DNS。',
+    colHost: '網域',
+    colIps: 'IP 數',
+    colRefreshed: '最近重新整理',
+    colActions: '操作',
+    builtinTitle: '內建備用池',
+    builtinSummary: '{groups} 組 / {ips} 個 IP',
+    builtinHint:
+      '隨版本發佈、唯讀：每個網域先走動態池，動態池無命中或候選全部失效時，' +
+      '出站競速用這組 IP 兜底（失敗候選會被自動跳過，不增加成功路徑的延遲）。' +
+      '這裡只涵蓋確實需要人工兜底的少數服務（GitHub 三組 / Google 翻譯 / Figma 三組）——' +
+      '它不是加速網域清單，完整網域見上方「加速網域 IP 總覽」。',
+    overviewTitle: '加速網域 IP 總覽',
+    overviewSummary: '共 {hosts} 個網域，{withIp} 個已有靜態/池 IP，{dnsOnly} 個僅走 DNS',
+    overviewHint:
+      '列出目前勾選加速專案（含內建分組）的全部網域及各自的 IP 來源。' +
+      '「覆蓋 IP」是內建加速服務為網域寫死的首選 IP；「動態池」來自右上角重新整理；' +
+      '「內建備用池」是版本內建的兜底清單；三者都沒有的網域由抗污染 DNS 解析 + 競速決定。',
+    searchPlaceholder: '搜尋網域',
+    colSource: '生效來源',
+    srcAll: '全部',
+    srcOverride: '覆蓋 IP',
+    srcDynamic: '動態池',
+    srcBuiltin: '內建備用池',
+    srcDns: 'DNS 解析',
+    srcDnsOnly: '僅 DNS',
+    dnsAlwaysHint: 'DNS 解析始終是候選之一（抗污染解析 + 競速擇優）',
+    ipCountDns: '僅 DNS',
+    readonly: '唯讀',
+    colPattern: '符合模式',
+    colNote: '說明',
+    edit: '編輯',
+    probe: '探測',
+    refreshHost: '從 DNS 重刷',
+    remove: '刪除',
+    removeConfirm: '刪除 {host} 的 IP 池？該網域將回退到內建備用池與系統 DNS。',
+    removeIp: '移除',
+    unreachable: '不可用',
+    notProbed: '未探測',
+    rtt: '{ms} ms',
+    prune: '移除 {n} 個不可用 IP',
+    pruneDone: '已移除 {n} 個不可用 IP',
+    probeOk: '{ok}/{total} 個 IP 可用',
+    probeAllFailed: '{total} 個 IP 全部不可用，建議從 DNS 重刷',
+    refreshHostEmpty: '{host} 未解析到可用 IP，池條目已清除',
+    refreshedHost: '{host} 已更新：{ok}/{total} 個候選可用',
+    removed: '已刪除',
+    saved: '已儲存',
+    cleared: 'IP 池已清空',
+    empty: '還沒有任何網域 IP 池，可新增網域或點右上角「重新整理 IP 池」',
+    editTitleNew: '新增網域 IP 池',
+    editTitleEdit: '編輯 {host} 的 IP 池',
+    hostLabel: '網域',
+    hostPlaceholder: 'example.com（不含協定與路徑）',
+    ipsLabel: 'IP 清單',
+    ipsPlaceholder: '每行一個 IP，例如：\n18.65.14.118\n13.35.190.56',
+    ipsHint: '支援 IPv4 / IPv6，每行一個（也接受逗號或空格分隔），儲存時自動去重。',
+    hostRequired: '請填寫網域',
+    save: '儲存',
+    cancel: '取消',
   },
   logs: {
     accessTab: '存取日誌',

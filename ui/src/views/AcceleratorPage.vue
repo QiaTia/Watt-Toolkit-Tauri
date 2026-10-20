@@ -5,7 +5,7 @@ import AntApp from 'ant-design-vue/es/app';
 import { useProxyStore } from '@/stores/proxy';
 import { useSettingsStore } from '@/stores/settings';
 import { useAccelerateStore } from '@/stores/accelerate';
-import { isMacOS } from '@/utils/platform';
+import { isMacOS, isWindows } from '@/utils/platform';
 import type {
   AccelerateProject,
   AccelerateProjectGroup,
@@ -78,6 +78,10 @@ const currentModeDescription = computed(() => {
   // macOS 下 Hosts 模式写入 /etc/hosts 需提权，补充弹窗说明
   if (isMacOS() && selectedMode.value === 'Hosts') {
     return `${desc} ${t('accel.modes.hosts.descMac')}`;
+  }
+  // Windows 下程序整体以管理员运行（清单 requireAdministrator），补充 UAC 说明
+  if (isWindows() && selectedMode.value === 'Hosts') {
+    return `${desc} ${t('accel.modes.hosts.descWin')}`;
   }
   return desc;
 });
@@ -288,6 +292,7 @@ async function toggleEngine(): Promise<void> {
     dns: s.dns,
     serverSideProxyToken: null,
     rules,
+    terminalProxyEnable: s.terminal_proxy_enable,
   };
   await proxy.start(params);
 }
