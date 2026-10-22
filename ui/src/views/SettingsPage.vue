@@ -408,6 +408,8 @@ function formatTime(iso: string): string {
 
 .cert-error {
   margin-bottom: 12px;
+  /* 后端的失败指引是多行（含可复制的手动命令），保留换行 */
+  white-space: pre-line;
 }
 
 .hint {

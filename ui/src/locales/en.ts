@@ -157,13 +157,8 @@ const en: Schema = {
     okRemove: 'Remove',
     okRegenerate: 'Regenerate',
     cancel: 'Cancel',
-    certHint:
-      'Installing to the system trust store is required for HTTPS boost (MITM): Windows shows ' +
-      'a UAC prompt, macOS shows an administrator password dialog. You can also export the ' +
-      'PEM and import it into "Trusted Root Certification Authorities" manually.',
-    elevateMacHint:
-      'On macOS, installing or removing the root certificate prompts for the administrator ' +
-      'password (system keychain access).',
+    certHint: 'Installing to the system trust store is required for HTTPS boost (MITM): Windows shows a UAC prompt, macOS shows a system trust confirmation (enter your login password). You can also export the PEM and import it manually.',
+    elevateMacHint: 'On macOS, installing the root certificate shows a one-time system trust confirmation (enter your login password). It applies to the current user - no administrator password needed.',
     elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
   },
   pool: {

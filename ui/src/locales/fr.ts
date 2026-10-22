@@ -161,14 +161,8 @@ const fr: Schema = {
     okRemove: 'Retirer',
     okRegenerate: 'Régénérer',
     cancel: 'Annuler',
-    certHint:
-      "L'installation dans le magasin de confiance système est requise pour l'accélération " +
-      'HTTPS (MITM) : Windows affiche une invite UAC, macOS une boîte de dialogue de mot de ' +
-      'passe administrateur. Vous pouvez aussi exporter le PEM et l’importer manuellement ' +
-      'dans « Autorités de certification racines de confiance ».',
-    elevateMacHint:
-      "Sur macOS, l'installation ou la suppression du certificat racine demande le mot de " +
-      'passe administrateur (accès au trousseau système).',
+    certHint: 'HTTPS (MITM) : Windows affiche une invite UAC, macOS une confirmation de confiance système (mot de passe de session). Vous pouvez aussi exporter le PEM et l’importer manuellement.',
+    elevateMacHint: "Sur macOS, l'installation affiche une confirmation de confiance (mot de passe de session) et s’applique à l’utilisateur courant, sans mot de passe administrateur.",
     elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
   },
   pool: {

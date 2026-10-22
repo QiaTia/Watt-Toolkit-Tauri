@@ -147,10 +147,8 @@ const zhHans = {
     okRemove: '移除',
     okRegenerate: '重新生成',
     cancel: '取消',
-    certHint:
-      '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下会弹出 UAC 提权确认，' +
-      'macOS 下会弹出管理员密码框。也可导出 PEM 后手动导入到「受信任的根证书颁发机构」。',
-    elevateMacHint: 'macOS 下安装 / 卸载根证书会弹出系统管理员密码框（需写入系统钥匙串）。',
+    certHint: '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下会弹出 UAC 提权确认，macOS 下会弹出系统信任确认（输入登录密码，无需管理员密码）。也可导出 PEM 后手动导入。',
+    elevateMacHint: 'macOS 下安装根证书会弹一次系统信任确认，输入登录密码即可（装入当前用户信任设置，无需管理员密码）。',
     elevateCancelled: '已取消管理员授权，操作未完成。',
   },
   pool: {

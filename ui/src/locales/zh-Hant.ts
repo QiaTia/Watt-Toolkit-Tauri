@@ -145,10 +145,8 @@ const zhHant: Schema = {
     okRemove: '移除',
     okRegenerate: '重新產生',
     cancel: '取消',
-    certHint:
-      '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下會彈出 UAC 提權確認，' +
-      'macOS 下會彈出管理員密碼框。也可匯出 PEM 後手動匯入到「受信任的根憑證授權單位」。',
-    elevateMacHint: 'macOS 下安裝 / 移除根证书會彈出系統管理員密碼框（需寫入系統鑰匙圈）。',
+    certHint: '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下會彈出 UAC 提權確認，macOS 下會彈出系統信任確認（輸入登入密碼，無需管理員密碼）。也可匯出 PEM 後手動匯入。',
+    elevateMacHint: 'macOS 下安裝根憑證會彈一次系統信任確認，輸入登入密碼即可（存入目前使用者的信任設定，無需管理員密碼）。',
     elevateCancelled: '已取消管理員授權，操作未完成。',
   },
   pool: {
