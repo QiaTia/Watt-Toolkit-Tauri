@@ -52,7 +52,6 @@ async fn diag_github_via_hosts_mode() {
         listening_domain_names: vec!["github.com".into(), "api.github.com".into()],
         fields: DomainRuleFields::default(),
         order: 1,
-        ..Default::default()
     };
 
     let mut engine = ProxyEngine::new();

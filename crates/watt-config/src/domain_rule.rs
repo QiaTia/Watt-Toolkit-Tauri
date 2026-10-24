@@ -58,6 +58,9 @@ pub struct DomainRuleFields {
     /// TLS 忽略名称不匹配
     #[serde(default)]
     pub tls_ignore_name_mismatch: bool,
+    /// 完全跳过 TLS 校验（对齐诊断/测试场景；生产规则应保持 false）
+    #[serde(default)]
+    pub tls_skip_verify: bool,
     /// 服务端代理（追加 X-Watt-Origin-Dest-* / X-Watt-Token 头）
     #[serde(default, alias = "IsServerSideProxy")]
     pub is_server_side_proxy: bool,
@@ -81,6 +84,7 @@ impl Default for DomainRuleFields {
             tls_sni: true,
             fake_server_name: None,
             tls_ignore_name_mismatch: false,
+            tls_skip_verify: false,
             is_server_side_proxy: false,
         }
     }

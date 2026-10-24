@@ -98,6 +98,7 @@ const ja: Schema = {
       failed: '検測未完了。既定順で競速します',
       partial: '予算超過で検測打ち切り。部分結果で最適化',
     },
+    noCheckedHint: '加速を開始する前に、少なくとも1つのプロジェクトを選択してください。',
   },
   settings: {
     generalTitle: '全般',
@@ -157,6 +158,11 @@ const ja: Schema = {
     certHint: 'HTTPS 加速（MITM）にはシステム信頼ストアへのインストールが必要です。Windows では UAC 確認、macOS ではシステムの信頼確認（ログインパスワードを入力）が表示されます。PEM をエクスポートして手動でインポートすることもできます。',
     elevateMacHint: 'macOS ではルート証明書のインストール時に信頼確認が 1 回表示され、ログインパスワードを入力します（現在のユーザーに適用、管理者パスワードは不要）。',
     elevateCancelled: '管理者の承認がキャンセルされました。操作は完了していません。',
+    runningLockedHint: '加速の実行中はプロキシモードとポートがロックされています。加速を停止してから変更してください。',
+    certInstalled: 'ルート証明書をインストールし、信頼しました。',
+    certInstallVerifyFailed: 'インストールコマンドは実行されましたが、検証に失敗しました。システムの信頼設定を確認するか、PEM をエクスポートして手動でインストールしてください。',
+    certUninstalled: 'ルート証明書の信頼を削除しました。',
+    certRegenerated: 'CA を再生成し、古い信頼を削除しました。HTTPS 加速を有効にする前にルート証明書を再インストールしてください。',
   },
   pool: {
     summary: '{hosts} ドメイン、{ips} 個の IP',
@@ -213,6 +219,7 @@ const ja: Schema = {
     remove: '削除',
     removeConfirm: '{host} の IP プールを削除しますか？内蔵バックアップとシステム DNS に戻ります。',
     removeIp: '削除',
+    removeIpConfirm: '{ip} を削除しますか？',
     unreachable: '利用不可',
     notProbed: '未検証',
     rtt: '{ms} ms',

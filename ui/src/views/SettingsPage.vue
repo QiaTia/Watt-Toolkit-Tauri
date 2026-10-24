@@ -1,21 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
+import AntApp from 'ant-design-vue/es/app';
 import { useSettingsStore } from '@/stores/settings';
+import { useProxyStore } from '@/stores/proxy';
 import { useCertStore } from '@/stores/cert';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
-import { isMacOS } from '@/utils/platform';
+import { isMacOS, isWindows } from '@/utils/platform';
 import type { ProxyMode } from '@/types/ipc';
 
 const settings = useSettingsStore();
+const proxy = useProxyStore();
 const cert = useCertStore();
 // 主题/语言即时生效（localStorage 持久化），不走「保存设置」
 const theme = useThemeStore();
 const { t } = useI18n();
+const { message } = AntApp.useApp();
 
 /** macOS 提权提示（钥匙串写入弹管理员密码框） */
 const isMac = isMacOS();
+/** 终端代理注入目前仅 Windows 实现 */
+const windowsPlatform = isWindows();
 
 /** 语言选择器双向绑定（写 localStorage + 切 i18n locale） */
 const language = computed<LocaleCode>({
@@ -27,8 +33,8 @@ const language = computed<LocaleCode>({
 const certError = ref<string | null>(null);
 
 onMounted(() => {
-  if (!settings.loaded) void settings.load();
-  if (cert.status === null) void cert.refresh();
+  if (!settings.loaded) void settings.ensureLoaded().catch(() => {});
+  if (cert.status === null) void cert.refresh().catch(() => {});
 });
 
 /**
@@ -117,15 +123,16 @@ const proxyTypeOptions: Array<{ value: string; label: string }> = [
   { value: 'SOCKS5', label: 'SOCKS5' },
 ];
 
-/** 包装证书操作：统一错误提示 */
+/** 包装证书操作：统一错误提示 + 成功反馈 */
 async function withCertError(action: () => Promise<void>): Promise<void> {
   certError.value = null;
   try {
     await action();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // 提权取消：后端错误含"取消"，映射为本地化文案
-    certError.value = msg.includes('取消') ? t('settings.elevateCancelled') : msg;
+    // 提权取消：后端错误含"取消" / osascript 的 -128 文案
+    const cancelled = msg.includes('取消') || msg.toLowerCase().includes('cancel') || msg.includes('-128');
+    certError.value = cancelled ? t('settings.elevateCancelled') : msg;
   }
 }
 
@@ -134,15 +141,29 @@ async function exportCa(): Promise<void> {
 }
 
 async function installCa(): Promise<void> {
-  await withCertError(() => cert.install());
+  await withCertError(async () => {
+    await cert.install();
+    if (cert.status?.installed) {
+      message.success(t('settings.certInstalled'));
+    } else {
+      // 命令成功但安装后校验未通过：明确提示，而不是静默停在「未安装」
+      message.warning(t('settings.certInstallVerifyFailed'));
+    }
+  });
 }
 
 async function uninstallCa(): Promise<void> {
-  await withCertError(() => cert.uninstall());
+  await withCertError(async () => {
+    await cert.uninstall();
+    message.success(t('settings.certUninstalled'));
+  });
 }
 
 async function regenerateCa(): Promise<void> {
-  await withCertError(() => cert.regenerate());
+  await withCertError(async () => {
+    await cert.regenerate();
+    message.warning(t('settings.certRegenerated'));
+  });
 }
 
 /** 格式化指纹为每组两字符的可读形式 */
@@ -192,6 +213,7 @@ function formatTime(iso: string): string {
                 v-model:value="settings.settings.proxy_mode"
                 :options="modeOptions"
                 :placeholder="$t('settings.proxyModePlaceholder')"
+                :disabled="proxy.isRunning"
               />
             </a-form-item>
           </a-col>
@@ -202,12 +224,16 @@ function formatTime(iso: string): string {
                 :min="0"
                 :max="65535"
                 class="w-full"
+                :disabled="proxy.isRunning"
               />
             </a-form-item>
           </a-col>
           <a-col :xs="24" :md="12" :lg="8">
             <a-form-item :label="$t('settings.httpRedirect')">
-              <a-switch v-model:checked="settings.settings.enable_http_proxy_to_https" />
+              <a-switch
+                v-model:checked="settings.settings.enable_http_proxy_to_https"
+                :disabled="proxy.isRunning"
+              />
             </a-form-item>
           </a-col>
         </a-row>
@@ -215,7 +241,10 @@ function formatTime(iso: string): string {
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
             <a-form-item :label="$t('settings.socks5Enable')">
-              <a-switch v-model:checked="settings.settings.socks5_proxy_enable" />
+              <a-switch
+                v-model:checked="settings.settings.socks5_proxy_enable"
+                :disabled="proxy.isRunning"
+              />
             </a-form-item>
           </a-col>
           <a-col v-if="settings.settings.socks5_proxy_enable" :xs="24" :md="12" :lg="8">
@@ -225,15 +254,23 @@ function formatTime(iso: string): string {
                 :min="0"
                 :max="65535"
                 class="w-full"
+                :disabled="proxy.isRunning"
               />
             </a-form-item>
           </a-col>
         </a-row>
 
-        <a-row :gutter="16">
+        <a-typography-paragraph v-if="proxy.isRunning" type="warning">
+          {{ t('settings.runningLockedHint') }}
+        </a-typography-paragraph>
+
+        <a-row v-if="windowsPlatform" :gutter="16">
           <a-col :xs="24" :md="16" :lg="12">
             <a-form-item :label="$t('settings.terminalProxy')">
-              <a-switch v-model:checked="settings.settings.terminal_proxy_enable" />
+              <a-switch
+                v-model:checked="settings.settings.terminal_proxy_enable"
+                :disabled="proxy.isRunning"
+              />
               <a-typography-paragraph type="secondary" class="field-hint">
                 {{ $t('settings.terminalProxyHint') }}
               </a-typography-paragraph>

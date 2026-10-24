@@ -138,7 +138,7 @@ pub mod platform {
             info.lpVerb = verb_w.as_mut_ptr();
             info.lpFile = exe_w.as_mut_ptr();
             info.lpParameters = args_w.as_mut_ptr();
-            info.nShow = SW_HIDE as i32;
+            info.nShow = SW_HIDE;
 
             if ShellExecuteExW(&mut info) == 0 {
                 return Err(TrustError::Elevation(
@@ -174,11 +174,11 @@ pub mod platform {
                 CertAddEncodedCertificateToStore, CertCloseStore, CertOpenSystemStoreA,
                 CERT_STORE_ADD_ALWAYS, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
             };
-            let store = CertOpenSystemStoreA(0, "ROOT\0".as_ptr() as *const u8 as _);
+            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
             if store.is_null() {
                 return Err(TrustError::Trust("CertOpenSystemStore(ROOT) 失败".into()));
             }
-            let encoding = (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING) as u32;
+            let encoding = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
             let result = CertAddEncodedCertificateToStore(
                 store,
                 encoding,
@@ -240,7 +240,7 @@ pub mod platform {
                 CertCloseStore, CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
                 CertOpenSystemStoreA, CERT_CONTEXT,
             };
-            let store = CertOpenSystemStoreA(0, "ROOT\0".as_ptr() as *const u8 as _);
+            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
             if store.is_null() {
                 return Err(TrustError::Trust("CertOpenSystemStore(ROOT) 失败".into()));
             }
@@ -285,7 +285,7 @@ pub mod platform {
                 CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateContext,
                 CertOpenSystemStoreA, CERT_CONTEXT,
             };
-            let store = CertOpenSystemStoreA(0, "ROOT\0".as_ptr() as *const u8 as _);
+            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
             if store.is_null() {
                 return false;
             }

@@ -48,14 +48,14 @@ pub fn generate_pac(
     pac
 }
 
-/// 收集去重（大小写不敏感），转义单引号
+/// 收集去重（大小写不敏感），按 JS 字符串字面量规则转义（先 `\` 后 `'`）
 fn push_pattern(patterns: &mut Vec<String>, name: &str) {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty() {
         return;
     }
     if !patterns.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
-        patterns.push(name.replace('\'', "\\'"));
+        patterns.push(name.replace('\\', "\\\\").replace('\'', "\\'"));
     }
 }
 
@@ -98,5 +98,17 @@ mod tests {
         let pac = generate_pac("127.0.0.1:26501", &DomainRules::default(), &[]);
         assert!(pac.contains("return 'DIRECT';"));
         assert!(!pac.contains("shExpMatch"));
+    }
+
+    #[test]
+    fn test_pac_pattern_escapes_backslash_and_quote() {
+        // 反斜杠必须先转义，否则 `x\'` 会提前闭合 JS 字符串并注入代码
+        let rules = DomainRules::new(vec![watt_config::DomainRule {
+            match_domain_names: vec!["x\\';return 'PROXY 1.2.3.4:8080';//".into()],
+            ..Default::default()
+        }]);
+        let pac = generate_pac("127.0.0.1:26501", &rules, &[]);
+        // 单引号前必须有反斜杠（转义序列 `\'`），字符串不会被提前闭合
+        assert!(pac.contains(r"x\\\'"), "实际 PAC: {pac}");
     }
 }

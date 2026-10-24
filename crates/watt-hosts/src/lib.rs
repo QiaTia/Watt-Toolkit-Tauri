@@ -28,6 +28,8 @@ pub enum HostsError {
     /// 命中说明进程被以 asInvoker 方式拉起（受限终端 / 调试器 / 计划任务）。
     #[error("需要管理员权限才能写入 hosts（请以管理员身份运行 Watt Toolkit 后重试）: {0}")]
     ElevationRequired(String),
+    #[error("非法 hosts 条目: {0}")]
+    InvalidEntry(String),
     #[error("{0}")]
     Other(String),
 }
@@ -100,6 +102,42 @@ pub fn default_hosts_content() -> &'static str {
     }
 }
 
+/// 校验一条 hosts 记录：IP 必须可解析，域名只允许主机名字符且非空。
+///
+/// 云端目录 / 前端规则是外部输入，换行或 `#` 会注入任意解析记录、
+/// 伪造 `# Steam++ End` 标记进而触发 hosts 重置。
+pub fn validate_hosts_entry(ip: &str, domain: &str) -> Result<(), HostsError> {
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(HostsError::InvalidEntry(format!("IP 非法: {ip:?}")));
+    }
+    validate_hostname(domain)
+}
+
+/// 校验域名（hosts 条目语义）：ASCII 字母数字与 `.`/`-`/`_`，不允许空白或标记字符。
+///
+/// 容忍单个尾点（FQDN 写法，如 `example.com.`）：fallback / ip_pool 等模块已按
+/// `trim_end_matches('.')` 归一化，这里若直接拒绝会让这类规则静默漏写 hosts。
+pub fn validate_hostname(domain: &str) -> Result<(), HostsError> {
+    let value = domain.trim().trim_end_matches('.');
+    if value.is_empty() || value.len() > 253 {
+        return Err(HostsError::InvalidEntry(format!(
+            "域名长度非法: {domain:?}"
+        )));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(HostsError::InvalidEntry(format!(
+            "域名含非法字符: {domain:?}"
+        )));
+    }
+    if value.starts_with('.') {
+        return Err(HostsError::InvalidEntry(format!("域名首字符不能是点: {domain:?}")));
+    }
+    Ok(())
+}
+
 /// hosts 文件操作入口：更新/删除/按标记移除。
 pub struct HostsManager {
     path: std::path::PathBuf,
@@ -122,6 +160,11 @@ impl HostsManager {
 
     /// 更新/新增 hosts 记录（元组为 (IP, 域名)，对齐 C# UpdateHosts(IEnumerable<(string ip, string domain)>)）
     pub fn update_hosts(&self, hosts: &[(String, String)]) -> Result<(), HostsError> {
+        // 校验放在写盘前：域名/IP 来自云端目录或前端规则，任何换行、空白或
+        // 标记串都会破坏 hosts 结构（注入任意解析记录或伪造标记块）。
+        for (ip, domain) in hosts {
+            validate_hosts_entry(ip, domain)?;
+        }
         let domain_ip: Vec<(String, String)> = hosts
             .iter()
             .map(|(ip, domain)| (domain.clone(), ip.clone()))
@@ -251,7 +294,7 @@ fn write_file_elevated(path: &std::path::Path, content: &str) -> Result<(), Host
     let tmp_q = watt_elevate::posix_shell_quote(&tmp.display().to_string());
     let path_q = watt_elevate::posix_shell_quote(&path.display().to_string());
     let script = format!(
-        "'mv' {tmp_q} {path_q} && 'chmod' '644' {path_q} && 'dscacheutil' '-flushcache' && 'killall' '-HUP' 'mDNSResponder'"
+        "'mv' {tmp_q} {path_q} && 'chown' 'root:wheel' {path_q} && 'chmod' '644' {path_q} && 'dscacheutil' '-flushcache' && 'killall' '-HUP' 'mDNSResponder'"
     );
     let result = watt_elevate::run_as_admin_shell(
         &script,
@@ -300,7 +343,12 @@ fn create_exclusive_temp(content: &str) -> Result<std::path::PathBuf, HostsError
             .open(&candidate)
         {
             Ok(mut f) => {
-                f.write_all(content.as_bytes())?;
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    // 写失败必须清理已创建的临时文件，避免残留
+                    drop(f);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(HostsError::Io(e));
+                }
                 return Ok(candidate);
             }
             // 已存在（含恶意预建的符号链接）：换后缀重试，绝不覆盖
@@ -371,6 +419,51 @@ mod tests {
         assert!(content2.contains("1.2.3.4 old.example.com"));
         assert!(content2.contains("# user comment"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_hosts_entry_accepts_normal_entries() {
+        assert!(validate_hosts_entry("127.0.0.1", "steamcommunity.com").is_ok());
+        assert!(validate_hosts_entry("::1", "localhost").is_ok());
+        assert!(validate_hosts_entry("1.2.3.4", "a-b_c.example.com").is_ok());
+        // FQDN 尾点：其余模块按 trim_end_matches('.') 归一化，此处不得拒绝
+        assert!(validate_hosts_entry("1.2.3.4", "example.com.").is_ok());
+        assert!(validate_hosts_entry("1.2.3.4", " example.com ").is_ok());
+    }
+
+    #[test]
+    fn validate_hosts_entry_rejects_injection() {
+        // IP 非法
+        assert!(validate_hosts_entry("not-an-ip", "a.com").is_err());
+        // 换行 / 制表符 / 注释符 / 标记串均不得进入 hosts
+        assert!(validate_hosts_entry("127.0.0.1", "a.com\n0.0.0.0 b.com").is_err());
+        assert!(validate_hosts_entry("127.0.0.1", "a.com\t#Steam++ End").is_err());
+        assert!(validate_hosts_entry("127.0.0.1", "#Steam++ End").is_err());
+        assert!(validate_hosts_entry("127.0.0.1", "a com").is_err());
+        assert!(validate_hosts_entry("127.0.0.1", "").is_err());
+    }
+
+    #[test]
+    fn update_hosts_rejects_invalid_entry_before_write() {
+        let dir = std::env::temp_dir().join("watt-hosts-invalid-entry");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+        let mgr = HostsManager::with_path(&path);
+        let err = mgr
+            .update_hosts(&[(
+                "127.0.0.1".into(),
+                "evil.com\n0.0.0.0 bank.example".into(),
+            )])
+            .unwrap_err();
+        assert!(matches!(err, HostsError::InvalidEntry(_)));
+        // 原文件未被修改
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -92,6 +92,7 @@ const zhHans = {
       failed: '节点探测未完成，竞速将按默认顺序尝试',
       partial: '节点探测被预算截断，已按已完成部分择优',
     },
+    noCheckedHint: '请至少勾选一个加速项目后再启动加速。',
   },
   settings: {
     generalTitle: '通用',
@@ -150,6 +151,11 @@ const zhHans = {
     certHint: '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下会弹出 UAC 提权确认，macOS 下会弹出系统信任确认（输入登录密码，无需管理员密码）。也可导出 PEM 后手动导入。',
     elevateMacHint: 'macOS 下安装根证书会弹一次系统信任确认，输入登录密码即可（装入当前用户信任设置，无需管理员密码）。',
     elevateCancelled: '已取消管理员授权，操作未完成。',
+    runningLockedHint: '加速运行中，代理模式与端口等设置已锁定；请先停止加速再修改。',
+    certInstalled: '根证书已安装并受信任。',
+    certInstallVerifyFailed: '根证书安装命令已执行，但校验未通过。请检查系统信任设置，或导出 PEM 手动安装。',
+    certUninstalled: '根证书信任已移除。',
+    certRegenerated: 'CA 已重新生成，旧信任已清理；请重新安装根证书后再启用 HTTPS 加速。',
   },
   pool: {
     summary: '共 {hosts} 个域名、{ips} 个 IP',
@@ -201,6 +207,7 @@ const zhHans = {
     remove: '删除',
     removeConfirm: '删除 {host} 的 IP 池？该域名将回退到内置备用池与系统 DNS。',
     removeIp: '移除',
+    removeIpConfirm: '确定移除 {ip}？',
     unreachable: '不可用',
     notProbed: '未探测',
     rtt: '{ms} ms',

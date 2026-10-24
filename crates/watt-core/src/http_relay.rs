@@ -283,7 +283,11 @@ impl RelayContext {
                     .header(hyper::header::LOCATION, location)
                     .body(Full::new(Bytes::new()))
                     .map(boxed_response)
-                    .unwrap(),
+                    .unwrap_or_else(|_| {
+                        let mut fallback = Response::new(Full::new(Bytes::new()));
+                        *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        boxed_response(fallback)
+                    }),
                 disp,
             );
         }
@@ -317,6 +321,7 @@ impl RelayContext {
     }
 
     /// 出站转发主流程
+    #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
         req: Request<Incoming>,
@@ -465,6 +470,7 @@ impl RelayContext {
             tls: destination_uri.scheme_str() == Some("https"),
             tls_sni: resolve_tls_sni(rule, &host),
             tls_ignore_name_mismatch: rule.fields.tls_ignore_name_mismatch,
+            tls_skip_verify: rule.fields.tls_skip_verify,
             override_ip: rule.fields.ip_address,
             forward_destination: rule.fields.forward_destination.clone(),
             timeout_ms: rule.fields.timeout_ms,
@@ -924,6 +930,7 @@ impl HookFetch for RelayFetch {
                 tls,
                 tls_sni: None,
                 tls_ignore_name_mismatch: false,
+                tls_skip_verify: false,
                 override_ip: None,
                 forward_destination: None,
                 timeout_ms: Some(10_000),

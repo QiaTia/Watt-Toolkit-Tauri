@@ -23,6 +23,11 @@ use hyper::Request;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// 协议握手超时：慢连接不得永久占用任务与 fd
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 并发连接上限（防本地端口被大量慢连接耗尽 fd）
+const MAX_CONNECTIONS: usize = 256;
+
 /// 正向代理监听主循环
 ///
 /// `proxy_authority`：PAC 脚本中的代理地址（如 `127.0.0.1:26501`）
@@ -33,10 +38,12 @@ pub async fn run_forward_proxy_listener(
     proxy_authority: String,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // sender 被丢弃时 changed() 立即返回 Err；必须退出，避免 100% CPU 空转
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
@@ -45,10 +52,15 @@ pub async fn run_forward_proxy_listener(
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    tracing::warn!("正向代理连接数达到上限，拒绝新连接");
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let proxy_authority = proxy_authority.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = handle_forward_connection(stream, ctx, tls_acceptor, proxy_authority).await;
                 });
             }
@@ -93,7 +105,9 @@ async fn peek_request_line(
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut chunk = [0u8; 2048];
     loop {
-        let n = stream.peek(&mut chunk).await?;
+        let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut chunk))
+            .await
+            .map_err(|_| "请求行读取超时")??;
         if n == 0 {
             return Ok(None);
         }
@@ -122,9 +136,11 @@ async fn handle_connect(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    // 嗅探首字节（peek 不消费）
+    // 嗅探首字节（peek 不消费；加超时防慢连接占用）
     let mut probe = [0u8; 2];
-    let n = stream.peek(&mut probe).await?;
+    let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut probe))
+        .await
+        .map_err(|_| "CONNECT 后等待客户端数据超时")??;
     let is_tls = n >= 2 && probe[0] == 0x16 && probe[1] == 0x03;
 
     if is_tls && should_mitm(&ctx, &host) {
@@ -192,6 +208,7 @@ async fn tunnel_to(
         tls: false,
         tls_sni: None,
         tls_ignore_name_mismatch: false,
+        tls_skip_verify: false,
         override_ip: ctx.rules.find(host).and_then(|r| r.fields.ip_address),
         forward_destination: None,
         timeout_ms: Some(15000),
@@ -318,7 +335,9 @@ async fn read_request_head(
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
-        let n = stream.read(&mut chunk).await?;
+        let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "请求头读取超时")??;
         if n == 0 {
             return Err("连接在请求头结束前关闭".into());
         }

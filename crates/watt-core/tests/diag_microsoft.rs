@@ -17,6 +17,7 @@ fn target(host: &str) -> OutboundTarget {
         tls: true,
         tls_sni: None,
         tls_ignore_name_mismatch: false,
+        tls_skip_verify: false,
         override_ip: None, // DNS-only，对齐微软内置分组
         forward_destination: None,
         timeout_ms: Some(15000),

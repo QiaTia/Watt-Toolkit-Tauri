@@ -99,6 +99,8 @@ export interface ProxySettings {
   is_proxy_gog: boolean;
   /** 用户勾选的加速项目 Id 集合（空 = 未设置，回退云端默认） */
   enabled_accelerate_ids: string[];
+  /** 勾选集合是否已初始化（区分首次运行与用户主动清空） */
+  enabled_accelerate_ids_initialized: boolean;
   /** 终端（CLI）代理环境变量 + 证书注入（git/curl/npm/pip 等） */
   terminal_proxy_enable: boolean;
 }

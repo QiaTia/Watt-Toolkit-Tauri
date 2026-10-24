@@ -46,6 +46,7 @@ pub fn probe_targets_from_rules(rules: &[DomainRule]) -> Vec<OutboundTarget> {
             // SNI 用 host 本身；SNI 覆盖（FakeServerName）场景 P1 可 refine
             tls_sni: None,
             tls_ignore_name_mismatch: rule.fields.tls_ignore_name_mismatch,
+            tls_skip_verify: rule.fields.tls_skip_verify,
             override_ip: rule.fields.ip_address,
             forward_destination: rule
                 .fields
@@ -164,11 +165,15 @@ mod tests {
     use super::*;
 
     fn rule(match_names: &[&str], ip: Option<&str>, fwd: Option<&str>) -> DomainRule {
-        let mut r = DomainRule::default();
-        r.match_domain_names = match_names.iter().map(|s| s.to_string()).collect();
-        r.fields.ip_address = ip.map(|s| s.parse().unwrap());
-        r.fields.forward_destination = fwd.map(|s| s.to_string());
-        r
+        DomainRule {
+            match_domain_names: match_names.iter().map(|s| s.to_string()).collect(),
+            fields: watt_config::DomainRuleFields {
+                ip_address: ip.map(|s| s.parse().unwrap()),
+                forward_destination: fwd.map(|s| s.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]

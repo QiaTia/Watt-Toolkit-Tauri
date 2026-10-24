@@ -33,10 +33,26 @@ use tokio::sync::Semaphore;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolEntry {
-    /// 探测通过的 IP（RTT 升序）
+    /// 动态刷新探测通过的 IP（RTT 升序）；刷新失败时保留旧值
     pub ips: Vec<IpAddr>,
+    /// 用户手工维护的 IP：动态刷新不覆盖，避免刷新失败/换池丢失手工数据
+    #[serde(default)]
+    pub manual_ips: Vec<IpAddr>,
     /// 刷新时刻（unix 毫秒）
     pub refreshed_at_ms: u64,
+}
+
+impl PoolEntry {
+    /// 生效候选（手工在前，动态在后，去重）
+    pub fn all_ips(&self) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = Vec::with_capacity(self.manual_ips.len() + self.ips.len());
+        for ip in self.manual_ips.iter().chain(self.ips.iter()) {
+            if !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
 }
 
 /// 单个候选 IP 的探测结果（供 UI 展示）
@@ -93,40 +109,81 @@ pub fn dynamic_ips(host: &str) -> Vec<IpAddr> {
     let host = normalize(host);
     let map = pool().read().unwrap();
     if let Some(e) = map.get(&host) {
-        return e.ips.clone();
+        return e.all_ips();
     }
-    let mut best: Option<(usize, &Vec<IpAddr>)> = None;
+    let mut best: Option<(usize, Vec<IpAddr>)> = None;
     for (key, entry) in map.iter() {
-        if entry.ips.is_empty() {
+        let ips = entry.all_ips();
+        if ips.is_empty() {
             continue;
         }
         // 后缀匹配：要求 key 之前紧邻 '.'，即 key 是完整域名段而非某段的后半截。
         // 用 strip_suffix 取代手写索引运算——等长 / 更长的 key 天然被排除，
         // 不存在越界可能（原先依赖 `&&` 短路顺序来保证边界安全，过于脆弱）。
         if let Some(prefix) = host.strip_suffix(key.as_str()) {
-            if prefix.ends_with('.') && best.map_or(true, |(len, _)| key.len() > len) {
-                best = Some((key.len(), &entry.ips));
+            if prefix.ends_with('.') && best.as_ref().is_none_or(|(len, _)| key.len() > *len) {
+                best = Some((key.len(), ips));
             }
         }
     }
-    best.map(|(_, ips)| ips.clone()).unwrap_or_default()
+    best.map(|(_, ips)| ips).unwrap_or_default()
 }
 
-/// 写入/替换某域名的池条目（ips 为空则移除该条目，避免残留失效 IP）
+/// 写入/替换某域名的**动态**池（手工 IP 保留；ips 为空只清动态部分）
 pub fn set_entry(host: &str, ips: Vec<IpAddr>) {
     let host = normalize(host);
     let mut map = pool().write().unwrap();
     if ips.is_empty() {
-        map.remove(&host);
+        let remove = match map.get_mut(&host) {
+            Some(entry) => {
+                entry.ips.clear();
+                entry.manual_ips.is_empty()
+            }
+            None => false,
+        };
+        if remove {
+            map.remove(&host);
+        }
     } else {
-        map.insert(
-            host,
-            PoolEntry {
-                ips,
-                refreshed_at_ms: now_ms(),
-            },
-        );
+        let entry = map.entry(host).or_insert_with(|| PoolEntry {
+            ips: Vec::new(),
+            manual_ips: Vec::new(),
+            refreshed_at_ms: now_ms(),
+        });
+        entry.ips = ips;
+        entry.refreshed_at_ms = now_ms();
     }
+}
+
+/// 写入/替换某域名的**手工** IP（管理页保存入口；动态部分保留）
+pub fn set_manual_entry(host: &str, ips: Vec<IpAddr>) {
+    let host = normalize(host);
+    let mut map = pool().write().unwrap();
+    if ips.is_empty() {
+        let remove = match map.get_mut(&host) {
+            Some(entry) => {
+                entry.manual_ips.clear();
+                entry.ips.is_empty()
+            }
+            None => false,
+        };
+        if remove {
+            map.remove(&host);
+        }
+    } else {
+        let entry = map.entry(host).or_insert_with(|| PoolEntry {
+            ips: Vec::new(),
+            manual_ips: Vec::new(),
+            refreshed_at_ms: now_ms(),
+        });
+        entry.manual_ips = ips;
+        entry.refreshed_at_ms = now_ms();
+    }
+}
+
+/// 删除某域名的全部池条目（动态 + 手工）
+pub fn remove_entry(host: &str) {
+    pool().write().unwrap().remove(&normalize(host));
 }
 
 /// 当前池快照（host → 条目），供落盘 / 诊断
@@ -144,7 +201,7 @@ pub fn entry_ips(host: &str) -> Vec<IpAddr> {
         .read()
         .unwrap()
         .get(&host)
-        .map(|e| e.ips.clone())
+        .map(|e| e.all_ips())
         .unwrap_or_default()
 }
 
@@ -159,7 +216,7 @@ pub fn clear() {
     pool().write().unwrap().clear();
 }
 
-/// 落盘（best-effort，失败仅 warn）
+/// 落盘（best-effort，失败仅 warn）：先写临时文件再替换，避免截断损坏整份池
 pub fn save_to(path: &Path) {
     #[derive(Serialize)]
     struct Doc {
@@ -167,7 +224,7 @@ pub fn save_to(path: &Path) {
         hosts: HashMap<String, PoolEntry>,
     }
     let doc = Doc {
-        version: 1,
+        version: 2,
         hosts: snapshot(),
     };
     let json = match serde_json::to_string_pretty(&doc) {
@@ -180,12 +237,23 @@ pub fn save_to(path: &Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(path, json) {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        tracing::warn!("IP 池临时文件写入失败: {e}");
+        return;
+    }
+    // Windows rename 不能覆盖已存在文件；先删除旧文件（失败窗口极小）
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
         tracing::warn!("IP 池落盘失败: {e}");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
-/// 从 JSON 加载（best-effort，不存在/损坏静默）
+/// 从 JSON 加载（best-effort；损坏文件改名保留，便于诊断）
 pub fn load_from(path: &Path) {
     #[derive(Deserialize)]
     struct Doc {
@@ -199,7 +267,10 @@ pub fn load_from(path: &Path) {
         Ok(doc) => {
             *pool().write().unwrap() = doc.hosts;
         }
-        Err(e) => tracing::warn!("IP 池文件损坏，忽略: {}", e),
+        Err(e) => {
+            tracing::warn!("IP 池文件损坏，已保留为 .corrupt 并忽略: {e}");
+            let _ = std::fs::rename(path, path.with_extension("json.corrupt"));
+        }
     }
 }
 
@@ -346,8 +417,7 @@ async fn refresh_one(
     }
 
     if candidates.is_empty() {
-        // 无候选 → 清掉该域名的旧池条目（避免残留失效 IP）
-        set_entry(host, Vec::new());
+        // 无候选（断网/DNS 被阻断）→ 保留旧池，不清空（手工 IP 更是不能丢）
         return RefreshHostResult {
             host: host.to_string(),
             candidates: 0,
@@ -383,8 +453,10 @@ async fn refresh_one(
     let survivors: Vec<IpAddr> = probed.iter().filter_map(|(ip, rtt)| rtt.map(|_| *ip)).collect();
     let ok = survivors.len();
 
-    // 写池：有通过者则更新，全灭则移除旧条目
-    set_entry(host, survivors);
+    // 写池：仅在有通过者时更新；全灭保留旧值（刷新失败不代表旧 IP 全部失效）
+    if !survivors.is_empty() {
+        set_entry(host, survivors);
+    }
 
     RefreshHostResult {
         host: host.to_string(),
@@ -479,10 +551,14 @@ mod tests {
 
     #[test]
     fn hosts_from_rules_strips_wildcard_and_dedups() {
-        let mut r1 = watt_config::DomainRule::default();
-        r1.match_domain_names = vec!["*.github.com".into(), "api.github.com".into()];
-        let mut r2 = watt_config::DomainRule::default();
-        r2.match_domain_names = vec!["github.com".into(), "*.github.com".into()];
+        let r1 = watt_config::DomainRule {
+            match_domain_names: vec!["*.github.com".into(), "api.github.com".into()],
+            ..Default::default()
+        };
+        let r2 = watt_config::DomainRule {
+            match_domain_names: vec!["github.com".into(), "*.github.com".into()],
+            ..Default::default()
+        };
         let hosts = hosts_from_rules(&[r1, r2]);
         assert_eq!(hosts, vec!["github.com", "api.github.com"]);
     }
@@ -503,6 +579,25 @@ mod tests {
             vec![ip("18.65.14.118"), ip("18.65.14.71")]
         );
         let _ = std::fs::remove_file(&path);
+        clear();
+    }
+
+    #[test]
+    fn manual_ips_survive_dynamic_clear_and_replace() {
+        let _g = TEST_LOCK.lock().unwrap();
+        clear();
+        set_manual_entry("example.com", vec![ip("1.1.1.1")]);
+        // 动态清空（刷新失败路径）不得丢掉手工 IP
+        set_entry("example.com", Vec::new());
+        assert_eq!(entry_ips("example.com"), vec![ip("1.1.1.1")]);
+        // 动态刷新成功只替换动态部分
+        set_entry("example.com", vec![ip("2.2.2.2")]);
+        let all = entry_ips("example.com");
+        assert!(all.contains(&ip("1.1.1.1")));
+        assert!(all.contains(&ip("2.2.2.2")));
+        // 显式删除才清空全部
+        remove_entry("example.com");
+        assert!(entry_ips("example.com").is_empty());
         clear();
     }
 }

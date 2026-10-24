@@ -76,7 +76,7 @@ impl PoolDomainDto {
     fn from_entry(host: String, entry: watt_core::ip_pool::PoolEntry) -> Self {
         Self {
             host,
-            ips: entry.ips.iter().map(|ip| ip.to_string()).collect(),
+            ips: entry.all_ips().iter().map(|ip| ip.to_string()).collect(),
             refreshed_at_ms: entry.refreshed_at_ms,
         }
     }
@@ -89,8 +89,9 @@ fn pool_dir(state: &AppState) -> std::path::PathBuf {
 }
 
 /// 落盘（best-effort：失败仅记日志，不影响本次内存态）
-fn persist(state: &AppState) {
-    watt_core::ip_pool::save_to(&pool_dir(state).join("IpPool.json"));
+async fn persist(state: &AppState) {
+    let path = pool_dir(state).join("IpPool.json");
+    let _ = tokio::task::spawn_blocking(move || watt_core::ip_pool::save_to(&path)).await;
 }
 
 /// 域名规范化 + 校验：去协议/路径/端口/尾点，转小写，只允许 `[a-z0-9.-_]`。
@@ -180,7 +181,7 @@ pub async fn ip_pool_refresh(
     let results = watt_core::ip_pool::refresh_hosts(&hosts, &resolvers, 443, PROBE_TIMEOUT).await;
 
     // 落盘（下次启动自动加载）
-    watt_core::ip_pool::save_to(&dir.join("IpPool.json"));
+    persist(&state).await;
 
     let total_ok: usize = results.iter().map(|r| r.ok).sum();
     tracing::info!(
@@ -303,20 +304,25 @@ fn build_domain_overview(rules: &[watt_config::DomainRule]) -> Vec<DomainPoolDto
 
 /// 列出当前已勾选加速项目的全部域名及其 IP 来源
 #[tauri::command]
-pub fn ip_pool_domain_overview(
+pub async fn ip_pool_domain_overview(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<DomainPoolDto>, String> {
-    let dir = pool_dir(&state);
-    let settings =
-        watt_config::settings::load_proxy_settings_in(&dir).map_err(|e| e.to_string())?;
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let settings_dir = data_dir.join("Settings");
+        let settings = watt_config::settings::load_proxy_settings_in(&settings_dir)
+            .map_err(|e| e.to_string())?;
 
-    let cache_dir = state.data_dir.join("Accelerate");
-    let catalog = watt_cloud::load_cached(Some(&cache_dir))
-        .ok_or_else(|| "本地无加速项目缓存，请先在加速页获取项目列表".to_string())?
-        .with_builtins();
-    let rules = catalog.to_domain_rules(Some(&settings.enabled_accelerate_ids));
+        let cache_dir = data_dir.join("Accelerate");
+        let catalog = watt_cloud::load_cached(Some(&cache_dir))
+            .ok_or_else(|| "本地无加速项目缓存，请先在加速页获取项目列表".to_string())?
+            .with_builtins();
+        let rules = catalog.to_domain_rules(Some(&settings.enabled_accelerate_ids));
 
-    Ok(build_domain_overview(&rules))
+        Ok(build_domain_overview(&rules))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 列出版本内置的备用 IP 池（`watt-core::fallback` 的 7 组常量）
@@ -346,9 +352,9 @@ pub fn ip_pool_list() -> Result<Vec<PoolDomainDto>, String> {
     Ok(list)
 }
 
-/// 保存某域名的 IP 池（新增或覆盖，空列表视为非法——移除请用 `ip_pool_remove_domain`）
+/// 保存某域名的手工 IP 池（新增或覆盖；手工 IP 不随动态刷新丢失）
 #[tauri::command]
-pub fn ip_pool_save_domain(
+pub async fn ip_pool_save_domain(
     state: tauri::State<'_, AppState>,
     host: String,
     ips: Vec<String>,
@@ -358,29 +364,29 @@ pub fn ip_pool_save_domain(
     if parsed.is_empty() {
         return Err("至少填写一个 IP".to_string());
     }
-    watt_core::ip_pool::set_entry(&host, parsed);
-    persist(&state);
+    watt_core::ip_pool::set_manual_entry(&host, parsed);
+    persist(&state).await;
     let entry = watt_core::ip_pool::entry(&host).ok_or_else(|| "写入 IP 池失败".to_string())?;
     Ok(PoolDomainDto::from_entry(host, entry))
 }
 
 /// 删除某域名的 IP 池（该域名回退到内置备用池 / 系统 DNS）
 #[tauri::command]
-pub fn ip_pool_remove_domain(
+pub async fn ip_pool_remove_domain(
     state: tauri::State<'_, AppState>,
     host: String,
 ) -> Result<(), String> {
     let host = normalize_host(&host)?;
-    watt_core::ip_pool::set_entry(&host, Vec::new());
-    persist(&state);
+    watt_core::ip_pool::remove_entry(&host);
+    persist(&state).await;
     Ok(())
 }
 
 /// 清空全部 IP 池
 #[tauri::command]
-pub fn ip_pool_clear(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn ip_pool_clear(state: tauri::State<'_, AppState>) -> Result<(), String> {
     watt_core::ip_pool::clear();
-    persist(&state);
+    persist(&state).await;
     Ok(())
 }
 
@@ -397,8 +403,8 @@ pub async fn ip_pool_refresh_host(
     let resolvers = build_resolvers(&settings.dns);
 
     let mut results =
-        watt_core::ip_pool::refresh_hosts(&[host.clone()], &resolvers, 443, PROBE_TIMEOUT).await;
-    persist(&state);
+        watt_core::ip_pool::refresh_hosts(std::slice::from_ref(&host), &resolvers, 443, PROBE_TIMEOUT).await;
+    persist(&state).await;
     results
         .pop()
         .ok_or_else(|| format!("刷新 {host} 失败：无结果"))

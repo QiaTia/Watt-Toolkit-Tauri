@@ -28,6 +28,7 @@ export function defaultProxySettings(): ProxySettings {
     },
     is_proxy_gog: false,
     enabled_accelerate_ids: [],
+    enabled_accelerate_ids_initialized: false,
     terminal_proxy_enable: true,
   };
 }
@@ -36,16 +37,21 @@ export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<ProxySettings>(defaultProxySettings());
   const loaded = ref(false);
   const saving = ref(false);
+  /** 最近一次加载错误（非 null 时禁止保存，避免默认值覆盖磁盘配置） */
+  const loadError = ref<string | null>(null);
   /** 进行中的加载请求（并发去重用） */
   let inflight: Promise<void> | null = null;
 
   async function load(): Promise<void> {
     try {
       settings.value = await settingsGetProxy();
-    } catch {
-      settings.value = defaultProxySettings();
-    } finally {
+      loadError.value = null;
       loaded.value = true;
+    } catch (e) {
+      // 读取失败不能标记 loaded：否则保存会用默认值覆盖磁盘上的真实配置
+      loadError.value = e instanceof Error ? e.message : String(e);
+      loaded.value = false;
+      throw e;
     }
   }
 
@@ -65,6 +71,10 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function save(): Promise<boolean> {
+    if (!loaded.value) {
+      console.error('设置尚未成功加载，拒绝保存以避免覆盖磁盘配置');
+      return false;
+    }
     saving.value = true;
     try {
       await settingsSaveProxy(settings.value);
@@ -77,5 +87,5 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  return { settings, loaded, saving, load, ensureLoaded, save };
+  return { settings, loaded, loadError, saving, load, ensureLoaded, save };
 });

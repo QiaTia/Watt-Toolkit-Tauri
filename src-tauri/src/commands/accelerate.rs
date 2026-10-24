@@ -76,6 +76,8 @@ pub async fn accelerate_set_enabled(
     let mut settings =
         watt_config::settings::load_proxy_settings_in(&dir).map_err(|e| e.to_string())?;
     settings.enabled_accelerate_ids = enabled_ids;
+    // 记录「已初始化」：用户把勾选清空后重启时不再回退云端默认值
+    settings.enabled_accelerate_ids_initialized = true;
     watt_config::settings::save_proxy_settings_in(&dir, &settings).map_err(|e| e.to_string())
 }
 

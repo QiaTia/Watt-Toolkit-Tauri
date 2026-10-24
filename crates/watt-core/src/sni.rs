@@ -55,11 +55,11 @@ pub fn outbound_tls_connector(
                         .with_no_client_auth()
                 }
                 None => {
-                    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                        Arc::new(PermissiveVerifier);
+                    // 没有可校验的替代名称时退回标准验证：IgnoreNameMismatch 只应
+                    // 放宽名称匹配，绝不应退化为全放行。
+                    tracing::warn!("IgnoreNameMismatch 缺少替代名称，回退标准证书验证");
                     builder
-                        .dangerous()
-                        .with_custom_certificate_verifier(verifier)
+                        .with_root_certificates(roots)
                         .with_no_client_auth()
                 }
             }

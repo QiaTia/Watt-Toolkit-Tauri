@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// 探测摘要（供 UI 展示「已择优」；IPC 直传）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProbeSummary {
     /// 本次探测的域名数
     pub hosts: usize,
@@ -229,5 +230,20 @@ mod tests {
         // 全未探测：稳定排序保持原序（不是无序重排）
         assert_eq!(addrs[0].ip().to_string(), "1.1.1.1");
         assert_eq!(addrs[1].ip().to_string(), "2.2.2.2");
+    }
+
+    #[test]
+    fn summary_serializes_camel_case() {
+        // 前端按 fastestMs 消费；字段名不一致会恒显示「最快 0ms」
+        let summary = ProbeSummary {
+            hosts: 2,
+            candidates: 5,
+            ok: 3,
+            fastest_ms: Some(88),
+            finished: true,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"fastestMs\":88"), "实际 JSON: {json}");
+        assert!(json.contains("\"hosts\":2"), "实际 JSON: {json}");
     }
 }

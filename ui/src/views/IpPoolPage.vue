@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import AntApp from 'ant-design-vue/es/app';
 import dayjs from 'dayjs';
@@ -99,11 +99,22 @@ onMounted(() => {
   void loadBuiltin();
 });
 
-// 动态池变化（刷新/保存/删除）后「来源」列会变，总览需同步重算
+// 动态池变化（刷新/保存/删除）后「来源」列会变，总览需同步重算。
+// 连续操作（如批量删除）在 150ms 内合并为一次 IPC。
+let overviewTimer: ReturnType<typeof setTimeout> | null = null;
 watch(
   () => pool.domains,
-  () => void loadOverview(),
+  () => {
+    if (overviewTimer !== null) clearTimeout(overviewTimer);
+    overviewTimer = setTimeout(() => {
+      overviewTimer = null;
+      void loadOverview();
+    }, 150);
+  },
 );
+onUnmounted(() => {
+  if (overviewTimer !== null) clearTimeout(overviewTimer);
+});
 
 /* ===================== 列表 ===================== */
 
@@ -173,8 +184,12 @@ async function refreshHost(host: string): Promise<void> {
 }
 
 async function pruneHost(host: string): Promise<void> {
-  const n = await pool.pruneUnreachable(host);
-  if (n > 0) void message.success(t('pool.pruneDone', { n }));
+  try {
+    const n = await pool.pruneUnreachable(host);
+    if (n > 0) void message.success(t('pool.pruneDone', { n }));
+  } catch {
+    // 错误已由 store 写入 error（页面顶部 alert）
+  }
 }
 
 async function removeHost(host: string): Promise<void> {
@@ -347,9 +362,16 @@ async function submitEditor(): Promise<void> {
               <a-typography-text :type="probeState(record.host, ip).type" class="ip-status">
                 {{ probeState(record.host, ip).text }}
               </a-typography-text>
-              <a-button size="small" type="link" danger @click="removeIp(record.host, ip)">
-                {{ $t('pool.removeIp') }}
-              </a-button>
+              <a-popconfirm
+                :title="$t('pool.removeIpConfirm', { ip })"
+                :ok-text="$t('pool.remove')"
+                :cancel-text="$t('pool.cancel')"
+                @confirm="removeIp(record.host, ip)"
+              >
+                <a-button size="small" type="link" danger>
+                  {{ $t('pool.removeIp') }}
+                </a-button>
+              </a-popconfirm>
             </div>
 
             <div v-if="hasProbe(record.host) && unreachableCount(record.host) > 0" class="prune">

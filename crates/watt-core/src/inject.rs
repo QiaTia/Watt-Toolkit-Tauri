@@ -82,8 +82,10 @@ pub fn compress(data: &[u8], compression: ContentCompression) -> Result<Vec<u8>,
         }
         ContentCompression::Brotli => {
             let mut out = Vec::new();
-            let mut params = brotli::enc::BrotliEncoderParams::default();
-            params.quality = 5;
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: 5,
+                ..Default::default()
+            };
             brotli::BrotliCompress(&mut &data[..], &mut out, &params)
                 .map_err(|e| format!("br 压缩失败: {e:?}"))?;
             Ok(out)

@@ -55,7 +55,8 @@ fn ensure_cert_file(state: &AppState, ca: &CaCertificate) -> Result<(), String> 
 
 #[tauri::command]
 pub async fn cert_get_status(state: tauri::State<'_, AppState>) -> Result<CertStatusDto, String> {
-    let ca = state.ca.read().await;
+    // 先克隆 Arc 释放读锁：信任查询在 macOS/Windows 都可能很慢（UAC/钥匙串）
+    let ca = state.ca.read().await.clone();
     ensure_cert_file(&state, &ca)?;
     let path = ca_cert_file(&state);
     let installed =
@@ -75,7 +76,7 @@ pub async fn cert_export_ca(state: tauri::State<'_, AppState>) -> Result<String,
 /// 安装根证书到系统信任存储（对齐 SetupRootCertificate：安装后校验）
 #[tauri::command]
 pub async fn cert_install(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let ca = state.ca.read().await;
+    let ca = state.ca.read().await.clone();
     ensure_cert_file(&state, &ca)?;
 
     let path = ca_cert_file(&state);
@@ -147,13 +148,23 @@ pub async fn cert_regenerate(state: tauri::State<'_, AppState>) -> Result<CertSt
         }
     }
 
-    let new_ca = Arc::new(CaCertificate::generate().map_err(|e| e.to_string())?);
     let cert_dir = state.cert_dir();
-    std::fs::create_dir_all(&cert_dir).map_err(|e| e.to_string())?;
-    std::fs::write(CaCertificate::cert_path(&cert_dir), new_ca.cert_pem())
-        .map_err(|e| e.to_string())?;
-    std::fs::write(CaCertificate::key_path(&cert_dir), new_ca.key_pem())
-        .map_err(|e| e.to_string())?;
+    // 生成 + 私钥落盘（可能涉及权限调整）放阻塞线程
+    let new_ca = tokio::task::spawn_blocking(move || {
+        let ca = CaCertificate::generate().map_err(|e| e.to_string())?;
+        ca.save(&cert_dir).map_err(|e| e.to_string())?;
+        Ok::<Arc<CaCertificate>, String>(Arc::new(ca))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 旧受信任根不会被新 CA 自动替换：显式移除，避免旧根长期留信任库
+    if let Err(e) = tokio::task::spawn_blocking(watt_cert::trust::remove_root_cert)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        tracing::warn!("重新生成 CA 后清理旧信任失败（可手动卸载）: {e}");
+    }
 
     let mut ca = state.ca.write().await;
     *ca = new_ca.clone();

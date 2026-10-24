@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn test_match() {
         let s = script(&["*.steamcommunity.com"], &["api.steamcommunity.com"]);
-        assert!(script_matches_url(&s, "https://steamcommunity.com/path") == false); // 通配不匹配裸域
+        assert!(!script_matches_url(&s, "https://steamcommunity.com/path")); // 通配不匹配裸域
         assert!(script_matches_url(
             &s,
             "https://www.steamcommunity.com/path"

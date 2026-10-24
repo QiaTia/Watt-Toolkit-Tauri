@@ -19,8 +19,10 @@ pub struct OutboundTarget {
     pub tls: bool,
     /// TLS SNI（None = 用 host；规则可覆盖）
     pub tls_sni: Option<String>,
-    /// 是否忽略 TLS 名称不匹配
+    /// 是否忽略 TLS 名称不匹配（仅在存在 SNI 覆盖/替代名称时放宽名称校验）
     pub tls_ignore_name_mismatch: bool,
+    /// 完全跳过 TLS 校验（仅测试/诊断使用，生产规则不应开启）
+    pub tls_skip_verify: bool,
     /// 规则指定的 IP（优先于 DNS）
     pub override_ip: Option<IpAddr>,
     /// 转发目标域名（对齐 C# ForwardDestination）：DNS 解析该域名取 IP，
@@ -330,7 +332,9 @@ impl OutboundConnector {
             .clone()
             .unwrap_or_else(|| target.host.clone());
         let sni_override = sni_host != target.host;
-        let verify = if target.tls_ignore_name_mismatch || sni_override {
+        let verify = if target.tls_skip_verify {
+            OutboundVerify::SkipAll
+        } else if target.tls_ignore_name_mismatch || sni_override {
             OutboundVerify::IgnoreNameMismatch
         } else {
             OutboundVerify::Standard
@@ -941,6 +945,7 @@ mod tests {
             tls: true,
             tls_sni: None,
             tls_ignore_name_mismatch: true,
+            tls_skip_verify: true,
             override_ip: None,
             forward_destination: None,
             timeout_ms: Some(5000),
@@ -1009,6 +1014,7 @@ mod tests {
             tls: true,
             tls_sni: None,
             tls_ignore_name_mismatch: true,
+            tls_skip_verify: true,
             override_ip: None,
             forward_destination: None,
             timeout_ms: Some(5000),

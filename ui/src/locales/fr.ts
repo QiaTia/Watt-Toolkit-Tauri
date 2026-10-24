@@ -102,6 +102,7 @@ const fr: Schema = {
       failed: 'Détection incomplète ; course dans l’ordre par défaut',
       partial: 'Détection tronquée par le budget ; résultats partiels utilisés',
     },
+    noCheckedHint: "Sélectionnez au moins un projet d'accélération avant de démarrer.",
   },
   settings: {
     generalTitle: 'Général',
@@ -164,6 +165,11 @@ const fr: Schema = {
     certHint: 'HTTPS (MITM) : Windows affiche une invite UAC, macOS une confirmation de confiance système (mot de passe de session). Vous pouvez aussi exporter le PEM et l’importer manuellement.',
     elevateMacHint: "Sur macOS, l'installation affiche une confirmation de confiance (mot de passe de session) et s’applique à l’utilisateur courant, sans mot de passe administrateur.",
     elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
+    runningLockedHint: "L'accélération est en cours ; le mode proxy et les ports sont verrouillés. Arrêtez l'accélération avant de les modifier.",
+    certInstalled: 'Certificat racine installé et approuvé.',
+    certInstallVerifyFailed: "La commande d'installation a été exécutée mais la vérification a échoué. Vérifiez les réglages de confiance du système ou exportez le PEM pour l'installer manuellement.",
+    certUninstalled: 'Confiance du certificat racine supprimée.',
+    certRegenerated: "CA régénérée et ancienne confiance nettoyée. Réinstallez le certificat racine avant d'activer l'accélération HTTPS.",
   },
   pool: {
     summary: '{hosts} domaines, {ips} IP',
@@ -224,6 +230,7 @@ const fr: Schema = {
     removeConfirm:
       'Supprimer le pool d’IP de {host} ? Il reviendra aux sauvegardes intégrées et au DNS système.',
     removeIp: 'Retirer',
+    removeIpConfirm: 'Supprimer {ip} ?',
     unreachable: 'Injoignable',
     notProbed: 'Non testé',
     rtt: '{ms} ms',

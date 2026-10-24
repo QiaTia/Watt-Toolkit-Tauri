@@ -74,6 +74,10 @@ pub struct EngineConfig {
     pub terminal_proxy: Option<crate::terminal_proxy::TerminalProxyPlan>,
 }
 
+/// 测试/工具用默认配置（生产启动一律由命令层显式提供 CA 等字段）。
+///
+/// 注意：该实现会即时生成一张 CA，仅供单测/集成测试以 `..Default::default()`
+/// 简化构造，生产代码不得依赖此路径。
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -91,7 +95,10 @@ impl Default for EngineConfig {
             server_side_proxy_token: None,
             rules: Vec::new(),
             scripts: Vec::new(),
-            ca: Arc::new(CaCertificate::generate().expect("CA 生成失败")),
+            ca: Arc::new(
+                CaCertificate::generate()
+                    .unwrap_or_else(|e| panic!("测试配置生成 CA 失败: {e}")),
+            ),
             hosts_path: None,
             probe_cache_path: None,
             probe_cache_persist: false,
@@ -334,7 +341,14 @@ impl ProxyEngine {
         };
         match mode {
             ProxyMode::Hosts => {
-                Self::check_port_available(config.listen_ip, config.https_port).await?;
+                if let Err(e) =
+                    Self::check_port_available(config.listen_ip, config.https_port).await
+                {
+                    // 端口预检失败也必须落 Error：否则状态永久停在 Starting，
+                    // stop() 只接受 Running，前端只能重启应用。
+                    self.state.send_replace(EngineState::Error(e.to_string()));
+                    return Err(e);
+                }
             }
             ProxyMode::System => {
                 let proxy_ip_s = proxy_ip.to_string();
@@ -390,9 +404,11 @@ impl ProxyEngine {
         // 探测缓存：落盘热启动（P2，默认关）→ ctx 与探测任务共享同一实例
         let probe_cache = Arc::new(crate::probe_cache::ProbeCache::new());
         if config.probe_cache_persist {
-            if let Some(path) = config.probe_cache_path.as_deref() {
-                probe_cache.load_from(path);
-                tracing::debug!("探测缓存落盘加载: {}", path.display());
+            if let Some(path) = config.probe_cache_path.clone() {
+                let cache = probe_cache.clone();
+                let log_path = path.clone();
+                let _ = tokio::task::spawn_blocking(move || cache.load_from(&path)).await;
+                tracing::debug!("探测缓存落盘加载: {}", log_path.display());
             }
         }
         let ctx = Arc::new(RelayContext {
@@ -506,8 +522,19 @@ impl ProxyEngine {
         if mode == ProxyMode::Hosts {
             let entries = collect_hosts_entries(&config);
             if !entries.is_empty() {
-                let manager = hosts_manager(config.hosts_path.as_deref());
-                if let Err(e) = manager.update_hosts(&entries) {
+                let manager_path = hosts_manager(config.hosts_path.as_deref())
+                    .path()
+                    .to_path_buf();
+                // 写 hosts 在 macOS 会弹管理员对话框，必须离开 tokio worker
+                let write_path = manager_path.clone();
+                let write_result = tokio::task::spawn_blocking(move || {
+                    let manager = watt_hosts::HostsManager::with_path(&write_path);
+                    manager.update_hosts(&entries)
+                })
+                .await
+                .map_err(|e| format!("hosts 写入任务异常: {e}"))
+                .and_then(|r| r.map_err(|e| e.to_string()));
+                if let Err(e) = write_result {
                     // 回滚：停止已启动的监听（对齐 C# StopProxyAsync 回滚）
                     self.shutdown_tx.send_replace(true);
                     if let Some(task) = self.running_task.take() {
@@ -517,7 +544,7 @@ impl ProxyEngine {
                     self.state.send_replace(EngineState::Error(msg.clone()));
                     return Err(EngineError::Other(msg));
                 }
-                self.hosts_written = Some(manager.path().to_path_buf());
+                self.hosts_written = Some(manager_path);
             }
         }
 
@@ -527,9 +554,15 @@ impl ProxyEngine {
         // 因此终端命令在 System/PAC 模式下天然不会被代理。这里补第二条接入面：
         // 有正向代理在听时注入 HTTP(S)_PROXY/ALL_PROXY/NO_PROXY，并给 CLI 注入 CA
         // 覆盖变量。失败不阻断启动（终端覆盖是增强能力，核心加速不受影响）。
-        if let Some(plan) = &config.terminal_proxy {
-            match crate::terminal_proxy::enable(plan) {
-                Ok(()) => self.terminal_proxy_backup = Some(plan.backup_path.clone()),
+        if let Some(plan) = config.terminal_proxy.clone() {
+            let backup_path = plan.backup_path.clone();
+            // 写注册表 + 广播环境变量变更，离开 tokio worker
+            let result = tokio::task::spawn_blocking(move || crate::terminal_proxy::enable(&plan))
+                .await
+                .map_err(|e| format!("终端代理注入任务异常: {e}"))
+                .and_then(|r| r);
+            match result {
+                Ok(()) => self.terminal_proxy_backup = Some(backup_path),
                 Err(e) => tracing::warn!("终端代理环境变量注入失败（忽略，不影响加速）: {e}"),
             }
         }
@@ -571,71 +604,92 @@ impl ProxyEngine {
         }
         self.state.send_replace(EngineState::Stopping);
 
-        // 探测任务随停止取消（结果已无意义，避免后台空跑）
-        if let Some(task) = self.probe_task.take() {
-            task.abort();
-        }
-        // 探测缓存落盘（P2，默认关）：供下次启动热加载
-        if self.probe_cache_persist {
-            if let (Some(cache), Some(path)) = (&self.probe_cache, &self.probe_cache_path) {
-                cache.save_to(path);
-            }
-        }
-        self.probe_cache = None;
-
         // —— 1. 摘除 hosts（失败阻止停止：避免域名仍指向本地却无服务）——
         if let Some(path) = self.hosts_written.take() {
-            let manager = watt_hosts::HostsManager::with_path(path);
-            if manager.contains_mark() {
-                if let Err(e) = manager.remove_hosts_by_tag() {
-                    // 恢复 Running 状态（引擎未停止）
-                    self.state.send_replace(prev_state);
-                    self.hosts_written = Some(manager.path().to_path_buf());
-                    return Err(EngineError::Other(format!("hosts 还原失败: {e}")));
+            let remove_path = path.clone();
+            // macOS 提权弹窗/文件 IO 不得占用 tokio worker
+            let result = tokio::task::spawn_blocking(move || {
+                let manager = watt_hosts::HostsManager::with_path(&remove_path);
+                if manager.contains_mark() {
+                    manager.remove_hosts_by_tag()
+                } else {
+                    Ok(())
                 }
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+            if let Err(e) = result {
+                // 恢复 Running 状态（引擎未停止）
+                self.state.send_replace(prev_state);
+                self.hosts_written = Some(path);
+                return Err(EngineError::Other(format!("hosts 还原失败: {e}")));
             }
         }
 
         // —— 2. 取消系统代理 / PAC ——
         if let Some(mode) = self.running_mode {
-            match mode {
-                ProxyMode::System => {
-                    let result = tokio::task::spawn_blocking(|| {
-                        crate::system_proxy::set_system_proxy(false, "", 0)
-                    })
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r);
-                    if let Err(e) = result {
-                        tracing::warn!("取消系统代理失败（继续停止）: {e}");
-                    }
-                }
+            let canceled = match mode {
+                ProxyMode::System => tokio::task::spawn_blocking(|| {
+                    crate::system_proxy::set_system_proxy(false, "", 0)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r),
                 ProxyMode::Pac => {
-                    let result = tokio::task::spawn_blocking(|| {
-                        crate::system_proxy::set_system_pac(false, "")
-                    })
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r);
-                    if let Err(e) = result {
-                        tracing::warn!("取消 PAC 代理失败（继续停止）: {e}");
-                    }
+                    tokio::task::spawn_blocking(|| crate::system_proxy::set_system_pac(false, ""))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
                 }
-                _ => {}
+                _ => Ok(()),
+            };
+            if let Err(e) = canceled {
+                // 代理仍指向本引擎端口时不能关闭监听：否则用户看到「已停止」，
+                // 浏览器却全部连不上（残留黑洞）。
+                self.state.send_replace(prev_state);
+                let msg = match mode {
+                    ProxyMode::System => format!("取消系统代理失败: {e}"),
+                    ProxyMode::Pac => format!("取消 PAC 代理失败: {e}"),
+                    _ => format!("取消代理设置失败: {e}"),
+                };
+                return Err(EngineError::Other(msg));
             }
         }
 
+        // 探测任务取消与缓存落盘放在接入面摘除成功之后：
+        // hosts/系统代理还原失败会回滚到 Running，探测状态必须保留。
+        if let Some(task) = self.probe_task.take() {
+            task.abort();
+        }
+        if self.probe_cache_persist {
+            if let (Some(cache), Some(path)) = (self.probe_cache.clone(), self.probe_cache_path.clone())
+            {
+                let _ = tokio::task::spawn_blocking(move || cache.save_to(&path)).await;
+            }
+        }
+        self.probe_cache = None;
+
         // —— 3. 还原终端代理环境变量（CLI 接入面）——
-        if let Some(path) = self.terminal_proxy_backup.take() {
+        if let Some(path) = self.terminal_proxy_backup.clone() {
             if let Err(e) = crate::terminal_proxy::disable(&path) {
-                tracing::warn!("还原终端代理环境变量失败: {e}");
+                tracing::warn!("还原终端代理环境变量失败（备份保留，下次启动重试）: {e}");
+            } else {
+                self.terminal_proxy_backup = None;
             }
         }
 
         // —— 4. 关闭监听 ——
         self.shutdown_tx.send_replace(true);
         if let Some(task) = self.running_task.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            if tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .is_err()
+            {
+                let msg = "监听停止超时（端口可能仍被占用），请重启应用".to_string();
+                self.state.send_replace(EngineState::Error(msg.clone()));
+                return Err(EngineError::Other(msg));
+            }
         }
         self.running_mode = None;
         self.state.send_replace(EngineState::Stopped);
@@ -714,6 +768,12 @@ fn collect_hosts_entries(config: &EngineConfig) -> Vec<(String, String)> {
         if ip.is_empty() || domain.is_empty() {
             return;
         }
+        // 规则来自云端目录/前端，必须在进入 hosts 前校验：
+        // 换行/空白会注入任意解析记录，`#` 还能伪造标记块导致 hosts 被重置。
+        if let Err(e) = watt_hosts::validate_hosts_entry(&ip, &domain) {
+            tracing::warn!("跳过非法 hosts 条目 {ip:?} {domain:?}: {e}");
+            return;
+        }
         if seen.insert(domain.to_ascii_lowercase()) {
             entries.push((ip, domain));
         }
@@ -721,10 +781,13 @@ fn collect_hosts_entries(config: &EngineConfig) -> Vec<(String, String)> {
 
     for rule in &config.rules {
         for entry in &rule.listening_domain_names {
-            if entry.contains(' ') {
-                let mut parts = entry.split_whitespace();
-                if let (Some(ip), Some(domain)) = (parts.next(), parts.next()) {
+            if entry.contains(char::is_whitespace) {
+                // "ip domain" 反序格式：必须恰好两个 token，多余内容视为非法
+                let parts: Vec<&str> = entry.split_whitespace().collect();
+                if let [ip, domain] = parts.as_slice() {
                     push(ip.to_string(), domain.to_string(), &mut seen);
+                } else {
+                    tracing::warn!("跳过非法 hosts 条目（token 数不为 2）: {entry:?}");
                 }
             } else {
                 push(localhost.clone(), entry.clone(), &mut seen);

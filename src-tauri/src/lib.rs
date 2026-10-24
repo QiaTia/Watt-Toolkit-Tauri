@@ -57,6 +57,15 @@ pub fn run() {
         .init();
 
     let app = tauri::Builder::default()
+        // 单实例：第二个进程直接激活已有窗口退出，避免启动清理误删运行中实例的
+        // hosts/系统代理/终端代理备份（必须最先注册）
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             let data_dir = resolve_data_dir(app.handle());
             std::fs::create_dir_all(&data_dir)?;

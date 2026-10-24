@@ -90,6 +90,7 @@ const zhHant: Schema = {
       failed: '節點探測未完成，競速將按預設順序嘗試',
       partial: '節點探測被預算截斷，已按已完成部分擇優',
     },
+    noCheckedHint: '請至少勾選一個加速專案後再啟動加速。',
   },
   settings: {
     generalTitle: '一般',
@@ -148,6 +149,11 @@ const zhHant: Schema = {
     certHint: '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下會彈出 UAC 提權確認，macOS 下會彈出系統信任確認（輸入登入密碼，無需管理員密碼）。也可匯出 PEM 後手動匯入。',
     elevateMacHint: 'macOS 下安裝根憑證會彈一次系統信任確認，輸入登入密碼即可（存入目前使用者的信任設定，無需管理員密碼）。',
     elevateCancelled: '已取消管理員授權，操作未完成。',
+    runningLockedHint: '加速執行中，代理模式與連接埠等設定已鎖定；請先停止加速再修改。',
+    certInstalled: '根憑證已安裝並受信任。',
+    certInstallVerifyFailed: '根憑證安裝命令已執行，但驗證未通過。請檢查系統信任設定，或匯出 PEM 手動安裝。',
+    certUninstalled: '根憑證信任已移除。',
+    certRegenerated: 'CA 已重新產生，舊信任已清理；請重新安裝根憑證後再啟用 HTTPS 加速。',
   },
   pool: {
     summary: '共 {hosts} 個網域、{ips} 個 IP',
@@ -199,6 +205,7 @@ const zhHant: Schema = {
     remove: '刪除',
     removeConfirm: '刪除 {host} 的 IP 池？該網域將回退到內建備用池與系統 DNS。',
     removeIp: '移除',
+    removeIpConfirm: '確定移除 {ip}？',
     unreachable: '不可用',
     notProbed: '未探測',
     rtt: '{ms} ms',

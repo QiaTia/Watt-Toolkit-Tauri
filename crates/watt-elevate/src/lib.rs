@@ -21,7 +21,7 @@ use std::process::Command;
 ///
 /// `mv` 用于 hosts 原子替换（同卷 rename，避免 `cp` 的 truncate-write 窗口）。
 pub const ALLOWED_PROGRAMS: &[&str] = &[
-    "security", "cp", "mv", "mkdir", "chmod", "dscacheutil", "killall",
+    "security", "cp", "mv", "mkdir", "chmod", "chown", "dscacheutil", "killall",
 ];
 
 /// 提权操作类型（用于选择弹窗 prompt 文案）

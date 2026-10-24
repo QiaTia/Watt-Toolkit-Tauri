@@ -13,6 +13,7 @@ fn target(override_ip: Option<&str>) -> OutboundTarget {
         tls: true,
         tls_sni: None,
         tls_ignore_name_mismatch: false,
+        tls_skip_verify: false,
         override_ip: override_ip.map(|s| s.parse().unwrap()),
         forward_destination: None,
         timeout_ms: None,

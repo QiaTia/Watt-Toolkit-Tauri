@@ -6,6 +6,7 @@ import { useProxyStore } from '@/stores/proxy';
 import { useSettingsStore } from '@/stores/settings';
 import { useAccelerateStore } from '@/stores/accelerate';
 import { isMacOS, isWindows } from '@/utils/platform';
+import { formatBytes } from '@/utils/format';
 import type {
   AccelerateProject,
   AccelerateProjectGroup,
@@ -19,17 +20,19 @@ const accel = useAccelerateStore();
 const { t } = useI18n();
 const { message } = AntApp.useApp();
 
-// 必须在 setup 顶层调用：放到 onMounted 里会因没有活跃组件实例而注册失败，
-// 导致离开页面后 1s 统计轮询永不停止。
-proxy.useAutoClean();
-
+// 统计/探测轮询由 proxy store 统一管理（引擎运行期间常驻，不随页面卸载停止）
 onMounted(async () => {
   void proxy.refreshState();
   // 关键顺序：先等设置从磁盘加载完成，再初始化勾选集合。
   // 若直接读 settings.settings.enabled_accelerate_ids（默认 []），
   // 持久化的勾选会被云端默认值覆盖，表现为「下次打开不恢复选择」。
-  await settings.ensureLoaded();
-  void accel.load(false, settings.settings.enabled_accelerate_ids);
+  try {
+    await settings.ensureLoaded();
+  } catch {
+    // 读取失败已写入 store.loadError；仍继续加载目录（勾选回退云端默认），
+    // 不能因设置失败让加速项目列表整页空白。
+  }
+  void accel.load(false);
 });
 
 /** 正向代理实际端口（0 = 默认 26501） */
@@ -230,7 +233,7 @@ async function refreshCatalog(): Promise<void> {
   refreshing.value = true;
   try {
     accel.clearProbes();
-    await accel.load(true, settings.settings.enabled_accelerate_ids);
+    await accel.load(true);
   } finally {
     refreshing.value = false;
   }
@@ -265,16 +268,22 @@ function isChecked(p: AccelerateProject): boolean {
   return accel.checkedIds.has(p.id);
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
 async function toggleEngine(): Promise<void> {
   if (proxy.isRunning) {
     await proxy.stop();
+    return;
+  }
+  // 目录未加载 / 加载失败 / 未勾选任何项目时禁止启动：
+  // 0 规则引擎会「运行中」但实际不加速任何流量。
+  if (accel.catalog === null) {
+    await accel.load(false);
+  }
+  if (accel.error !== null) {
+    message.error(accel.error);
+    return;
+  }
+  if (accel.checkedIds.size === 0) {
+    message.warning(t('accel.noCheckedHint'));
     return;
   }
   const s = settings.settings;

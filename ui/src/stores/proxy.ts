@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
-import { computed, onUnmounted, ref } from 'vue';
-import { listen } from '@tauri-apps/api/event';
+import { computed, ref } from 'vue';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   engineGetState,
   engineGetStats,
@@ -14,7 +14,7 @@ import type { EngineStartParams, EngineStateDto, FlowStatsDto, ProbeSummaryDto }
 /** 后端托盘/命令启停引擎后广播的状态变更事件（与 Rust tray::ENGINE_STATE_EVENT 对齐） */
 const ENGINE_STATE_EVENT = 'watt://engine-state-changed';
 
-/** 探测摘要轮询上限（启动预探测整体预算 8s + 余量；拿到摘要或超时即停） */
+/** 探测摘要轮询上限（启动预探测整体预算 12s + 余量；拿到摘要或超时即停） */
 const PROBE_POLL_TIMEOUT_MS = 15_000;
 const PROBE_POLL_INTERVAL_MS = 1000;
 
@@ -55,6 +55,15 @@ export const useProxyStore = defineStore('proxy', () => {
 
   async function refreshState(): Promise<void> {
     state.value = await engineGetState();
+    // 轮询归属 store：引擎运行中时无论当前在哪个页面都持续统计
+    if (isRunning.value) {
+      if (statsTimer === null) startStatsLoop();
+    } else {
+      stopStatsLoop();
+      stopProbePolling();
+      stats.value = { upBytes: 0, downBytes: 0 };
+      probeSummary.value = null;
+    }
   }
 
   async function start(params: EngineStartParams): Promise<boolean> {
@@ -141,14 +150,6 @@ export const useProxyStore = defineStore('proxy', () => {
     }
   }
 
-  /** 组件内使用：自动清理轮询 */
-  function useAutoClean(): void {
-    onUnmounted(() => {
-      stopStatsLoop();
-      stopProbePolling();
-    });
-  }
-
   /**
    * 外部（托盘菜单 / 其他入口）触发的引擎状态变更：
    * 重新拉取状态并同步统计轮询，使面板与后台服务保持一致。
@@ -158,18 +159,24 @@ export const useProxyStore = defineStore('proxy', () => {
     if (isRunning.value) {
       startStatsLoop();
       startProbePolling();
-    } else {
-      stopStatsLoop();
-      stopProbePolling();
-      stats.value = { upBytes: 0, downBytes: 0 };
-      probeSummary.value = null;
     }
   }
 
-  // 订阅后端状态广播（store 为应用级单例，随应用生命周期常驻，无需手动解绑）
+  // 订阅后端状态广播（store 为应用级单例；HMR 时释放旧监听避免叠加）
+  let unlistenState: UnlistenFn | null = null;
   void listen(ENGINE_STATE_EVENT, () => {
     void syncFromExternal();
+  }).then((fn) => {
+    unlistenState = fn;
   });
+  if (import.meta.hot) {
+    import.meta.hot.dispose(() => {
+      unlistenState?.();
+      unlistenState = null;
+      stopStatsLoop();
+      stopProbePolling();
+    });
+  }
 
   return {
     state,
@@ -184,7 +191,6 @@ export const useProxyStore = defineStore('proxy', () => {
     stop,
     refreshState,
     refreshStats,
-    useAutoClean,
     syncFromExternal,
   };
 });

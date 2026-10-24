@@ -11,6 +11,11 @@ use hyper::service::Service;
 use hyper::Request;
 use std::sync::Arc;
 
+/// 协议握手超时：慢连接不得永久占用任务与 fd
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 并发连接上限（防本地端口被大量慢连接耗尽 fd）
+const MAX_CONNECTIONS: usize = 256;
+
 /// MITM HTTPS 监听（443）
 pub async fn run_mitm_listener(
     listener: tokio::net::TcpListener,
@@ -18,10 +23,13 @@ pub async fn run_mitm_listener(
     tls_acceptor: tokio_rustls::TlsAcceptor,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // sender 被丢弃时 changed() 立即返回 Err；必须退出，
+                // 否则旧监听任务会在 accept/changed 之间 100% CPU 空转
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
@@ -36,7 +44,12 @@ pub async fn run_mitm_listener(
                 };
                 let ctx = ctx.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    tracing::warn!("443 连接数达到上限，拒绝新连接");
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = handle_mitm_connection(stream, ctx, tls_acceptor).await;
                     let _ = peer;
                 });
@@ -51,10 +64,15 @@ async fn handle_mitm_connection(
     tls_acceptor: tokio_rustls::TlsAcceptor,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = stream.set_nodelay(true);
-    let tls_stream = match tls_acceptor.accept(stream).await {
-        Ok(s) => s,
-        Err(e) => {
+    let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(stream)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             tracing::debug!("TLS 握手失败: {e}");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::debug!("TLS 握手超时（慢连接已断开）");
             return Ok(());
         }
     };
@@ -79,10 +97,13 @@ pub async fn run_http_listener(
     ctx: Arc<RelayContext>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // sender 被丢弃时 changed() 立即返回 Err；必须退出，
+                // 否则旧监听任务会在 accept/changed 之间 100% CPU 空转
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
@@ -92,7 +113,12 @@ pub async fn run_http_listener(
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    tracing::warn!("HTTP 监听连接数达到上限，拒绝新连接");
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let scheme = "http".to_string();
                     let service = RelayService { ctx, scheme };
                     let io = hyper_util::rt::TokioIo::new(stream);
@@ -206,6 +232,7 @@ fn upgrade_target(
         tls: destination_uri.scheme_str() == Some("https"),
         tls_sni: crate::http_relay::resolve_tls_sni(&rule, host),
         tls_ignore_name_mismatch: rule.fields.tls_ignore_name_mismatch,
+        tls_skip_verify: rule.fields.tls_skip_verify,
         override_ip: rule.fields.ip_address,
         forward_destination: rule.fields.forward_destination.clone(),
         timeout_ms: rule.fields.timeout_ms,
@@ -231,10 +258,13 @@ pub async fn run_socks5_listener(
     ctx: Arc<RelayContext>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // sender 被丢弃时 changed() 立即返回 Err；必须退出，
+                // 否则旧监听任务会在 accept/changed 之间 100% CPU 空转
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
@@ -244,7 +274,12 @@ pub async fn run_socks5_listener(
                     Err(_) => continue,
                 };
                 let ctx = ctx.clone();
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    tracing::warn!("SOCKS5 连接数达到上限，拒绝新连接");
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = handle_socks5_connection(stream, ctx).await;
                 });
             }
@@ -259,51 +294,63 @@ async fn handle_socks5_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // 1. 握手
-    let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
-    if head[0] != 0x05 {
-        return Ok(());
-    }
-    let n_methods = head[1] as usize;
-    let mut methods = vec![0u8; n_methods];
-    stream.read_exact(&mut methods).await?;
-    // 无认证
-    stream.write_all(&[0x05, 0x00]).await?;
+    // 1-2. 握手 + CONNECT 请求解析（整体限时，防慢连接永久占用任务）
+    let handshake = async {
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await?;
+        if head[0] != 0x05 {
+            return Err("非 SOCKS5 请求".into());
+        }
+        let n_methods = head[1] as usize;
+        let mut methods = vec![0u8; n_methods];
+        stream.read_exact(&mut methods).await?;
+        // 无认证
+        stream.write_all(&[0x05, 0x00]).await?;
 
-    // 2. CONNECT 请求
-    let mut req_head = [0u8; 4];
-    stream.read_exact(&mut req_head).await?;
-    if req_head[1] != 0x01 {
-        // 仅支持 CONNECT
-        stream
-            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await?;
-        return Ok(());
-    }
-    let target_host = match req_head[3] {
-        0x01 => {
-            let mut ip = [0u8; 4];
-            stream.read_exact(&mut ip).await?;
-            std::net::IpAddr::from(ip).to_string()
+        let mut req_head = [0u8; 4];
+        stream.read_exact(&mut req_head).await?;
+        if req_head[1] != 0x01 {
+            // 仅支持 CONNECT
+            stream
+                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            return Err("仅支持 SOCKS5 CONNECT".into());
         }
-        0x03 => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            let mut domain = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut domain).await?;
-            String::from_utf8_lossy(&domain).to_string()
-        }
-        0x04 => {
-            let mut ip = [0u8; 16];
-            stream.read_exact(&mut ip).await?;
-            std::net::IpAddr::from(ip).to_string()
-        }
-        _ => return Ok(()),
+        let target_host = match req_head[3] {
+            0x01 => {
+                let mut ip = [0u8; 4];
+                stream.read_exact(&mut ip).await?;
+                std::net::IpAddr::from(ip).to_string()
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut domain = vec![0u8; len[0] as usize];
+                stream.read_exact(&mut domain).await?;
+                String::from_utf8_lossy(&domain).to_string()
+            }
+            0x04 => {
+                let mut ip = [0u8; 16];
+                stream.read_exact(&mut ip).await?;
+                std::net::IpAddr::from(ip).to_string()
+            }
+            _ => return Err("不支持的 SOCKS5 地址类型".into()),
+        };
+        let mut port_buf = [0u8; 2];
+        stream.read_exact(&mut port_buf).await?;
+        let port = u16::from_be_bytes(port_buf);
+
+        Ok::<(String, u16), Box<dyn std::error::Error + Send + Sync>>((target_host, port))
     };
-    let mut port_buf = [0u8; 2];
-    stream.read_exact(&mut port_buf).await?;
-    let port = u16::from_be_bytes(port_buf);
+
+    let (target_host, port) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => return Ok(()),
+        Err(_) => {
+            tracing::debug!("SOCKS5 握手超时（慢连接已断开）");
+            return Ok(());
+        }
+    };
 
     // SOCKS5 直连隧道（匹配域名走规则 IP；TLS 由客户端在隧道内进行，无法注入）
     let outbound = crate::outbound::OutboundConnector::new(
@@ -316,6 +363,7 @@ async fn handle_socks5_connection(
         tls: false,
         tls_sni: None,
         tls_ignore_name_mismatch: false,
+        tls_skip_verify: false,
         override_ip: ctx
             .rules
             .find(&target_host)

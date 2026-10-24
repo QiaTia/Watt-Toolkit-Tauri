@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// DNS 解析配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DnsConfig {
     /// 主 DNS 服务器（如 "223.5.5.5"），None 用系统默认
     pub master_dns: Option<String>,
@@ -14,16 +14,6 @@ pub struct DnsConfig {
     pub use_doh: bool,
     /// 自定义 DoH 地址
     pub custom_doh_address: Option<String>,
-}
-
-impl Default for DnsConfig {
-    fn default() -> Self {
-        Self {
-            master_dns: None,
-            use_doh: false,
-            custom_doh_address: None,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

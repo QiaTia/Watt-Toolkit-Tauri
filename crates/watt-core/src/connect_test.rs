@@ -144,6 +144,16 @@ async fn connect_via_http_proxy(
 /// 解析走系统 `getaddrinfo`（含 hosts），TLS 走系统根证书——语义对齐原版
 /// .NET HttpClient 的默认行为。
 pub async fn probe_https(host: &str, timeout: Duration) -> ProbeResult {
+    probe_https_with_proxy(host, timeout, system_proxy_addr()).await
+}
+
+/// 同 [`probe_https`]，但系统代理由调用方先取一次（批量探测避免每域名重复
+/// 执行 networksetup/注册表查询）。
+pub async fn probe_https_with_proxy(
+    host: &str,
+    timeout: Duration,
+    proxy: Option<(String, u16)>,
+) -> ProbeResult {
     let started = Instant::now();
     let host = host.trim().trim_end_matches('/').to_string();
     if host.is_empty() {
@@ -159,7 +169,7 @@ pub async fn probe_https(host: &str, timeout: Duration) -> ProbeResult {
     let deadline = async {
         // 1. TCP：系统代理存在（含本引擎 PAC）→ 走代理隧道，测得「浏览器真实打开」路径；
         //    否则直连系统解析（hosts 劫持时即 Hosts 模式加速链路）
-        let tcp = match system_proxy_addr() {
+        let tcp = match proxy {
             Some(proxy) => connect_via_http_proxy(&proxy, &host, timeout).await,
             None => tokio::time::timeout(
                 timeout,
@@ -242,11 +252,17 @@ pub async fn probe_https(host: &str, timeout: Duration) -> ProbeResult {
 
 /// 并发探测多个域名（对齐原版 `Task.WhenAll` 全并发语义）。
 pub async fn probe_https_all(hosts: &[String], timeout: Duration) -> Vec<ProbeResult> {
+    // 系统代理状态只取一次：macOS 上每次查询都要起多个 networksetup 子进程
+    let proxy = tokio::task::spawn_blocking(system_proxy_addr)
+        .await
+        .ok()
+        .flatten();
     let tasks: Vec<_> = hosts
         .iter()
         .map(|h| {
             let h = h.clone();
-            tokio::spawn(async move { probe_https(&h, timeout).await })
+            let proxy = proxy.clone();
+            tokio::spawn(async move { probe_https_with_proxy(&h, timeout, proxy).await })
         })
         .collect();
     let mut out = Vec::with_capacity(tasks.len());
@@ -378,6 +394,7 @@ mod tests {
                 tls: true,
                 tls_sni: None,
                 tls_ignore_name_mismatch: false,
+                tls_skip_verify: false,
                 override_ip: Some("120.253.253.34".parse().unwrap()),
                 forward_destination: None,
                 timeout_ms: Some(15_000),

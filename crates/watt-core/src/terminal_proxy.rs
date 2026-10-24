@@ -139,7 +139,12 @@ pub fn enable(plan: &TerminalProxyPlan) -> Result<(), String> {
         write_backup(&plan.backup_path, &backup)?;
 
         for (name, value) in &targets {
-            imp::write(name, value)?;
+            if let Err(e) = imp::write(name, value) {
+                // 半注入立即回滚：否则新开终端会指向一个可能已停的端口
+                let rollback = disable(&plan.backup_path);
+                tracing::warn!("写入 {name} 失败，回滚终端代理环境变量: {rollback:?}");
+                return Err(format!("写入 {name} 失败: {e}"));
+            }
         }
         imp::broadcast_change();
         tracing::info!(
@@ -152,8 +157,7 @@ pub fn enable(plan: &TerminalProxyPlan) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = plan;
-        tracing::warn!("终端代理环境变量注入暂未在非 Windows 平台实现（跳过）");
-        Ok(())
+        Err("当前平台暂不支持终端代理环境变量注入（仅 Windows）".to_string())
     }
 }
 

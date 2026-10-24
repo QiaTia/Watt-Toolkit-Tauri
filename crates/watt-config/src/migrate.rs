@@ -258,9 +258,9 @@ mod tests {
         assert_eq!(s.proxy_mode, ProxyMode::Pac);
         assert_eq!(s.system_proxy_port, 26501);
         assert_eq!(s.system_proxy_ip.as_deref(), Some("127.0.0.1"));
-        assert_eq!(s.socks5_proxy_enable, true);
+        assert!(s.socks5_proxy_enable);
         assert_eq!(s.socks5_proxy_port, 8868);
-        assert_eq!(s.enable_http_proxy_to_https, true);
+        assert!(s.enable_http_proxy_to_https);
         assert!(s.two_level_agent.enable);
         assert_eq!(
             s.two_level_agent.typed_proxy_type(),

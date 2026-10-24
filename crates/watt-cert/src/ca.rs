@@ -161,10 +161,16 @@ impl CaCertificate {
         self.key_pair.serialize_pem()
     }
 
-    fn save(&self, dir: &Path) -> Result<(), CaError> {
+    /// 保存证书与私钥（Unix 下目录 0700、私钥 0600，避免多用户机器上私钥泄露）
+    pub fn save(&self, dir: &Path) -> Result<(), CaError> {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         std::fs::write(Self::cert_path(dir), &self.cert_pem)?;
-        std::fs::write(Self::key_path(dir), self.key_pem())?;
+        write_private_file(&Self::key_path(dir), self.key_pem().as_bytes())?;
         Ok(())
     }
 
@@ -184,6 +190,28 @@ impl CaCertificate {
             sha1: crate::trust::sha1_hex(&self.cert_der).to_uppercase(),
             sha256: crate::trust::sha256_hex_upper(&self.cert_der),
         })
+    }
+}
+
+/// 写私钥文件：Unix 下强制 0600（含已存在文件），Windows 走默认 ACL
+fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(data)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
     }
 }
 

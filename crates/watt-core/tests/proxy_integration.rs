@@ -501,6 +501,7 @@ async fn test_outbound_tls_chain() {
                 destination: Some(format!("https://upstream.example.com:{}/", upstream.port())),
                 ip_address: Some("127.0.0.1".parse().unwrap()),
                 tls_ignore_name_mismatch: true,
+                tls_skip_verify: true,
                 ..Default::default()
             },
             ..Default::default()

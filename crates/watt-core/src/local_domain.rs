@@ -8,13 +8,17 @@
 //! - `requestType: xhr` → XHR 桥（转发请求至目标 URL，还原 `-steamtool` 后缀头）
 //! - `/{lid}` → 脚本内容（兼容路径）
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Bytes};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use watt_script::ScriptConfig;
+
+/// XHR 桥请求/响应体上限（防内存放大）
+const MAX_XHR_BODY: usize = 8 * 1024 * 1024;
 
 /// XHR 桥响应处理
 pub struct LocalDomainHandler {
@@ -70,24 +74,6 @@ impl LocalDomainHandler {
 
         // 2. 仅 local.steampp.net 域
         if host.eq_ignore_ascii_case(watt_config::constants::LOCAL_DOMAIN) {
-            // CORS 预检（含私网访问）
-            if method == Method::OPTIONS {
-                let origin = req
-                    .headers()
-                    .get(hyper::header::ORIGIN)
-                    .cloned()
-                    .unwrap_or_else(|| HeaderValue::from_static("*"));
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Access-Control-Allow-Origin", origin)
-                    .header("Access-Control-Allow-Headers", "*")
-                    .header("Access-Control-Allow-Methods", "*")
-                    .header("Access-Control-Allow-Credentials", "true")
-                    .header("Access-Control-Allow-Private-Network", "true")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap();
-            }
-
             let request_type = req
                 .headers()
                 .get("requestType")
@@ -95,11 +81,37 @@ impl LocalDomainHandler {
                 .unwrap_or_default()
                 .to_string();
 
-            match request_type.as_str() {
-                "status" => Response::builder()
+            // 存活检查无副作用，保留给注入脚本/诊断使用
+            if request_type == "status" {
+                return Response::builder()
                     .status(StatusCode::OK)
                     .body(Full::new(Bytes::from_static(b"OK")))
-                    .unwrap(),
+                    .unwrap_or_else(|_| internal_error());
+            }
+
+            // 其余入口（含 XHR 桥与预检）都服务于注入脚本：
+            // 脚本为空时整体关闭，避免任意网页借无鉴权桥读取内网响应。
+            if self.scripts.is_empty() {
+                return not_found();
+            }
+
+            // CORS 预检：只接受 http(s) 来源，拒绝 null / 自定义协议
+            if method == Method::OPTIONS {
+                let Some(origin) = cors_origin(&req) else {
+                    return forbidden();
+                };
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Access-Control-Allow-Origin", origin)
+                    .header("Access-Control-Allow-Headers", "*")
+                    .header("Access-Control-Allow-Methods", "*")
+                    .header("Access-Control-Allow-Credentials", "true")
+                    .header("Vary", "Origin")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|_| internal_error());
+            }
+
+            match request_type.as_str() {
                 "xhr" => self.handle_xhr(req).await,
                 _ => {
                     // 默认：路径为 /{lid} 的脚本请求
@@ -126,7 +138,7 @@ impl LocalDomainHandler {
                         "application/javascript;charset=UTF-8",
                     )
                     .body(Full::new(Bytes::from(content.clone())))
-                    .unwrap();
+                    .unwrap_or_else(|_| internal_error());
             }
         }
         not_found()
@@ -141,6 +153,9 @@ impl LocalDomainHandler {
     {
         let method = req.method().clone();
         let headers = req.headers().clone();
+        let Some(origin) = cors_origin(&req) else {
+            return forbidden();
+        };
         let (parts, body) = req.into_parts();
 
         // 解析目标 URL
@@ -155,28 +170,27 @@ impl LocalDomainHandler {
             Ok(u) => u,
             Err(_) => return bad_request("无效的 URL"),
         };
-
-        // CORS 响应头
-        let origin = headers
-            .get(hyper::header::ORIGIN)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("*"));
+        if !matches!(target.scheme_str(), Some("http") | Some("https")) {
+            return bad_request("仅支持 http/https 目标");
+        }
 
         // 仅支持 GET / POST（对齐原实现）；POST 需带非空 body（Content-Length > 0）
         let is_get = method == Method::GET;
         let is_post = method == Method::POST;
-        let has_body = headers
+        let content_length = headers
             .get(hyper::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|n| n > 0);
+            .and_then(|v| v.parse::<u64>().ok());
+        if content_length.is_some_and(|n| n > MAX_XHR_BODY as u64) {
+            return bad_request("请求体超过上限");
+        }
+        let has_body = content_length.is_some_and(|n| n > 0);
         if !is_get && !(is_post && has_body) {
-            let resp = Response::builder()
+            return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("Access-Control-Allow-Origin", origin)
                 .body(Full::new(Bytes::new()))
-                .unwrap();
-            return resp;
+                .unwrap_or_else(|_| internal_error());
         }
 
         // 还原 -steamtool 后缀头
@@ -207,8 +221,31 @@ impl LocalDomainHandler {
             forward_headers.insert(hyper::header::USER_AGENT, ua.clone());
         }
 
-        // 转发（直连，走系统解析）
-        let outbound_result = forward_xhr(method.clone(), target, forward_headers, body).await;
+        // 目标地址校验：只允许公网地址，防止任意网页借桥访问内网/环回/云元数据；
+        // 解析结果全部可用才放行，并以首个 IP 直连防 DNS 重绑定。
+        let target_host = target.host().unwrap_or_default().to_string();
+        let target_port = target.port_u16().unwrap_or(if target.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+        let addrs: Vec<std::net::SocketAddr> =
+            match tokio::net::lookup_host((target_host.as_str(), target_port)).await {
+                Ok(iter) => iter.collect(),
+                Err(e) => return bad_request(&format!("目标解析失败: {e}")),
+            };
+        if addrs.is_empty() {
+            return bad_request("目标无可用地址");
+        }
+        if addrs.iter().any(|a| !crate::ip_pool::is_usable_ip(&a.ip())) {
+            return forbidden();
+        }
+        let connect_ip = addrs[0].ip();
+
+        // 转发（直连校验后的 IP）
+        let body = Limited::new(body, MAX_XHR_BODY);
+        let outbound_result =
+            forward_xhr(method.clone(), target, forward_headers, body, connect_ip).await;
 
         match outbound_result {
             Ok(resp_parts) => {
@@ -217,7 +254,8 @@ impl LocalDomainHandler {
                     .header("Access-Control-Allow-Origin", origin)
                     .header("Access-Control-Allow-Headers", "*")
                     .header("Access-Control-Allow-Methods", "*")
-                    .header("Access-Control-Allow-Credentials", "true");
+                    .header("Access-Control-Allow-Credentials", "true")
+                    .header("Vary", "Origin");
                 for (k, v) in resp_parts.1.iter() {
                     builder = builder.header(k, v);
                 }
@@ -225,15 +263,11 @@ impl LocalDomainHandler {
                     .body(Full::new(resp_parts.2))
                     .unwrap_or_else(|_| internal_error())
             }
-            Err(e) => {
-                let mut resp = Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .header("Access-Control-Allow-Origin", origin)
-                    .body(Full::new(Bytes::from(e)))
-                    .unwrap();
-                let _ = &mut resp;
-                resp
-            }
+            Err(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Access-Control-Allow-Origin", origin)
+                .body(Full::new(Bytes::from(e)))
+                .unwrap_or_else(|_| internal_error()),
         }
     }
 }
@@ -266,6 +300,7 @@ async fn forward_xhr<B>(
     target: hyper::Uri,
     headers: HeaderMap,
     body: B,
+    connect_ip: IpAddr,
 ) -> Result<(StatusCode, HeaderMap, Bytes), String>
 where
     B: Body + Send + 'static,
@@ -292,7 +327,8 @@ where
             tls,
             tls_sni: None,
             tls_ignore_name_mismatch: false,
-            override_ip: None,
+            tls_skip_verify: false,
+            override_ip: Some(connect_ip),
             forward_destination: None,
             timeout_ms: Some(30000),
         })
@@ -321,33 +357,48 @@ where
         .map_err(|e| format!("请求失败: {e}"))?;
 
     let (parts, body) = response.into_parts();
-    let bytes = body
+    let bytes = Limited::new(body, MAX_XHR_BODY)
         .collect()
         .await
-        .map_err(|e| format!("读取响应失败: {e}"))?
+        .map_err(|e| format!("读取响应失败或超过上限: {e}"))?
         .to_bytes();
     Ok((parts.status, parts.headers, bytes))
 }
 
+/// 仅接受 http(s) Origin（拒绝 `null`、自定义协议与缺失）
+fn cors_origin<B>(req: &Request<B>) -> Option<HeaderValue> {
+    let origin = req.headers().get(hyper::header::ORIGIN)?;
+    let value = origin.to_str().ok()?;
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(origin.clone())
+    } else {
+        None
+    }
+}
+
 fn not_found() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Full::new(Bytes::new()))
-        .unwrap()
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::NOT_FOUND;
+    resp
+}
+
+fn forbidden() -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::FORBIDDEN;
+    resp
 }
 
 fn bad_request(msg: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from(msg.to_string())))
-        .unwrap()
+    let mut resp = Response::new(Full::new(Bytes::from(msg.to_string())));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
 }
 
 fn internal_error() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Full::new(Bytes::new()))
-        .unwrap()
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    resp
 }
 
 #[cfg(test)]

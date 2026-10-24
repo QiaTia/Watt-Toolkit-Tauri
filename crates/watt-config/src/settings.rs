@@ -151,6 +151,9 @@ pub struct ProxySettings {
     /// 勾选的加速项目 Id 集合（对齐旧版 SupportProxyServicesStatus）
     #[serde(default)]
     pub enabled_accelerate_ids: Vec<String>,
+    /// 勾选集合是否已初始化：区分「首次运行」与「用户主动清空」
+    #[serde(default)]
+    pub enabled_accelerate_ids_initialized: bool,
     /// 终端（CLI）代理环境变量 + 证书注入（默认开）
     #[serde(default = "default_true")]
     pub terminal_proxy_enable: bool,
@@ -173,6 +176,7 @@ impl Default for ProxySettings {
             dns: DnsSettings::default(),
             is_proxy_gog: false,
             enabled_accelerate_ids: Vec::new(),
+            enabled_accelerate_ids_initialized: false,
             terminal_proxy_enable: true,
         }
     }
@@ -282,9 +286,11 @@ mod tests {
         assert_eq!(loaded.proxy_mode, ProxyMode::Hosts);
 
         // 保存后回读一致
-        let mut settings = ProxySettings::default();
-        settings.system_proxy_port = 26502;
-        settings.enabled_accelerate_ids = vec!["steam".into()];
+        let settings = ProxySettings {
+            system_proxy_port: 26502,
+            enabled_accelerate_ids: vec!["steam".into()],
+            ..Default::default()
+        };
         save_proxy_settings_in(&dir, &settings).unwrap();
         let reloaded = load_proxy_settings_in(&dir).unwrap();
         assert_eq!(reloaded.system_proxy_port, 26502);

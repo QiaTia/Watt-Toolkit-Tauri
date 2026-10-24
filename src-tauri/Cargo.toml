@@ -1,6 +1,7 @@
 [package]
 name = "watt-toolkit-app"
-version = "0.4.0"
+# 继承 workspace 版本：此前硬编码导致 workspace 升到 0.4.1 时这里仍是 0.4.0
+version.workspace = true
 description = "Watt Toolkit（网络加速服务 Tauri 版）"
 edition = "2021"
 license = "GPL-3.0"
@@ -10,6 +11,13 @@ default-run = "watt-toolkit-app"
 [lib]
 name = "watt_toolkit_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 二进制内嵌 requireAdministrator 清单（写 hosts），测试二进制无法在普通终端执行；
+# 单元/集成测试都在 lib 与各 crate，bin 不参与 cargo test。
+[[bin]]
+name = "watt-toolkit-app"
+path = "src/main.rs"
+test = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -31,6 +39,7 @@ watt-config = { workspace = true }
 watt-cloud = { workspace = true }
 # rustls crypto provider 需手动安装（全局唯一入口，见 lib.rs run()）
 rustls = { workspace = true }
+tauri-plugin-single-instance = "2.5.4"
 
 [features]
 default = []

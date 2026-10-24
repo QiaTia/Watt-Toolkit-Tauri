@@ -58,8 +58,11 @@ const router = createRouter({
 let landingResolved = false;
 router.beforeEach(async (to) => {
   if (landingResolved) return;
-  landingResolved = true;
-  if (to.path !== '/') return;
+  // 首次导航不是首页（deep link 等）：置位并放手，避免之后点「首页」被弹到加速页
+  if (to.path !== '/') {
+    landingResolved = true;
+    return;
+  }
   let running = false;
   try {
     const proxy = useProxyStore();
@@ -69,6 +72,7 @@ router.beforeEach(async (to) => {
     // 状态获取失败：按未加速处理，落入加速页
     running = false;
   }
+  landingResolved = true;
   if (!running) return '/accelerator';
 });
 

@@ -85,8 +85,10 @@ const engineTagColor = computed(() => {
 
 onMounted(() => {
   void appStore.load();
-  // ensureLoaded 幂等去重：子页面可能更早发起加载
-  void settings.ensureLoaded();
+  // ensureLoaded 幂等去重：子页面可能更早发起加载。
+  // load 失败会 reject（不标记 loaded，避免默认值覆盖磁盘配置），此处吞掉：
+  // 错误已写入 store.loadError，由设置页展示。
+  void settings.ensureLoaded().catch(() => {});
   void cert.refresh();
   void proxy.refreshState();
 });

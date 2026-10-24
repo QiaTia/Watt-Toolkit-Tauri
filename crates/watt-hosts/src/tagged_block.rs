@@ -176,11 +176,10 @@ pub fn handle_hosts(
         }
 
         // —— 普通行基础校验 ——
-        let result = if split.len() < 2 {
-            LineResult::WriteAsIs
-        } else if split[0].starts_with('#') {
-            LineResult::WriteAsIs
-        } else if split.len() > 2 && !split[2].starts_with('#') {
+        let result = if split.len() < 2
+            || split[0].starts_with('#')
+            || (split.len() > 2 && !split[2].starts_with('#'))
+        {
             LineResult::WriteAsIs
         } else if is_v1_format(&split) {
             LineResult::Skip

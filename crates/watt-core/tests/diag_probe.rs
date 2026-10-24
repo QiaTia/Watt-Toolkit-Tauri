@@ -16,6 +16,7 @@ fn tls_target(host: &str, override_ip: Option<&str>) -> OutboundTarget {
         tls: true,
         tls_sni: None,
         tls_ignore_name_mismatch: false,
+        tls_skip_verify: false,
         override_ip: override_ip.map(|s| s.parse().unwrap()),
         forward_destination: None,
         timeout_ms: None,
@@ -58,9 +59,9 @@ async fn diag_github_probe_sort() {
     let first = addrs[0].ip();
     let first_rtt = cache.get("github.com", first).expect("首位候选应有探测结果");
     for a in &addrs[1..] {
-        match cache.get("github.com", a.ip()) {
-            Some(rtt) => assert!(rtt >= first_rtt, "已探测候选未按 RTT 升序: {first_rtt}ms > {rtt}ms"),
-            None => {} // 未探测沉底（在已探测之后）
+        // None = 未探测，按规则沉底（在已探测之后）
+        if let Some(rtt) = cache.get("github.com", a.ip()) {
+            assert!(rtt >= first_rtt, "已探测候选未按 RTT 升序: {first_rtt}ms > {rtt}ms");
         }
     }
     println!("[diag] sort_addrs 首位 = {first} ({first_rtt}ms)，未探测沉底 ✓");
@@ -107,10 +108,9 @@ async fn diag_probe_pass_concurrent_16_hosts() {
     ];
     let rules: Vec<watt_config::DomainRule> = hosts
         .iter()
-        .map(|h| {
-            let mut r = watt_config::DomainRule::default();
-            r.match_domain_names = vec![h.to_string()];
-            r
+        .map(|h| watt_config::DomainRule {
+            match_domain_names: vec![h.to_string()],
+            ..Default::default()
         })
         .collect();
     let targets = probe_targets_from_rules(&rules);

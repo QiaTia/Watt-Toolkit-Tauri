@@ -58,28 +58,43 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     return ids;
   });
 
-  /** 加载目录（force=true 时强制走云端刷新） */
-  async function load(force = false, fallbackIds: string[] = []): Promise<void> {
-    if (loading.value) return;
-    loading.value = true;
-    error.value = null;
+  /** 进行中的目录加载（并发去重） */
+  let inflightLoad: Promise<void> | null = null;
+
+  /** 加载目录（force=true 时强制走云端刷新；已有目录则直接复用） */
+  async function load(force = false): Promise<void> {
+    if (!force && catalog.value !== null) return;
+    if (inflightLoad) return inflightLoad;
+    inflightLoad = (async () => {
+      loading.value = true;
+      error.value = null;
+      try {
+        const dto = force ? await accelerateRefresh() : await accelerateGetProjects();
+        catalog.value = dto.catalog;
+        source.value = dto.source;
+        const settingsStore = useSettingsStore();
+        initChecked(
+          settingsStore.settings.enabled_accelerate_ids,
+          settingsStore.settings.enabled_accelerate_ids_initialized,
+        );
+      } catch (e) {
+        error.value = e instanceof Error ? e.message : String(e);
+      } finally {
+        loading.value = false;
+      }
+    })();
     try {
-      const dto = force ? await accelerateRefresh() : await accelerateGetProjects();
-      catalog.value = dto.catalog;
-      source.value = dto.source;
-      initChecked(fallbackIds);
-    } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      await inflightLoad;
     } finally {
-      loading.value = false;
+      inflightLoad = null;
     }
   }
 
-  /** 初始化勾选：持久化集合非空则用它，否则回退云端默认值 */
-  function initChecked(persistedIds: string[]): void {
+  /** 初始化勾选：已初始化则完全采用持久化集合（含空集），首次运行才回退云端默认值 */
+  function initChecked(persistedIds: string[], initialized: boolean): void {
     const valid = new Set(allProjectIds.value);
     const persisted = persistedIds.filter((id) => valid.has(id));
-    checkedIds.value = new Set(persisted.length > 0 ? persisted : defaultCheckedIds.value);
+    checkedIds.value = new Set(initialized ? persisted : defaultCheckedIds.value);
   }
 
   /** 切换单个项目勾选（含子项目联动：父勾选带动未勾选子项，父取消则整树取消） */

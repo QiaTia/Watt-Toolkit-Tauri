@@ -3,6 +3,7 @@ import { computed, onMounted } from 'vue';
 import { useProxyStore } from '@/stores/proxy';
 import { useAppStore } from '@/stores/app';
 import { useCertStore } from '@/stores/cert';
+import { formatBytes } from '@/utils/format';
 
 const proxy = useProxyStore();
 const app = useAppStore();
@@ -12,13 +13,6 @@ onMounted(() => {
   void proxy.refreshState();
   void cert.refresh();
 });
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
 
 const certHealthy = computed(() => cert.status !== null && !cert.status.expired);
 

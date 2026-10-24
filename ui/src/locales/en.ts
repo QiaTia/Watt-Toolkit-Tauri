@@ -100,6 +100,7 @@ const en: Schema = {
       failed: 'Probing incomplete; racing in default order',
       partial: 'Probing truncated by budget; using partial results',
     },
+    noCheckedHint: 'Select at least one acceleration project before starting.',
   },
   settings: {
     generalTitle: 'General',
@@ -160,6 +161,11 @@ const en: Schema = {
     certHint: 'Installing to the system trust store is required for HTTPS boost (MITM): Windows shows a UAC prompt, macOS shows a system trust confirmation (enter your login password). You can also export the PEM and import it manually.',
     elevateMacHint: 'On macOS, installing the root certificate shows a one-time system trust confirmation (enter your login password). It applies to the current user - no administrator password needed.',
     elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
+    runningLockedHint: 'Acceleration is running; proxy mode and ports are locked. Stop acceleration before changing them.',
+    certInstalled: 'Root certificate installed and trusted.',
+    certInstallVerifyFailed: 'The install command ran but verification failed. Check the system trust settings or export the PEM and install it manually.',
+    certUninstalled: 'Root certificate trust removed.',
+    certRegenerated: 'CA regenerated and old trust cleaned up. Reinstall the root certificate before enabling HTTPS acceleration.',
   },
   pool: {
     summary: '{hosts} domains, {ips} IPs',
@@ -217,6 +223,7 @@ const en: Schema = {
     remove: 'Delete',
     removeConfirm: 'Delete the IP pool of {host}? It falls back to built-in backups and system DNS.',
     removeIp: 'Remove',
+    removeIpConfirm: 'Remove {ip}?',
     unreachable: 'Unreachable',
     notProbed: 'Not probed',
     rtt: '{ms} ms',
