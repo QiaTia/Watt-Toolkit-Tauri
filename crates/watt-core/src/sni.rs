@@ -77,7 +77,15 @@ pub fn outbound_tls_connector(
 }
 
 /// 系统根证书存储
+///
+/// 进程内缓存：旧实现每次建立 TLS 连接都重新读取系统根证书（macOS 上还要走
+/// TrustSettings API），既拖慢握手又会在失败时按连接刷屏日志。
 pub fn root_store() -> rustls::RootCertStore {
+    static ROOTS: std::sync::OnceLock<rustls::RootCertStore> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(load_root_store).clone()
+}
+
+fn load_root_store() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     match rustls_native_certs::load_native_certs() {
         Ok(certs) => {
@@ -89,10 +97,33 @@ pub fn root_store() -> rustls::RootCertStore {
             tracing::warn!("系统根证书加载失败: {e}");
         }
     }
+    #[cfg(target_os = "macos")]
+    if roots.is_empty() {
+        // macOS 26+ 上 TrustSettings 的部分域会返回 errSecItemNotFound(-25300)，
+        // rustls-native-certs 0.7 对任一域的错误都整体失败 → 根存储为空，所有
+        // 标准出站 TLS 校验必然 UnknownIssuer。退回 macOS 自带的系统 CA 包。
+        let loaded = load_macos_bundle(&mut roots);
+        tracing::warn!("系统根证书 API 不可用，改用 /etc/ssl/cert.pem（{loaded} 个根证书）");
+    }
     if roots.is_empty() {
         tracing::warn!("系统根证书存储为空");
     }
     roots
+}
+
+#[cfg(target_os = "macos")]
+fn load_macos_bundle(roots: &mut rustls::RootCertStore) -> usize {
+    const BUNDLE: &str = "/etc/ssl/cert.pem";
+    let Ok(pem) = std::fs::read(BUNDLE) else {
+        return 0;
+    };
+    let mut loaded = 0;
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()).filter_map(Result::ok) {
+        if roots.add(cert).is_ok() {
+            loaded += 1;
+        }
+    }
+    loaded
 }
 
 /// 目标 ServerName（支持 DNS 名称；IP 直连用 IP 类型）

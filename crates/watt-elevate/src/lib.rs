@@ -372,10 +372,11 @@ mod tests {
 
     #[test]
     fn run_as_admin_rejects_non_whitelisted_before_spawn() {
-        // 非 macOS 上返回 Unsupported；白名单校验先于平台分支（macOS 上同样先校验）
-        assert_eq!(
-            run_as_admin("rm", &["-rf", "/"]),
-            Err(ElevateError::Unsupported)
-        );
+        // macOS 上白名单校验先于平台分支，返回 NotAllowed；其它平台无提权实现
+        let err = run_as_admin("rm", &["-rf", "/"]).unwrap_err();
+        #[cfg(target_os = "macos")]
+        assert_eq!(err, ElevateError::NotAllowed("rm".into()));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(err, ElevateError::Unsupported);
     }
 }

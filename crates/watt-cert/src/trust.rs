@@ -86,6 +86,19 @@ fn trust_dump_contains(dump: &str, sha1: &str) -> bool {
     !needle.is_empty() && normalize_hex(dump).contains(&needle)
 }
 
+/// trust-settings-export 导出的 plist 中是否包含指定 SHA-1
+///
+/// 新版 macOS 的 `dump-trust-settings` 只列证书名、不输出指纹，无法精确匹配；
+/// 而 `trust-settings-export` 的 trustList 直接以 SHA-1（大写）为键。二进制 plist
+/// 中的键仍是 ASCII 字节，按字节搜索即可，无需解析 plist。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn trust_export_contains(data: &[u8], sha1: &str) -> bool {
+    !sha1.is_empty()
+        && String::from_utf8_lossy(data)
+            .to_ascii_lowercase()
+            .contains(sha1)
+}
+
 /// 自动安装失败时的手动兜底指引（含可直接粘贴的命令）
 ///
 /// macOS 的信任设置写入受 Authorization Services 保护，自动化通道被系统拒绝时
@@ -96,7 +109,9 @@ fn manual_install_hint(cert_path: &str, cause: &str) -> String {
         "{cause}\nmacOS 拒绝代为授权「证书信任设置」，请任选一种方式手动完成：\n\
          ① 打开「钥匙串访问」→ 拖入 {cert_path} → 双击该证书 → 展开「信任」→ \
          「使用此证书时」选「始终信任」；\n\
-         ② 或在「终端」执行：sudo security add-trusted-cert -d -r trustRoot \"{cert_path}\""
+         ② 或在「终端」执行（当前用户，无需 sudo；-k 不可省略）：\n\
+         security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db \"{cert_path}\"\n\
+         ③ 需要整机生效时：sudo security add-trusted-cert -d -r trustRoot \"{cert_path}\""
     )
 }
 
@@ -319,10 +334,11 @@ pub mod platform {
 pub mod platform {
     use super::{
         is_fatal_security_error, is_no_interaction_error, manual_install_hint, sha1_hex,
-        trust_dump_contains, TrustError, CA_SUBJECT_CN,
+        trust_dump_contains, trust_export_contains, TrustError, CA_SUBJECT_CN,
     };
     use std::path::Path;
     use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// 系统钥匙串（admin 域信任设置的目标）
     ///
@@ -359,6 +375,31 @@ pub mod platform {
         format!("{home}/Library/Keychains/login.keychain-db")
     }
 
+    /// 导出指定信任域的 trust settings（二进制 plist 原样字节）
+    ///
+    /// 读取失败返回 None，由调用方回退到 `dump-trust-settings` 解析。
+    fn export_trust_settings(admin: bool) -> Option<Vec<u8>> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!(
+            "watt-trust-{}-{seq}-{}.plist",
+            std::process::id(),
+            if admin { "admin" } else { "user" }
+        ));
+        let file_str = file.to_string_lossy().to_string();
+        let mut args: Vec<&str> = vec!["trust-settings-export"];
+        if admin {
+            args.push("-d");
+        }
+        args.push(&file_str);
+        let ok = security_output(&args)
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let data = if ok { std::fs::read(&file).ok() } else { None };
+        let _ = std::fs::remove_file(&file);
+        data
+    }
+
     /// 安装根证书信任（分级：用户域免提权 → 系统域直试 → 系统域提权）
     ///
     /// ① **用户域**（`add-trusted-cert` 不带 `-d`）：不需要 root，只影响当前用户，
@@ -367,23 +408,39 @@ pub mod platform {
     /// ② **系统域直试**（`-d`）：进程本身已被提权时免弹窗。
     /// ③ **系统域提权**：osascript 弹一次管理员密码框。
     ///
-    /// 两个必须避开的坑：
+    /// 三个必须避开的坑：
+    /// - 用户域必须显式给 `-k <登录钥匙串>`。macOS 26+ 实测不带 `-k` 时
+    ///   `security add-trusted-cert` **静默退出 0 且不写任何东西**（既不导入钥匙串
+    ///   也不写 trust settings），上层据退出码判定成功 → 二次校验必然失败。
     /// - `-d` 与 `-k <System.keychain>` 不能同时给。`-d` 的默认目标**就是**
     ///   System.keychain，多给 `-k` 在部分 macOS 版本上会让域判定退化，最终在
     ///   `SecTrustSettingsSetTrustSettings` 报 0:290。故系统域只用 `-d`。
     /// - 用户域若报「no user interaction was possible」，说明 Authorization
     ///   交互通道不可用，第 ③ 步走的是同一套机制、必然失败 —— 此时**不弹框**，
     ///   直接回可复制的手动命令，避免用户白输一次管理员密码。
+    ///
+    /// 每一级成功后都做一次真实校验：退出码 0 不代表信任已生效。
     pub fn install_root_cert(cert_pem_path: &Path) -> Result<(), TrustError> {
         let path = cert_pem_path.to_string_lossy().to_string();
         let mut notes: Vec<String> = Vec::new();
 
         // ① 用户域（免提权）
-        let user_args: [&str; 4] = ["add-trusted-cert", "-r", "trustRoot", &path];
+        let keychain = user_keychain();
+        let user_args: [&str; 6] = [
+            "add-trusted-cert",
+            "-r",
+            "trustRoot",
+            "-k",
+            &keychain,
+            &path,
+        ];
         match security_output(&user_args) {
             Ok(out) if out.status.success() => {
-                tracing::info!("根证书已装入用户信任域（免提权）");
-                return Ok(());
+                if is_root_cert_installed(cert_pem_path) {
+                    tracing::info!("根证书已装入用户信任域（免提权, keychain={keychain}）");
+                    return Ok(());
+                }
+                notes.push("用户域: 命令成功但证书/信任校验未通过".into());
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -407,8 +464,11 @@ pub mod platform {
         let sys_args: [&str; 5] = ["add-trusted-cert", "-d", "-r", "trustRoot", &path];
         match security_output(&sys_args) {
             Ok(out) if out.status.success() => {
-                tracing::info!("根证书已装入系统信任域（进程已有权限）");
-                return Ok(());
+                if is_root_cert_installed(cert_pem_path) {
+                    tracing::info!("根证书已装入系统信任域（进程已有权限）");
+                    return Ok(());
+                }
+                notes.push("系统域: 命令成功但证书/信任校验未通过".into());
             }
             Ok(out) => notes.push(format!(
                 "系统域: {}",
@@ -423,7 +483,14 @@ pub mod platform {
             &sys_args,
             Some(watt_elevate::ElevatePurpose::InstallCert.prompt()),
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) if is_root_cert_installed(cert_pem_path) => Ok(()),
+            Ok(_) => Err(TrustError::Trust(manual_install_hint(
+                &path,
+                &format!(
+                    "提权安装命令已执行，但信任校验仍未通过；{}",
+                    notes.join(" / ")
+                ),
+            ))),
             Err(watt_elevate::ElevateError::Cancelled) => {
                 Err(TrustError::Elevation("用户取消了管理员授权".into()))
             }
@@ -546,14 +613,33 @@ pub mod platform {
 
     /// 在用户域 / admin 域中查找该指纹的信任设置
     ///
-    /// `dump-trust-settings -d` 对普通用户会因权限被拒 —— 那只是这一路读不到，
-    /// 不影响用户域结论。
+    /// 优先用 `trust-settings-export`：它把 trustList 按 SHA-1 哈希导出，可精确匹配；
+    /// 而 macOS 26+ 的 `dump-trust-settings` 只列证书名（如 `Cert 0: Watt Toolkit`），
+    /// 不含指纹，继续依赖它会把校验退化成「同名证书存在即已信任」。
     ///
-    /// 三态而非布尔的理由：`dump-trust-settings` 的输出格式跨版本不一致。只有在
-    /// 「输出里确实有 SHA 字段却没命中」或「明确没有信任设置」时才敢判 Absent；
-    /// 格式不含指纹时只能 Unknown —— 盲目判 Absent 会让安装流程陷入死循环
-    /// （装成功 → 检测判未装 → 再装 → 再弹密码框）。
+    /// `dump-trust-settings -d` / `trust-settings-export -d` 在部分版本上对普通用户
+    /// 会因权限被拒 —— 那只是这一路读不到，不影响用户域结论。
+    ///
+    /// 三态而非布尔的理由：输出格式跨版本不一致。只有在完整读到某个域、且确认
+    /// 未命中时才敢判 Absent；读不全时只能 Unknown —— 盲目判 Absent 会让安装流程
+    /// 陷入死循环（装成功 → 检测判未装 → 再装 → 再弹密码框）。
     fn trust_settings_lookup(sha1: &str) -> TrustLookup {
+        let user_export = export_trust_settings(false);
+        let admin_export = export_trust_settings(true);
+        if user_export
+            .as_ref()
+            .map_or(false, |d| trust_export_contains(d, sha1))
+            || admin_export
+                .as_ref()
+                .map_or(false, |d| trust_export_contains(d, sha1))
+        {
+            return TrustLookup::Found;
+        }
+        // 两个域都完整读到 → 未命中即明确不存在（导出是该域信任设置的完整快照）
+        if user_export.is_some() && admin_export.is_some() {
+            return TrustLookup::Absent;
+        }
+
         let mut read_any = false;
         let mut saw_entries = false;
         let mut saw_hash_field = false;
@@ -765,11 +851,34 @@ mod tests {
     }
 
     #[test]
+    fn trust_export_matches_hash_key() {
+        let sha1 = "5ccba6ca76d48ca187d3272e291f098494d014f1";
+        // trust-settings-export 的二进制 plist：trustList 以大写 SHA-1 为键
+        let plist = format!(
+            "bplist00...trustVersiontrustList{}{}...",
+            sha1.to_ascii_uppercase(),
+            "Watt Toolkit"
+        );
+        assert!(trust_export_contains(plist.as_bytes(), sha1));
+        // 其它指纹不得误命中
+        assert!(!trust_export_contains(
+            plist.as_bytes(),
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+        ));
+        // 空指纹绝不能命中
+        assert!(!trust_export_contains(plist.as_bytes(), ""));
+    }
+
+    #[test]
     fn manual_hint_is_actionable() {
         let hint = manual_install_hint("/tmp/watt-ca.pem", "用户域安装失败: boom");
         assert!(hint.contains("用户域安装失败: boom"));
         assert!(hint.contains("/tmp/watt-ca.pem"));
         // 必须给出可直接粘贴的命令与 GUI 路径
+        // 用户域命令必须带 -k：不带 -k 在 macOS 26+ 会静默无效
+        assert!(hint.contains(
+            "security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db"
+        ));
         assert!(hint.contains("sudo security add-trusted-cert -d -r trustRoot"));
         assert!(hint.contains("钥匙串访问"));
         assert!(hint.contains("始终信任"));

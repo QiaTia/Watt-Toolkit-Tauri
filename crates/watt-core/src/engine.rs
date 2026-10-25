@@ -556,7 +556,7 @@ impl ProxyEngine {
         // 覆盖变量。失败不阻断启动（终端覆盖是增强能力，核心加速不受影响）。
         if let Some(plan) = config.terminal_proxy.clone() {
             let backup_path = plan.backup_path.clone();
-            // 写注册表 + 广播环境变量变更，离开 tokio worker
+            // 写用户级环境变量（Windows 注册表 / Unix shell 启动文件），离开 tokio worker
             let result = tokio::task::spawn_blocking(move || crate::terminal_proxy::enable(&plan))
                 .await
                 .map_err(|e| format!("终端代理注入任务异常: {e}"))

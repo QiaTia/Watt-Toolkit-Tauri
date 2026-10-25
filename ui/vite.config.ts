@@ -34,7 +34,9 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
-    host: host || false,
+    // 必须显式绑 IPv4：devUrl 是 127.0.0.1，而 host:false 在 macOS 上会解析到
+    // ::1，WebView 连 IPv4 失败 → 白屏。
+    host: host || '127.0.0.1',
     hmr: host
       ? { protocol: 'ws', host, port: 5174 }
       : undefined,

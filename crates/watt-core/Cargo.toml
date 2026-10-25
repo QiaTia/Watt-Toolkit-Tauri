@@ -48,6 +48,9 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 watt-cloud = { workspace = true }

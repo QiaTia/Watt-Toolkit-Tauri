@@ -7,7 +7,7 @@ import { useProxyStore } from '@/stores/proxy';
 import { useCertStore } from '@/stores/cert';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
-import { isMacOS, isWindows } from '@/utils/platform';
+import { isMacOS } from '@/utils/platform';
 import type { ProxyMode } from '@/types/ipc';
 
 const settings = useSettingsStore();
@@ -20,8 +20,6 @@ const { message } = AntApp.useApp();
 
 /** macOS 提权提示（钥匙串写入弹管理员密码框） */
 const isMac = isMacOS();
-/** 终端代理注入目前仅 Windows 实现 */
-const windowsPlatform = isWindows();
 
 /** 语言选择器双向绑定（写 localStorage + 切 i18n locale） */
 const language = computed<LocaleCode>({
@@ -264,7 +262,7 @@ function formatTime(iso: string): string {
           {{ t('settings.runningLockedHint') }}
         </a-typography-paragraph>
 
-        <a-row v-if="windowsPlatform" :gutter="16">
+        <a-row :gutter="16">
           <a-col :xs="24" :md="16" :lg="12">
             <a-form-item :label="$t('settings.terminalProxy')">
               <a-switch
