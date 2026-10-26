@@ -11,7 +11,7 @@ use crate::stats::FlowStats;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
-use hyper::header::{HeaderMap, HeaderName, HeaderValue, HOST, USER_AGENT};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, HOST, USER_AGENT};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use std::sync::Arc;
 use std::time::Duration;
@@ -498,18 +498,7 @@ impl RelayContext {
             .authority()
             .map(|a| a.as_str().to_string())
             .unwrap_or_else(|| host.to_string());
-        let mut template_headers = HeaderMap::new();
-        template_headers.insert(
-            HOST,
-            HeaderValue::from_str(&outbound_authority).map_err(|e| e.to_string())?,
-        );
-        for (k, v) in parts.headers.iter() {
-            let name = k.as_str();
-            if k == HOST || is_hop_by_hop(name) {
-                continue;
-            }
-            template_headers.insert(k.clone(), v.clone());
-        }
+        let template_headers = build_outbound_headers(&parts.headers, &outbound_authority)?;
 
         // 统计上行
         self.stats.add_up(body.size_hint().exact().unwrap_or(0));
@@ -868,6 +857,10 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// (名, 值) 列表 → HeaderMap（脚本修改结果；无效头跳过并告警）
+///
+/// 用 `append` 而非 `insert`：`Set-Cookie` 天然是多值的，`insert` 会让后一条
+/// 覆盖前一条 —— 登录类响应常同时下发多个 cookie（session + csrf + waf token），
+/// 被合并掉一个就会出现「登录成功但刷新即掉登录」。
 fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
     let mut map = HeaderMap::new();
     for (k, v) in pairs {
@@ -876,7 +869,7 @@ fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
             HeaderValue::from_str(v),
         ) {
             (Ok(name), Ok(value)) => {
-                map.insert(name, value);
+                map.append(name, value);
             }
             _ => {
                 tracing::warn!("脚本修改的请求头无效，已跳过: {k}");
@@ -884,6 +877,71 @@ fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
         }
     }
     map
+}
+
+/// 构造出站请求头：`Host` 指向目标权威 + 透传原始头（跳过 hop-by-hop）。
+///
+/// 两条约束共同决定实现：
+///
+/// 1. **多值头不能用 `insert`**：HTTP/2 允许同一个头拆成多个字段
+///    （RFC 9113 §8.2.3），`insert` 会让后一段覆盖前一段。原先此处用 `insert`
+///    拷贝，使拆分后的 cookie 只剩最后一段 —— 典型症状是「加速后已登录站点
+///    变未登录 / 刷新就掉登录」。
+/// 2. **`Cookie` 必须合并成一条**：本链路出站恒为 HTTP/1.1（仅 `http1::handshake`），
+///    而 RFC 7540 §8.1.2.5 要求多条 Cookie 在交给非 h2 上下文前用 `"; "` 拼成
+///    单条，RFC 6265 §5.4 亦禁止客户端发出多于一个 `Cookie` 字段。若逐条透传，
+///    上游（Java Servlet `getHeader`、部分 WAF）只会读到第一条，仍会丢 cookie。
+///
+/// 其余头一律 `append` 保序保留。`Host` 只允许一个值，故单独 `insert`。
+fn build_outbound_headers(
+    src: &HeaderMap,
+    authority: &str,
+) -> Result<HeaderMap, String> {
+    let mut out = HeaderMap::new();
+    out.insert(
+        HOST,
+        HeaderValue::from_str(authority).map_err(|e| e.to_string())?,
+    );
+
+    // 拆分后的 cookie 段，按原顺序用 "; " 拼回单条
+    let mut cookie_parts: Vec<String> = Vec::new();
+    // 收到的 Cookie 字段数（>1 说明下游确实拆过段，用于验证 h2 拆包假设）
+    let mut cookie_fields = 0usize;
+
+    for (k, v) in src.iter() {
+        if k == HOST || is_hop_by_hop(k.as_str()) {
+            continue;
+        }
+        if *k == COOKIE {
+            cookie_fields += 1;
+            match v.to_str() {
+                Ok(s) => cookie_parts.push(s.to_string()),
+                // 非可见 ASCII 的 cookie 极罕见：退回逐条透传，宁可多一条也不丢
+                Err(_) => {
+                    out.append(k.clone(), v.clone());
+                }
+            }
+            continue;
+        }
+        out.append(k.clone(), v.clone());
+    }
+
+    if !cookie_parts.is_empty() {
+        let joined = cookie_parts.join("; ");
+        out.insert(
+            COOKIE,
+            HeaderValue::from_str(&joined).map_err(|e| e.to_string())?,
+        );
+        // 只在真的拆过段时记录，正常单条 Cookie 不产生噪音
+        if cookie_fields > 1 {
+            tracing::debug!(
+                "合并拆分 Cookie：{cookie_fields} 个字段 → 1 条（{} 字节），host={authority}",
+                joined.len()
+            );
+        }
+    }
+
+    Ok(out)
 }
 
 /// 受限 fetch 出站实现（Phase 4b）：脚本内 fetch 走应用出站链路（DNS/二级代理）。
@@ -1089,6 +1147,7 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "proxy-connection"
             | "te"
             | "trailer"
             | "transfer-encoding"
@@ -1204,5 +1263,95 @@ mod tests {
         let uri: Uri = "/p".parse().unwrap();
         let dest = resolve_destination("https", "a.com", uri, Some("http://mirror.org/x"));
         assert_eq!(dest.to_string(), "http://mirror.org/x/p");
+    }
+
+    /// 下游 h2 把 Cookie 拆成多个字段（RFC 9113 §8.2.3）时，出站必须：
+    /// ① 不丢任何一段（原先 `insert` 只留最后一段 → 掉登录）；
+    /// ② 按 RFC 7540 §8.1.2.5 用 `"; "` 合并成**单条**，因为出站是 HTTP/1.1，
+    ///    逐条透传会让只读第一条 `Cookie` 的服务端丢值。
+    #[test]
+    fn test_outbound_headers_merge_split_cookie_into_single_field() {
+        let mut src = HeaderMap::new();
+        src.append("cookie", HeaderValue::from_static("figma.sid=aaa"));
+        src.append("cookie", HeaderValue::from_static("figma.csrf=bbb"));
+        src.append("accept", HeaderValue::from_static("*/*"));
+
+        let out = build_outbound_headers(&src, "www.figma.com").unwrap();
+        let cookies: Vec<&str> = out
+            .get_all(COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["figma.sid=aaa; figma.csrf=bbb"],
+            "必须合并为单条 Cookie（顺序保持、值不丢）"
+        );
+        assert_eq!(out.get(HOST).unwrap(), "www.figma.com");
+        assert_eq!(out.get("accept").unwrap(), "*/*");
+    }
+
+    /// 单条 Cookie 原样保留，不应被加上分隔符或改写
+    #[test]
+    fn test_outbound_headers_single_cookie_untouched() {
+        let mut src = HeaderMap::new();
+        src.insert(COOKIE, HeaderValue::from_static("a=1; b=2"));
+
+        let out = build_outbound_headers(&src, "x.com").unwrap();
+        let cookies: Vec<&str> = out
+            .get_all(COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1; b=2"]);
+    }
+
+    /// 多值非 Cookie 头仍需逐条保留（如 `accept-language` 的等价多值），
+    /// 合并规则只作用于 `Cookie`。
+    #[test]
+    fn test_outbound_headers_other_multi_value_kept_apart() {
+        let mut src = HeaderMap::new();
+        src.append("x-trace", HeaderValue::from_static("1"));
+        src.append("x-trace", HeaderValue::from_static("2"));
+
+        let out = build_outbound_headers(&src, "x.com").unwrap();
+        let traces: Vec<&str> = out
+            .get_all("x-trace")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(traces, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_outbound_headers_host_and_hop_by_hop() {
+        let mut src = HeaderMap::new();
+        src.insert(HOST, HeaderValue::from_static("origin.example"));
+        src.insert("connection", HeaderValue::from_static("keep-alive"));
+        src.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        src.insert("x-custom", HeaderValue::from_static("1"));
+
+        let out = build_outbound_headers(&src, "target.example:443").unwrap();
+        assert_eq!(out.get(HOST).unwrap(), "target.example:443");
+        assert!(out.get("connection").is_none());
+        assert!(out.get("transfer-encoding").is_none());
+        assert_eq!(out.get("x-custom").unwrap(), "1");
+    }
+
+    /// 登录响应常一次下发多个 Set-Cookie（session / csrf / waf token），
+    /// 快照还原也必须 append。
+    #[test]
+    fn test_headermap_from_pairs_keeps_multi_set_cookie() {
+        let pairs = vec![
+            ("set-cookie".to_string(), "a=1; Path=/".to_string()),
+            ("set-cookie".to_string(), "b=2; Path=/".to_string()),
+        ];
+        let map = headermap_from_pairs(&pairs);
+        let values: Vec<&str> = map
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["a=1; Path=/", "b=2; Path=/"]);
     }
 }
