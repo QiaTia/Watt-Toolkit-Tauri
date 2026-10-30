@@ -70,6 +70,12 @@ impl LeafCertCache {
 }
 
 /// rustls ResolvesServerCert：握手回调内按 SNI 同步签发（DashMap 缓存保证热路径 O(1)）
+///
+/// 缓存上限 [`MAX_SYNC_CACHE`]：SNI 由客户端控制，本机任意进程（或暴露到局域网时
+/// 的远端）都可用随机域名撑大缓存。超限时整体清空而非逐条淘汰——证书重签成本
+/// 很低，宁可偶发重签也不能让内存无界增长。
+const MAX_SYNC_CACHE: usize = 4096;
+
 #[derive(Debug)]
 pub struct SyncLeafCertResolver {
     ca: Arc<CaCertificate>,
@@ -92,6 +98,9 @@ impl SyncLeafCertResolver {
         }
         let leaf = create_leaf(&self.ca, domain, self.not_after).ok()?;
         let key = build_certified_key(leaf)?;
+        if self.cache.len() >= MAX_SYNC_CACHE {
+            self.cache.clear();
+        }
         self.cache.insert(domain.to_string(), key.clone());
         Some(key)
     }

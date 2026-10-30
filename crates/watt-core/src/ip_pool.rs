@@ -275,26 +275,54 @@ pub fn load_from(path: &Path) {
 }
 
 /// 过滤明显不可用的 IP（回环 / 私有 / 链路本地 / 未指定 / 组播 / 文件用途 / v6 ULA）
+///
+/// 该函数同时是本地 XHR 桥的 SSRF 闸门（`local_domain::handle_xhr`），因此除
+/// `IpAddr` 标准库判定外，还覆盖以下容易漏网的保留段：
+/// - `0.0.0.0/8`（本网络）、`100.64.0.0/10`（CGNAT / 运营商内网）、
+///   `192.0.0.0/24`（IETF 协议分配）、`198.18.0.0/15`（基准测试）、`240.0.0.0/4`（保留）
+/// - IPv4-mapped IPv6（`::ffff:127.0.0.1` 等）必须先还原为 IPv4 再判定，
+///   否则 `::ffff:169.254.169.254` 可绕过回环/链路本地检查访问云元数据
 pub fn is_usable_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_documentation())
-        }
+        IpAddr::V4(v4) => is_usable_v4(*v4),
         IpAddr::V6(v6) => {
-            let seg = v6.segments()[0];
+            // IPv4-mapped / IPv4-compatible：按内嵌 IPv4 判定，防绕过
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_usable_v4(v4);
+            }
+            let seg = v6.segments();
+            // IPv6 转换/隧道前缀：可承载任意 IPv4（含云元数据 169.254.169.254），
+            // 不能仅凭「IPv6 公网段」放行。
+            let transition = (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 64:ff9b::/96
+                || seg[0] == 0x2002 // 6to4 2002::/16
+                || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001::/32
+                || seg[..6] == [0, 0, 0, 0, 0, 0]; // IPv4-compatible ::/96（已废弃）
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (seg & 0xfe00) == 0xfc00 // fc00::/7 唯一本地
-                || (seg & 0xffc0) == 0xfe80) // fe80::/10 链路本地
+                || transition
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 站点本地（已废弃）
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 文档
         }
     }
+}
+
+fn is_usable_v4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    !(v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || octets[0] == 0 // 0.0.0.0/8
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18) // 198.18.0.0/15 基准测试
+        || octets[0] >= 240) // 240.0.0.0/4 保留（含广播）
 }
 
 /// 由域名规则推导需要刷新的 host 列表（含通配基域，去重）。
@@ -471,16 +499,13 @@ async fn refresh_one(
     }
 }
 
-/// 解析器来源描述（用于 UI 展示「IP 来自哪个 DNS」）
+/// 解析器来源描述（用于 UI 展示「IP 来自哪个 DNS」）。
+/// 按实际生效后端展示：DoH 配置失效会回退，不能只信 settings。
 fn describe_resolver(resolver: &watt_dns::DnsResolver) -> String {
-    let c = resolver.config();
-    if c.use_doh {
-        let url = c.custom_doh_address.clone().unwrap_or_default();
-        format!("DoH {url}")
-    } else if let Some(master) = c.master_dns.as_deref().filter(|s| !s.is_empty()) {
-        format!("DNS {master}")
-    } else {
-        "系统 DNS".to_string()
+    match resolver.backend() {
+        watt_dns::DnsBackend::Doh(url) => format!("DoH {url}"),
+        watt_dns::DnsBackend::Udp(ip) => format!("DNS {ip}"),
+        watt_dns::DnsBackend::System => "系统 DNS".to_string(),
     }
 }
 
@@ -547,6 +572,37 @@ mod tests {
         assert!(!is_usable_ip(&ip("0.0.0.0")));
         assert!(!is_usable_ip(&ip("fe80::1")));
         assert!(!is_usable_ip(&ip("fd00::1")));
+    }
+
+    /// SSRF 闸门回归：常见保留段与 IPv4-mapped IPv6 绕过
+    #[test]
+    fn usable_ip_filters_reserved_and_mapped() {
+        for s in [
+            "0.1.2.3",        // 0.0.0.0/8
+            "100.64.0.1",     // CGNAT
+            "100.127.255.254", // CGNAT 上界
+            "192.0.0.8",      // IETF 协议分配
+            "198.18.0.1",     // 基准测试
+            "198.19.255.254", // 基准测试上界
+            "240.0.0.1",      // 保留
+            "255.255.255.254",
+            "::ffff:127.0.0.1",       // IPv4-mapped 回环
+            "::ffff:169.254.169.254", // IPv4-mapped 链路本地（云元数据）
+            "::ffff:10.0.0.1",
+            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254
+            "2002:a9fe:a9fe::1",  // 6to4 → 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+            "::a9fe:a9fe",        // IPv4-compatible ::/96
+            "fec0::1",            // 站点本地
+            "2001:db8::1",        // 文档段
+        ] {
+            assert!(!is_usable_ip(&ip(s)), "{s} 应判定为不可用");
+        }
+        // 边界外的公网地址仍可用
+        assert!(is_usable_ip(&ip("100.63.255.254"))); // CGNAT 前一段
+        assert!(is_usable_ip(&ip("100.128.0.1"))); // CGNAT 后一段
+        assert!(is_usable_ip(&ip("198.20.0.1")));
+        assert!(is_usable_ip(&ip("2606:4700::1111")));
     }
 
     #[test]

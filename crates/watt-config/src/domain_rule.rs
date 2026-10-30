@@ -185,16 +185,49 @@ pub fn pattern_matches(pattern: &str, host: &str, url: &str) -> bool {
 /// URL 模式匹配：`;` 分隔多模式，任意模式命中即匹配；`*` 通配段、`?` 通配单字符。
 /// 对齐 C# DomainPattern：正则未锚定，匹配完整 URL 的任意位置。
 pub fn url_pattern_matches(pattern: &str, url: &str) -> bool {
-    match regex::RegexBuilder::new(&url_patterns_to_regex(pattern))
+    match compiled_url_pattern(pattern) {
+        Some(re) => re.is_match(url),
+        None => false,
+    }
+}
+
+/// URL 通配模式缓存上限（云端规则有限；超限整体清空，避免动态输入撑爆内存）
+const MAX_URL_PATTERN_CACHE: usize = 2048;
+
+fn url_pattern_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<regex::Regex>>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<regex::Regex>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 编译并缓存 URL 通配模式对应的正则（失败也缓存为 None，避免每请求重复编译/告警）
+fn compiled_url_pattern(pattern: &str) -> Option<regex::Regex> {
+    let mut cache = url_pattern_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(pattern) {
+        return cached.clone();
+    }
+
+    let regex_str = url_patterns_to_regex(pattern);
+    let compiled = match regex::RegexBuilder::new(&regex_str)
         .case_insensitive(true)
         .build()
     {
-        Ok(re) => re.is_match(url),
+        Ok(re) => Some(re),
         Err(e) => {
             tracing::warn!("URL 模式无效（{pattern}）：{e}");
-            false
+            None
         }
+    };
+
+    if cache.len() >= MAX_URL_PATTERN_CACHE {
+        cache.clear();
     }
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
 }
 
 /// `;` 分隔的通配模式 → 正则串（对齐 C# DomainPattern：转义后 `*`→`.*`、`?`→`.`）
@@ -370,5 +403,15 @@ mod tests {
         assert!(!regex::Regex::new(&url_patterns_to_regex(""))
             .unwrap()
             .is_match("https://a.com/"));
+    }
+
+    #[test]
+    fn url_pattern_cache_matches_consistently() {
+        let pattern = "https://cache-test.example/*/api";
+        // 重复命中缓存（第二次起走缓存路径），行为必须一致
+        assert!(url_pattern_matches(pattern, "https://cache-test.example/v1/api"));
+        assert!(!url_pattern_matches(pattern, "https://other.example/v1/api"));
+        assert!(url_pattern_matches(pattern, "https://cache-test.example/v2/api"));
+        assert!(!url_pattern_matches("", "https://a.com/"));
     }
 }

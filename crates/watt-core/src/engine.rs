@@ -221,9 +221,11 @@ impl ProxyEngine {
 
         // —— 2. 系统代理 / PAC 残留（仅当指向本引擎端口）——
         let (enabled, server, pac_url) = crate::system_proxy::get_system_proxy_status();
+        let mut proxy_owned = false;
         if enabled {
             if let Some(addr) = server.as_deref() {
                 if is_own_proxy_addr(addr, proxy_ports) {
+                    proxy_owned = true;
                     match crate::system_proxy::set_system_proxy(false, "", 0) {
                         Ok(()) => cleaned.push(format!("system_proxy({addr})")),
                         Err(e) => tracing::warn!("清理系统代理残留失败: {e}"),
@@ -233,11 +235,17 @@ impl ProxyEngine {
         }
         if let Some(url) = pac_url.as_deref() {
             if !url.is_empty() && is_own_proxy_addr(url, proxy_ports) {
+                proxy_owned = true;
                 match crate::system_proxy::set_system_pac(false, "") {
                     Ok(()) => cleaned.push(format!("pac({url})")),
                     Err(e) => tracing::warn!("清理 PAC 残留失败: {e}"),
                 }
             }
+        }
+        if !proxy_owned {
+            // 当前代理已不归本引擎所有：遗留快照只会让下次 stop 用旧值覆盖
+            // 用户后来手动修改的代理，直接丢弃。
+            crate::system_proxy::discard_stale_proxy_backup();
         }
 
         cleaned
@@ -332,6 +340,24 @@ impl ProxyEngine {
             tracing::info!("启动前清理残留代理状态: {}", cleaned.join(", "));
         }
 
+        // 域名型 DoH 需要在启动时做一次引导解析（getaddrinfo，最长 3s）。
+        // 必须在改系统代理**之前**完成：否则代理已指向未监听的端口，用户会短暂断网。
+        // 放到 spawn_blocking，避免占用 tokio worker。
+        let dns_config = config.dns.clone();
+        let dns = match tokio::task::spawn_blocking(move || {
+            watt_dns::DnsResolver::with_config(dns_config)
+        })
+        .await
+        {
+            Ok(resolver) => Arc::new(resolver),
+            Err(e) => {
+                let msg = format!("DNS 初始化任务异常: {e}");
+                self.state.send_replace(EngineState::Error(msg.clone()));
+                return Err(EngineError::Other(msg));
+            }
+        };
+        tracing::info!(backend = ?dns.backend(), "DNS 解析器已初始化");
+
         // —— 1. 模式前置（对齐 C# switch(proxyMode)）——
         // 系统代理/PAC 地址回退：0.0.0.0 → 127.0.0.1（注册表/PAC 不接受 unspecified）
         let proxy_ip = if config.listen_ip.is_unspecified() {
@@ -360,6 +386,15 @@ impl ProxyEngine {
                 .map_err(|e| e.to_string())
                 .and_then(|r| r);
                 if let Err(e) = result {
+                    // 部分写入（例如 ProxyEnable 已置 1、ProxyServer 写失败）同样要撤销：
+                    // 否则系统可能指向一个未监听的地址。只有快照已建立时才回滚——
+                    // capture 失败时尚未写入任何值，回滚反而会关掉用户原有代理。
+                    if crate::system_proxy::should_rollback_proxy_on_failure() {
+                        let _ = tokio::task::spawn_blocking(|| {
+                            crate::system_proxy::set_system_proxy(false, "", 0)
+                        })
+                        .await;
+                    }
                     let msg = format!("设置系统代理失败: {e}");
                     self.state.send_replace(EngineState::Error(msg.clone()));
                     return Err(EngineError::Other(msg));
@@ -377,6 +412,13 @@ impl ProxyEngine {
                 .map_err(|e| e.to_string())
                 .and_then(|r| r);
                 if let Err(e) = result {
+                    // 同 System 分支：只有快照已建立时才回滚，避免误关用户原有代理
+                    if crate::system_proxy::should_rollback_proxy_on_failure() {
+                        let _ = tokio::task::spawn_blocking(|| {
+                            crate::system_proxy::set_system_pac(false, "")
+                        })
+                        .await;
+                    }
                     let msg = format!("设置 PAC 系统代理失败: {e}");
                     self.state.send_replace(EngineState::Error(msg.clone()));
                     return Err(EngineError::Other(msg));
@@ -389,7 +431,6 @@ impl ProxyEngine {
         let rules = watt_config::DomainRules::new(config.rules.clone());
         let upstream = UpstreamProxy::from_settings(&config.two_level_agent);
         let local = LocalDomainHandler::new(config.scripts.clone());
-        let dns = Arc::new(watt_dns::DnsResolver::with_config(config.dns.clone()));
 
         // 服务端脚本钩子引擎（Phase 4b）：为导出 onRequest/onResponse 的脚本启动 actor
         let fetch: Arc<dyn watt_script::hooks::HookFetch> = Arc::new(

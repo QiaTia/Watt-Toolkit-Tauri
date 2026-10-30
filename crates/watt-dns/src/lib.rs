@@ -5,7 +5,7 @@ pub mod pollution;
 pub mod resolver;
 
 pub use pollution::is_polluted_ip;
-pub use resolver::{DnsConfig, DnsResolver};
+pub use resolver::{DnsBackend, DnsConfig, DnsResolver};
 
 /// 默认 DoH 地址（对齐原 Dnspod 默认）
 pub const DEFAULT_DOH_ADDRESS: &str = "https://doh.pub/dns-query";

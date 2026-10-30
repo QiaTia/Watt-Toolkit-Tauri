@@ -15,10 +15,15 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use watt_script::ScriptConfig;
 
 /// XHR 桥请求/响应体上限（防内存放大）
 const MAX_XHR_BODY: usize = 8 * 1024 * 1024;
+/// XHR 桥目标解析超时（DNS 可能被恶意/异常目标拖慢，必须独立限时）
+const XHR_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+/// XHR 桥整体超时（连接 + 请求 + 读响应），防止慢目标长期占用连接
+const XHR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// XHR 桥响应处理
 pub struct LocalDomainHandler {
@@ -95,9 +100,9 @@ impl LocalDomainHandler {
                 return not_found();
             }
 
-            // CORS 预检：只接受 http(s) 来源，拒绝 null / 自定义协议
+            // CORS 预检：只接受被脚本匹配域名覆盖的 http(s) 来源
             if method == Method::OPTIONS {
-                let Some(origin) = cors_origin(&req) else {
+                let Some(origin) = self.allowed_origin(&req) else {
                     return forbidden();
                 };
                 return Response::builder()
@@ -153,7 +158,7 @@ impl LocalDomainHandler {
     {
         let method = req.method().clone();
         let headers = req.headers().clone();
-        let Some(origin) = cors_origin(&req) else {
+        let Some(origin) = self.allowed_origin(&req) else {
             return forbidden();
         };
         let (parts, body) = req.into_parts();
@@ -185,7 +190,7 @@ impl LocalDomainHandler {
             return bad_request("请求体超过上限");
         }
         let has_body = content_length.is_some_and(|n| n > 0);
-        if !is_get && !(is_post && has_body) {
+        if !(is_get || (is_post && has_body)) {
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("Access-Control-Allow-Origin", origin)
@@ -229,11 +234,21 @@ impl LocalDomainHandler {
         } else {
             80
         });
-        let addrs: Vec<std::net::SocketAddr> =
-            match tokio::net::lookup_host((target_host.as_str(), target_port)).await {
-                Ok(iter) => iter.collect(),
-                Err(e) => return bad_request(&format!("目标解析失败: {e}")),
-            };
+        let addrs: Vec<std::net::SocketAddr> = match tokio::time::timeout(
+            XHR_DNS_TIMEOUT,
+            tokio::net::lookup_host((target_host.as_str(), target_port)),
+        )
+        .await
+        {
+            Ok(Ok(iter)) => iter.collect(),
+            Ok(Err(e)) => return bad_request(&format!("目标解析失败: {e}")),
+            Err(_) => {
+                return bad_request(&format!(
+                    "目标解析超时（{}s）",
+                    XHR_DNS_TIMEOUT.as_secs()
+                ))
+            }
+        };
         if addrs.is_empty() {
             return bad_request("目标无可用地址");
         }
@@ -242,10 +257,17 @@ impl LocalDomainHandler {
         }
         let connect_ip = addrs[0].ip();
 
-        // 转发（直连校验后的 IP）
+        // 转发（直连校验后的 IP）。整段请求加超时：慢目标不能长期占用连接。
         let body = Limited::new(body, MAX_XHR_BODY);
-        let outbound_result =
-            forward_xhr(method.clone(), target, forward_headers, body, connect_ip).await;
+        let outbound_result = match tokio::time::timeout(
+            XHR_TIMEOUT,
+            forward_xhr(method.clone(), target, forward_headers, body, connect_ip),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("XHR 桥请求超时（{}s）", XHR_TIMEOUT.as_secs())),
+        };
 
         match outbound_result {
             Ok(resp_parts) => {
@@ -269,6 +291,35 @@ impl LocalDomainHandler {
                 .body(Full::new(Bytes::from(e)))
                 .unwrap_or_else(|_| internal_error()),
         }
+    }
+
+    /// 校验 Origin 是否为「运行了注入脚本的页面」。
+    ///
+    /// 只接受 http(s) 且主机命中某个已启用脚本的 match 规则；`null`、自定义
+    /// 协议、未匹配域名一律拒绝。相比旧的「协议前缀」校验，任意被加速但未
+    /// 启用脚本的页面不能再借桥发起请求。
+    fn allowed_origin<B>(&self, req: &Request<B>) -> Option<HeaderValue> {
+        let origin = req.headers().get(hyper::header::ORIGIN)?;
+        let value = origin.to_str().ok()?;
+        let uri: hyper::Uri = value.parse().ok()?;
+        let scheme = uri.scheme_str()?;
+        if !matches!(scheme, "http" | "https") {
+            return None;
+        }
+        // Origin 不允许携带 path/query；带 userinfo 的伪 Origin 直接拒绝
+        if !uri.path().is_empty() && uri.path() != "/" {
+            return None;
+        }
+        if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+            return None;
+        }
+        let host = uri.host()?.to_ascii_lowercase();
+        let probe = format!("{scheme}://{host}/");
+        let matched = self
+            .scripts
+            .iter()
+            .any(|s| watt_script::model::script_matches_url(s, &probe));
+        matched.then(|| origin.clone())
     }
 }
 
@@ -365,18 +416,6 @@ where
     Ok((parts.status, parts.headers, bytes))
 }
 
-/// 仅接受 http(s) Origin（拒绝 `null`、自定义协议与缺失）
-fn cors_origin<B>(req: &Request<B>) -> Option<HeaderValue> {
-    let origin = req.headers().get(hyper::header::ORIGIN)?;
-    let value = origin.to_str().ok()?;
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(origin.clone())
-    } else {
-        None
-    }
-}
-
 fn not_found() -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(Bytes::new()));
     *resp.status_mut() = StatusCode::NOT_FOUND;
@@ -444,5 +483,30 @@ mod tests {
             .unwrap();
         let resp = handler.handle(req, "local.steampp.net").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_allowed_origin_requires_script_match() {
+        let handler = LocalDomainHandler::new(vec![ScriptConfig {
+            local_id: "1".into(),
+            match_domain_names: vec!["*.example.com".into(), "example.com".into()],
+            ..Default::default()
+        }]);
+        let req = |origin: &str| {
+            Request::builder()
+                .header("Origin", origin)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        };
+        // 命中脚本域名的页面
+        assert!(handler.allowed_origin(&req("https://www.example.com")).is_some());
+        assert!(handler.allowed_origin(&req("http://example.com")).is_some());
+        // 未命中 / null / 自定义协议 / 带路径的伪 Origin
+        assert!(handler.allowed_origin(&req("https://evil.com")).is_none());
+        assert!(handler.allowed_origin(&req("null")).is_none());
+        assert!(handler.allowed_origin(&req("file://example.com")).is_none());
+        assert!(handler
+            .allowed_origin(&req("https://www.example.com/path"))
+            .is_none());
     }
 }

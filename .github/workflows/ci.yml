@@ -1,0 +1,84 @@
+name: CI
+
+# PR / main 回归门禁：改完先跑这里，避免无测试门槛直接进主干。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (typecheck + build + audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'pnpm'
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --dir ui --frozen-lockfile
+
+      # vue-tsc + vite build（与 release 一致）
+      - name: Build frontend
+        run: pnpm --dir ui build
+
+      - name: Audit production dependencies
+        run: pnpm --dir ui audit --prod
+
+  rust:
+    name: Rust (clippy + unit/integration tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace --lib
+
+      - name: Cookie forwarding test
+        run: cargo test -p watt-core --test cookie_forwarding
+
+      - name: Relay integration tests
+        run: cargo test -p watt-core --test proxy_integration
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 当前仅剩 unmaintained/unsound 警告（无已知漏洞）。新出现的漏洞仍会失败。
+      # 升级到修复版本后请同步删除对应 RUSTSEC 编号。
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: 'RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2026-0370,RUSTSEC-2026-0371,RUSTSEC-2026-0372,RUSTSEC-2024-0429'

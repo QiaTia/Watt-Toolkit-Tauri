@@ -72,6 +72,8 @@ pub async fn accelerate_set_enabled(
     state: tauri::State<'_, AppState>,
     enabled_ids: Vec<String>,
 ) -> Result<(), String> {
+    // 与 settings_save_proxy 共用锁：避免「设置页整对象保存」覆盖刚写入的勾选集合
+    let _guard = state.settings_lock.lock().await;
     let dir = state.data_dir.join("Settings");
     let mut settings =
         watt_config::settings::load_proxy_settings_in(&dir).map_err(|e| e.to_string())?;

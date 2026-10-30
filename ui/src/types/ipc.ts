@@ -87,6 +87,18 @@ export interface DnsSettings {
   custom_doh_address: string | null;
 }
 
+/** DoH 连通性探测结果（含 TLS 握手 + 真实查询） */
+export interface DohProbeDto {
+  /** 实际使用的端点 */
+  endpoint: string;
+  /** 探测域名 */
+  host: string;
+  /** 解析得到的 IP */
+  ips: string[];
+  /** 端到端耗时（毫秒） */
+  elapsedMs: number;
+}
+
 export interface ProxySettings {
   proxy_mode: ProxyMode;
   system_proxy_ip: string | null;

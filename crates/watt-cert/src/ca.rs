@@ -194,7 +194,7 @@ impl CaCertificate {
 }
 
 /// 写私钥文件：Unix 下强制 0600（含已存在文件），Windows 走默认 ACL
-fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;

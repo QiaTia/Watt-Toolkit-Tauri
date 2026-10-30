@@ -49,6 +49,14 @@ pub fn set_system_proxy(enable: bool, ip: &str, port: u16) -> Result<(), String>
             KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
         };
 
+        // 启用前先快照当前系统代理（只快照一次）；停止时按快照还原，
+        // 避免覆盖用户原有的公司代理 / PAC 配置。
+        if enable {
+            win_backup::capture()?;
+        } else if win_backup::restore()? {
+            return Ok(());
+        }
+
         const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
         fn to_wide(s: &str) -> Vec<u16> {
@@ -146,6 +154,13 @@ pub fn set_system_pac(enable: bool, pac_url: &str) -> Result<(), String> {
             RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
             KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
         };
+
+        // 与 System 模式共用同一份快照：PAC 与 Web 代理的原值一起保存/还原
+        if enable {
+            win_backup::capture()?;
+        } else if win_backup::restore()? {
+            return Ok(());
+        }
 
         const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
@@ -284,6 +299,32 @@ pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         (false, None, None)
+    }
+}
+
+/// 启用系统代理失败后是否应执行回滚（Windows）。
+///
+/// Windows 只有快照已建立时才允许回滚，否则会把用户原有代理关掉；
+/// macOS 没有快照机制，沿用原有「失败即关闭代理」的回滚；Linux 无写入。
+pub fn should_rollback_proxy_on_failure() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win_backup::has_backup()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
+/// 丢弃陈旧快照：当前系统代理已不归本引擎所有时调用，避免下次 stop 用旧值
+/// 覆盖用户后来手动修改的代理设置。
+pub fn discard_stale_proxy_backup() {
+    #[cfg(target_os = "windows")]
+    {
+        if win_backup::has_backup() {
+            win_backup::discard_backup();
+        }
     }
 }
 
@@ -648,6 +689,402 @@ mod macos {
             }
         }
         (false, None, None)
+    }
+}
+
+/// Windows 系统代理原值快照。
+///
+/// 启用 System/PAC 前把用户当前的 `ProxyEnable / ProxyServer / ProxyOverride /
+/// AutoConfigURL` 存入 `HKCU\Software\WattToolkit\SystemProxyBackup`，停止或
+/// 启动残留清理时原样写回。快照只抓取一次：运行期间重复启用不会把「本引擎写入
+/// 的值」误当用户原值。崩溃后快照保留，下次启动清理到本引擎代理时自动还原。
+#[cfg(target_os = "windows")]
+mod win_backup {
+    use super::notify_settings_changed;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
+        REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    const SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const BACKUP_SUBKEY: &str = r"Software\WattToolkit\SystemProxyBackup";
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn open_key(subkey: &str, access: u32) -> Option<HKEY> {
+        unsafe {
+            let wide = to_wide(subkey);
+            let mut key: HKEY = std::ptr::null_mut();
+            (RegOpenKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), 0, access, &mut key) == 0)
+                .then_some(key)
+        }
+    }
+
+    fn create_key(subkey: &str, access: u32) -> Result<HKEY, String> {
+        unsafe {
+            let wide = to_wide(subkey);
+            let mut key: HKEY = std::ptr::null_mut();
+            let status = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                access,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            );
+            if status == 0 {
+                Ok(key)
+            } else {
+                Err(format!("打开注册表键失败: {status:#x}"))
+            }
+        }
+    }
+
+    fn read_raw(key: HKEY, name: &str) -> Option<(u32, Vec<u8>)> {
+        unsafe {
+            let name_w = to_wide(name);
+            let mut ty: u32 = 0;
+            let mut len: u32 = 0;
+            if RegQueryValueExW(
+                key,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                &mut ty,
+                std::ptr::null_mut(),
+                &mut len,
+            ) != 0
+                || len == 0
+                || len > 8192
+            {
+                return None;
+            }
+            let mut buf = vec![0u8; len as usize];
+            if RegQueryValueExW(
+                key,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                &mut ty,
+                buf.as_mut_ptr(),
+                &mut len,
+            ) != 0
+            {
+                return None;
+            }
+            buf.truncate(len as usize);
+            Some((ty, buf))
+        }
+    }
+
+    fn read_dword(key: HKEY, name: &str) -> Option<u32> {
+        match read_raw(key, name) {
+            Some((REG_DWORD, buf)) if buf.len() == 4 => {
+                Some(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+            }
+            _ => None,
+        }
+    }
+
+    fn read_sz(key: HKEY, name: &str) -> Option<String> {
+        let (ty, buf) = read_raw(key, name)?;
+        if ty != REG_SZ || buf.len() % 2 != 0 {
+            return None;
+        }
+        let wide: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|c| *c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&wide))
+    }
+
+    fn write_dword(key: HKEY, name: &str, value: u32) -> Result<(), String> {
+        unsafe {
+            let name_w = to_wide(name);
+            let status = RegSetValueExW(
+                key,
+                name_w.as_ptr(),
+                0,
+                REG_DWORD,
+                &value as *const u32 as *const u8,
+                4,
+            );
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(format!("写入 {name} 失败: {status:#x}"))
+            }
+        }
+    }
+
+    fn write_sz(key: HKEY, name: &str, value: &str) -> Result<(), String> {
+        unsafe {
+            let name_w = to_wide(name);
+            let value_w = to_wide(value);
+            let status = RegSetValueExW(
+                key,
+                name_w.as_ptr(),
+                0,
+                REG_SZ,
+                value_w.as_ptr() as *const u8,
+                (value_w.len() * 2) as u32,
+            );
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(format!("写入 {name} 失败: {status:#x}"))
+            }
+        }
+    }
+
+    fn delete_value(key: HKEY, name: &str) {
+        unsafe {
+            let name_w = to_wide(name);
+            let _ = RegDeleteValueW(key, name_w.as_ptr());
+        }
+    }
+
+    fn delete_tree(subkey: &str) {
+        unsafe {
+            let wide = to_wide(subkey);
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, wide.as_ptr());
+        }
+    }
+
+    fn has_captured(backup_subkey: &str) -> bool {
+        let Some(key) = open_key(backup_subkey, KEY_READ) else {
+            return false;
+        };
+        let captured = read_dword(key, "Complete") == Some(1);
+        unsafe { RegCloseKey(key) };
+        captured
+    }
+
+    fn capture_from(settings_subkey: &str, backup_subkey: &str) -> Result<(), String> {
+        if has_captured(backup_subkey) {
+            return Ok(());
+        }
+        let settings = open_key(settings_subkey, KEY_READ)
+            .ok_or_else(|| "读取系统代理设置失败（Internet Settings 不可访问）".to_string())?;
+        let enabled = read_dword(settings, "ProxyEnable").unwrap_or(0);
+        let server = read_sz(settings, "ProxyServer");
+        let override_list = read_sz(settings, "ProxyOverride");
+        let pac = read_sz(settings, "AutoConfigURL");
+        unsafe { RegCloseKey(settings) };
+
+        let backup = create_key(backup_subkey, KEY_READ | KEY_WRITE)?;
+        let result = (|| -> Result<(), String> {
+            // 先写值、最后写 Complete 标志：进程在中间崩溃时快照不可用，
+            // 下次 capture 会重新抓取，restore 也不会拿半份数据覆盖用户配置。
+            write_dword(backup, "ProxyEnable", enabled)?;
+            for (name, value) in [
+                ("ProxyServer", server.as_deref()),
+                ("ProxyOverride", override_list.as_deref()),
+                ("AutoConfigURL", pac.as_deref()),
+            ] {
+                match value {
+                    Some(v) => write_sz(backup, name, v)?,
+                    None => delete_value(backup, name),
+                }
+            }
+            write_dword(backup, "Complete", 1)?;
+            Ok(())
+        })();
+        unsafe { RegCloseKey(backup) };
+        if let Err(e) = result {
+            // 快照不完整时不能保留：否则下次启停会用半份数据覆盖用户配置
+            delete_tree(backup_subkey);
+            return Err(format!("保存系统代理原值失败，已中止: {e}"));
+        }
+        Ok(())
+    }
+
+    fn restore_from(settings_subkey: &str, backup_subkey: &str) -> Result<bool, String> {
+        let Some(backup) = open_key(backup_subkey, KEY_READ | KEY_WRITE) else {
+            return Ok(false);
+        };
+        if read_dword(backup, "Complete") != Some(1) {
+            // 不完整快照：删除并退化为原有的「仅关闭代理」行为
+            unsafe { RegCloseKey(backup) };
+            delete_tree(backup_subkey);
+            return Ok(false);
+        }
+        let enabled = read_dword(backup, "ProxyEnable").unwrap_or(0);
+        let server = read_sz(backup, "ProxyServer");
+        let override_list = read_sz(backup, "ProxyOverride");
+        let pac = read_sz(backup, "AutoConfigURL");
+        unsafe { RegCloseKey(backup) };
+
+        let settings = create_key(settings_subkey, KEY_READ | KEY_WRITE)?;
+        let result = (|| -> Result<(), String> {
+            write_dword(settings, "ProxyEnable", enabled)?;
+            for (name, value) in [
+                ("ProxyServer", server.as_deref()),
+                ("ProxyOverride", override_list.as_deref()),
+                ("AutoConfigURL", pac.as_deref()),
+            ] {
+                match value {
+                    Some(v) => write_sz(settings, name, v)?,
+                    None => delete_value(settings, name),
+                }
+            }
+            Ok(())
+        })();
+        unsafe { RegCloseKey(settings) };
+        if let Err(e) = result {
+            // 写回失败时保留快照，下次启停/清理可重试
+            return Err(format!("还原系统代理设置失败: {e}"));
+        }
+        delete_tree(backup_subkey);
+        notify_settings_changed();
+        Ok(true)
+    }
+
+    pub(super) fn capture() -> Result<(), String> {
+        capture_from(SETTINGS_SUBKEY, BACKUP_SUBKEY)
+    }
+
+    pub(super) fn restore() -> Result<bool, String> {
+        restore_from(SETTINGS_SUBKEY, BACKUP_SUBKEY)
+    }
+
+    /// 是否存在完整快照（供调用方判断失败回滚是否安全）
+    pub(super) fn has_backup() -> bool {
+        has_captured(BACKUP_SUBKEY)
+    }
+
+    /// 丢弃陈旧快照（当前代理已不归本引擎所有时调用）
+    pub(super) fn discard_backup() {
+        delete_tree(BACKUP_SUBKEY);
+    }
+
+    /// 单元测试：只在 HKCU 临时键上操作，不触碰真实 Internet Settings
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn temp_key(tag: &str) -> String {
+            format!(
+                r"Software\WattToolkit\Test-{tag}-{}",
+                std::process::id()
+            )
+        }
+
+        #[test]
+        fn capture_and_restore_roundtrip() {
+            let settings_key = temp_key("Settings");
+            let backup_key = temp_key("Backup");
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+
+            // 模拟用户原有的公司代理 + PAC
+            let settings = create_key(&settings_key, KEY_READ | KEY_WRITE).unwrap();
+            write_dword(settings, "ProxyEnable", 1).unwrap();
+            write_sz(settings, "ProxyServer", "corp.proxy:8080").unwrap();
+            write_sz(settings, "ProxyOverride", "*.corp.example;<local>").unwrap();
+            write_sz(settings, "AutoConfigURL", "http://wpad/wpad.dat").unwrap();
+            unsafe { RegCloseKey(settings) };
+
+            // 快照 → 模拟本引擎覆盖
+            capture_from(&settings_key, &backup_key).unwrap();
+            let settings = create_key(&settings_key, KEY_READ | KEY_WRITE).unwrap();
+            write_dword(settings, "ProxyEnable", 1).unwrap();
+            write_sz(settings, "ProxyServer", "127.0.0.1:26501").unwrap();
+            delete_value(settings, "AutoConfigURL");
+            unsafe { RegCloseKey(settings) };
+
+            // 还原 → 原值必须逐项恢复，快照删除
+            assert!(restore_from(&settings_key, &backup_key).unwrap());
+            let settings = open_key(&settings_key, KEY_READ).unwrap();
+            assert_eq!(read_dword(settings, "ProxyEnable"), Some(1));
+            assert_eq!(
+                read_sz(settings, "ProxyServer").as_deref(),
+                Some("corp.proxy:8080")
+            );
+            assert_eq!(
+                read_sz(settings, "ProxyOverride").as_deref(),
+                Some("*.corp.example;<local>")
+            );
+            assert_eq!(
+                read_sz(settings, "AutoConfigURL").as_deref(),
+                Some("http://wpad/wpad.dat")
+            );
+            unsafe { RegCloseKey(settings) };
+            assert!(!has_captured(&backup_key));
+
+            // 无快照时 restore 返回 false（调用方退化为「仅关闭」）
+            assert!(!restore_from(&settings_key, &backup_key).unwrap());
+
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+        }
+
+        #[test]
+        fn incomplete_snapshot_is_ignored() {
+            let settings_key = temp_key("IncompleteSettings");
+            let backup_key = temp_key("IncompleteBackup");
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+
+            let settings = create_key(&settings_key, KEY_READ | KEY_WRITE).unwrap();
+            write_dword(settings, "ProxyEnable", 0).unwrap();
+            write_sz(settings, "ProxyServer", "user.proxy:8080").unwrap();
+            unsafe { RegCloseKey(settings) };
+
+            // 模拟 capture 崩溃：只写了部分值，没有 Complete 标志
+            let backup = create_key(&backup_key, KEY_READ | KEY_WRITE).unwrap();
+            write_dword(backup, "ProxyEnable", 1).unwrap();
+            unsafe { RegCloseKey(backup) };
+
+            assert!(!restore_from(&settings_key, &backup_key).unwrap());
+            let settings = open_key(&settings_key, KEY_READ).unwrap();
+            assert_eq!(read_dword(settings, "ProxyEnable"), Some(0));
+            assert_eq!(
+                read_sz(settings, "ProxyServer").as_deref(),
+                Some("user.proxy:8080"),
+                "半份快照不得覆盖用户当前代理"
+            );
+            unsafe { RegCloseKey(settings) };
+            assert!(!has_captured(&backup_key));
+
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+        }
+
+        #[test]
+        fn capture_is_idempotent() {
+            let settings_key = temp_key("IdemSettings");
+            let backup_key = temp_key("IdemBackup");
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+
+            let settings = create_key(&settings_key, KEY_READ | KEY_WRITE).unwrap();
+            write_dword(settings, "ProxyEnable", 1).unwrap();
+            write_sz(settings, "ProxyServer", "original:1").unwrap();
+            unsafe { RegCloseKey(settings) };
+            capture_from(&settings_key, &backup_key).unwrap();
+
+            // 运行期间代理被改成引擎值；再次 capture 不得覆盖原值
+            let settings = create_key(&settings_key, KEY_READ | KEY_WRITE).unwrap();
+            write_sz(settings, "ProxyServer", "127.0.0.1:26501").unwrap();
+            unsafe { RegCloseKey(settings) };
+            capture_from(&settings_key, &backup_key).unwrap();
+
+            let backup = open_key(&backup_key, KEY_READ).unwrap();
+            assert_eq!(
+                read_sz(backup, "ProxyServer").as_deref(),
+                Some("original:1")
+            );
+            unsafe { RegCloseKey(backup) };
+
+            delete_tree(&settings_key);
+            delete_tree(&backup_key);
+        }
     }
 }
 

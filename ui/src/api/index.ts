@@ -11,6 +11,7 @@ import type {
   CertificateInfo,
   CertStatusDto,
   ConnectivityTestItem,
+  DohProbeDto,
   DomainPoolOverview,
   DomainRule,
   EngineStartParams,
@@ -90,6 +91,11 @@ export function settingsGetProxy(): Promise<ProxySettings> {
 
 export function settingsSaveProxy(settings: ProxySettings): Promise<void> {
   return invoke('settings_save_proxy', { settings });
+}
+
+/** 探测 DoH 端点（空 = 默认端点）。失败会抛错，不会静默回退到系统 DNS。 */
+export function dnsProbeDoh(endpoint: string | null): Promise<DohProbeDto> {
+  return invoke('dns_probe_doh', { endpoint });
 }
 
 /* 加速项目 */

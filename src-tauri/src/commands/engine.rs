@@ -104,9 +104,6 @@ pub async fn engine_start(
         Some(ip) => ip.parse().map_err(|_| format!("无效监听 IP: {ip}"))?,
     };
 
-    // CA（若引擎在运行则不允许重新生成，此处仅读取）
-    let ca: Arc<CaCertificate> = state.ca.read().await.clone();
-
     // DNS 设置转换
     let dns = DnsConfig {
         master_dns: params.dns.master_dns,
@@ -114,12 +111,27 @@ pub async fn engine_start(
         custom_doh_address: params.dns.custom_doh_address,
     };
 
+    // 端口 0 在 bind 语义里是「由系统分配随机端口」，而设置页清空端口输入框会写入 0。
+    // 若不归一化：正向代理会监听随机端口，系统代理却写成 `127.0.0.1:0`（必断网）；
+    // HTTPS/HTTP 端口同理。统一回退到各端口默认值。
     let https_port = params
         .https_port
+        .filter(|p| *p > 0)
         .unwrap_or(watt_config::constants::HTTPS_PORT);
     let forward_proxy_port = params
         .forward_proxy_port
+        .filter(|p| *p > 0)
         .unwrap_or(watt_config::constants::DEFAULT_HTTP_PROXY_PORT);
+    let http_port = params.http_port.filter(|p| *p > 0);
+    // 端口 0 在 bind 语义里是「由系统分配随机端口」，前端填写 0 时用户看到的是
+    // 「已启用 SOCKS5」却永远连不上。统一回退默认端口。
+    let socks5_port = params.socks5_port.map(|p| {
+        if p == 0 {
+            watt_config::constants::DEFAULT_SOCKS5_PROXY_PORT
+        } else {
+            p
+        }
+    });
 
     // 终端（CLI）接入面：仅当存在正向代理监听时注入代理变量；
     // 证书变量在所有模式下都注入（Hosts 模式终端仍需信任 MITM 根证书）。
@@ -137,13 +149,18 @@ pub async fn engine_start(
         }
     });
 
+    // 先拿 engine 锁再读 CA：与 cert_regenerate（持 engine 锁生成新 CA）互斥，
+    // 避免「读到旧 CA → 等锁 → 新 CA 已落盘」导致引擎用旧 CA 服务新证书文件。
+    let mut engine = state.engine.lock().await;
+    let ca: Arc<CaCertificate> = state.ca.read().await.clone();
+
     let config = EngineConfig {
         mode: params.mode,
         listen_ip,
         https_port,
-        http_port: params.http_port,
+        http_port,
         forward_proxy_port,
-        socks5_port: params.socks5_port,
+        socks5_port,
         enable_http_to_https: params.enable_http_to_https,
         // 脚本子系统已移除：以下字段保持引擎默认（仅代理域名，无脚本注入）
         only_enable_proxy_script: false,
@@ -164,7 +181,6 @@ pub async fn engine_start(
         terminal_proxy,
     };
 
-    let mut engine = state.engine.lock().await;
     engine.start(config).await.map_err(|e| e.to_string())?;
     let dto: EngineStateDto = engine.state().into();
     drop(engine);

@@ -51,10 +51,17 @@ pub fn import_pfx(
 
     // 写入临时校验：CaCertificate::load 会做 X.509 解析 + rcgen 重建 + 到期检查
     std::fs::create_dir_all(cert_dir)?;
+    // 与 CaCertificate::save 保持一致的私钥保护：Unix 目录 0700、私钥 0600。
+    // 旧实现走 fs::write，导入的私钥继承 umask（常见 644），同机其他用户可读。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cert_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let cert_path = CaCertificate::cert_path(cert_dir);
     let key_path = CaCertificate::key_path(cert_dir);
     std::fs::write(&cert_path, &cert_pem)?;
-    std::fs::write(&key_path, &key_pem)?;
+    crate::ca::write_private_file(&key_path, key_pem.as_bytes())?;
 
     let ca = CaCertificate::load(&cert_path, &key_path).map_err(|e| {
         // 校验失败：清理半成品，避免下次启动加载到坏文件
@@ -135,6 +142,19 @@ mod tests {
         // 5. 文件已落地，且可再次加载
         assert!(CaCertificate::cert_path(&cert_dir).exists());
         assert!(CaCertificate::key_path(&cert_dir).exists());
+
+        // Unix：导入的私钥必须是 0600（与生成的 CA 一致），不得继承 umask
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(CaCertificate::key_path(&cert_dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "私钥权限应为 0600，实际 {mode:o}");
+        }
+
         let reloaded = CaCertificate::load(
             &CaCertificate::cert_path(&cert_dir),
             &CaCertificate::key_path(&cert_dir),

@@ -223,13 +223,85 @@ pub fn load_proxy_settings_in(dir: &Path) -> Result<ProxySettings, SettingsError
     Ok(settings)
 }
 
-/// 保存代理设置到指定目录
+/// 保存代理设置到指定目录（原子替换，避免崩溃/断电留下半截 JSON）
 pub fn save_proxy_settings_in(dir: &Path, settings: &ProxySettings) -> Result<(), SettingsError> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("ProxySettings.json");
     let content = serde_json::to_string_pretty(settings)?;
-    std::fs::write(path, content)?;
+    write_atomic(&path, content.as_bytes())?;
     Ok(())
+}
+
+/// 原子写文件：同目录临时文件 → fsync → rename 替换。
+///
+/// 直接 `fs::write` 会先截断目标文件，进程在写入中途退出（崩溃 / 断电 / 强杀）
+/// 会留下半截 JSON，下次启动解析失败即丢失全部配置。rename 在同一文件系统内
+/// 是原子的：要么看到完整旧文件，要么看到完整新文件。
+///
+/// Windows 下 `rename` 不能覆盖已存在文件，退化为「删除后重命名」——仍有极小的
+/// 丢文件窗口，但远小于直接截断写入；失败时保留临时文件便于诊断。
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // 同进程并发写（如「保存设置」与「保存勾选」同时触发）必须使用不同临时文件，
+    // 否则会互相截断临时文件、把半截内容 rename 成正式配置。单实例插件保证
+    // 跨进程不会并发写同一目录。
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{seq}",
+        std::process::id()
+    ));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            // 配置文件可能包含二级代理密码；Unix 下限定仅属主可读写
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            #[cfg(windows)]
+            {
+                // Windows 的 rename 已带替换语义；失败通常是杀软/其他进程短暂持有
+                // 目标文件。重试即可，**绝不先删旧文件**——否则重试再失败会同时
+                // 失去旧配置和新内容，后续按默认值加载并回写。
+                for _ in 0..3 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    if std::fs::rename(&tmp, path).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&tmp);
+            Err(first_err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +368,30 @@ mod tests {
         assert_eq!(reloaded.system_proxy_port, 26502);
         assert_eq!(reloaded.enabled_accelerate_ids, vec!["steam"]);
         assert_eq!(reloaded.proxy_mode, ProxyMode::Hosts);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("watt-atomic-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        write_atomic(&path, br#"{"v":1}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"v":1}"#);
+
+        // 覆盖写入：内容完整替换，旧内容不残留
+        write_atomic(&path, br#"{"v":2}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"v":2}"#);
+
+        // 同目录不残留临时文件
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

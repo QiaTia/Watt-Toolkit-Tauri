@@ -100,12 +100,25 @@ async fn handle_forward_connection(
 }
 
 /// peek 请求行（至 \r\n，不消费；EOF 返回 None）
+///
+/// 使用**累计**截止时间而非每次 peek 单独超时：客户端只发 1 字节便静默时，
+/// peek 会立即返回同一批数据，逐次超时会被无限重置（1% CPU + fd 常驻），
+/// 256 个这样的连接即可耗尽正向代理。累计超时保证任何慢连接最多占用
+/// [`HANDSHAKE_TIMEOUT`]。
 async fn peek_request_line(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    peek_request_line_with_timeout(stream, HANDSHAKE_TIMEOUT).await
+}
+
+async fn peek_request_line_with_timeout(
+    stream: &mut tokio::net::TcpStream,
+    timeout: std::time::Duration,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut chunk = [0u8; 2048];
     loop {
-        let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut chunk))
+        let n = tokio::time::timeout_at(deadline, stream.peek(&mut chunk))
             .await
             .map_err(|_| "请求行读取超时")??;
         if n == 0 {
@@ -117,7 +130,13 @@ async fn peek_request_line(
         if n >= chunk.len() {
             return Err("请求行过大".into());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        // peek 不消费字节：等待对端补齐请求行；截止时间不随循环重置
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(std::time::Duration::from_millis(1)))
+            .await
+            .is_err()
+        {
+            return Err("请求行读取超时".into());
+        }
     }
 }
 
@@ -425,6 +444,36 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(target, "/pac");
         assert_eq!(ver, 0);
+    }
+
+    /// 慢连接防护：只发 1 字节不带 CRLF 的客户端必须在累计超时后断开，
+/// 而不是让 peek 循环永久占用连接槽位
+    #[tokio::test]
+    async fn test_peek_request_line_bounds_slow_client() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"G").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let started = std::time::Instant::now();
+        let result = peek_request_line_with_timeout(
+            &mut server,
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+        assert!(result.is_err(), "慢连接应在累计超时后失败");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "超时不应被逐次重置，实际耗时 {:?}",
+            started.elapsed()
+        );
+        client.abort();
     }
 
     #[test]

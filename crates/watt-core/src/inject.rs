@@ -5,6 +5,9 @@
 
 use std::io::Read;
 
+/// 解压后正文上限：防压缩炸弹。脚本注入只处理 HTML，32MB 已远超正常页面。
+const MAX_DECOMPRESSED: usize = 32 * 1024 * 1024;
+
 /// 内容编码类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentCompression {
@@ -28,32 +31,41 @@ impl ContentCompression {
 /// 解压响应体（对齐 GetStreamByContentCompression Decompress）
 pub fn decompress(data: &[u8], compression: ContentCompression) -> Result<Vec<u8>, String> {
     match compression {
-        ContentCompression::None => Ok(data.to_vec()),
+        ContentCompression::None => {
+            if data.len() > MAX_DECOMPRESSED {
+                return Err(format!(
+                    "正文超过 {MAX_DECOMPRESSED} 字节上限，跳过解压"
+                ));
+            }
+            Ok(data.to_vec())
+        }
         ContentCompression::Gzip => {
-            let mut decoder = flate2::read::MultiGzDecoder::new(data);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| format!("gzip 解压失败: {e}"))?;
-            Ok(out)
+            let decoder = flate2::read::MultiGzDecoder::new(data);
+            read_limited(decoder, "gzip 解压", MAX_DECOMPRESSED)
         }
         ContentCompression::Deflate => {
-            let mut decoder = flate2::read::DeflateDecoder::new(data);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| format!("deflate 解压失败: {e}"))?;
-            Ok(out)
+            let decoder = flate2::read::DeflateDecoder::new(data);
+            read_limited(decoder, "deflate 解压", MAX_DECOMPRESSED)
         }
         ContentCompression::Brotli => {
-            let mut decoder = brotli::Decompressor::new(data, 4096);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| format!("br 解压失败: {e}"))?;
-            Ok(out)
+            let decoder = brotli::Decompressor::new(data, 4096);
+            read_limited(decoder, "br 解压", MAX_DECOMPRESSED)
         }
     }
+}
+
+/// 限长读取：多读 1 字节用于判断是否超限，避免把压缩炸弹完整展开到内存。
+fn read_limited(mut reader: impl Read, what: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    reader
+        .by_ref()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("{what}失败: {e}"))?;
+    if out.len() > limit {
+        return Err(format!("{what}失败: 解压后超过 {limit} 字节上限"));
+    }
+    Ok(out)
 }
 
 /// 重压缩响应体（对齐 GetStreamByContentCompression Compress）
@@ -335,6 +347,14 @@ pub fn inject_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_limited_caps_output() {
+        let data = [0u8; 64];
+        assert_eq!(read_limited(&data[..], "test", 64).unwrap().len(), 64);
+        let err = read_limited(&data[..], "test", 16).unwrap_err();
+        assert!(err.contains("上限"), "{err}");
+    }
 
     #[test]
     fn test_find_inject_position_body() {

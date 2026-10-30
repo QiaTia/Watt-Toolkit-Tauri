@@ -19,6 +19,9 @@ pub struct AppState {
     pub engine: tokio::sync::Mutex<ProxyEngine>,
     /// CA 证书（重新生成时替换）
     pub ca: tokio::sync::RwLock<Arc<CaCertificate>>,
+    /// ProxySettings.json 的读-改-写串行化：设置页整对象保存与加速页
+    /// 「保存勾选」都会写同一文件，并发执行会互相覆盖（丢勾选 / 丢设置）
+    pub settings_lock: tokio::sync::Mutex<()>,
     /// 应用数据目录（{AppData}/WattToolkit）
     pub data_dir: PathBuf,
     /// 首启迁移报告（旧版数据导入结果）
@@ -113,6 +116,7 @@ pub fn run() {
                 AppState {
                     engine: tokio::sync::Mutex::new(engine),
                     ca: tokio::sync::RwLock::new(ca),
+                    settings_lock: tokio::sync::Mutex::new(()),
                     data_dir,
                     migration,
                 }
@@ -143,6 +147,7 @@ pub fn run() {
             commands::cert::cert_uninstall,
             commands::cert::cert_export_ca,
             commands::cert::cert_regenerate,
+            commands::dns::dns_probe_doh,
             commands::settings::settings_get_proxy,
             commands::settings::settings_save_proxy,
             commands::accelerate::accelerate_get_projects,

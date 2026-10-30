@@ -31,7 +31,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 x509-parser = "0.16"
-hickory-resolver = { version = "0.24", features = ["tokio", "dns-over-https-rustls", "dns-over-rustls"] }
+hickory-resolver = { version = "0.26", features = ["tokio", "https-ring", "webpki-roots"] }
+webpki-roots = "1"
 flate2 = "1"
 brotli = "7"
 regex = "1"

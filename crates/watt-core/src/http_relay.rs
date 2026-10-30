@@ -8,12 +8,15 @@ use crate::local_domain::LocalDomainHandler;
 use crate::access_log::{now_ms, AccessLogEntry, AccessLogStore, Disposition, DEFAULT_CAPACITY};
 use crate::outbound::{CandidateHealth, OutboundConnector, OutboundTarget, UpstreamProxy};
 use crate::stats::FlowStats;
+use bytes::BytesMut;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Bytes, Incoming};
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, HOST, USER_AGENT};
 use hyper::{Method, Request, Response, StatusCode, Uri};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use watt_config::domain_rule::DomainRule;
 use watt_config::DomainRules;
@@ -24,6 +27,10 @@ use watt_script::hooks::{
 
 /// 转发请求体：无钩子时保持流式，有钩子时缓冲（避免无谓开销）
 type ForwardBody = BoxBody<Bytes, hyper::Error>;
+
+/// 脚本注入 / onResponse 钩子需要整包缓冲的响应体上限（压缩后大小）。
+/// 超过则跳过注入/钩子，退回流式转发，避免大响应或压缩炸弹耗尽内存。
+const MAX_SCRIPT_BUFFER: usize = 16 * 1024 * 1024;
 
 /// 代理响应体：静态 / 本地 / 错误响应为 `Full`，**转发响应为流式**（边收边发）。
 ///
@@ -77,6 +84,78 @@ impl Body for CountingBody {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// 缓冲结果：完整读完，或超过上限（保留已读前缀 + 未读 stream）
+enum CollectOutcome<B> {
+    Complete(Bytes),
+    Overflow { prefix: Bytes, rest: B },
+}
+
+/// 限长收集：超过上限时不丢弃已读数据，而是返回前缀 + 剩余 body，
+/// 调用方可跳过脚本处理并继续流式转发（避免 chunked 大响应/大上传直接 500）。
+async fn collect_with_limit<B>(mut body: B, limit: usize) -> Result<CollectOutcome<B>, B::Error>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if collected.len() + data.len() > limit {
+                // 当前 frame 一并放入前缀，最多超出一个 frame，可接受
+                collected.extend_from_slice(data);
+                return Ok(CollectOutcome::Overflow {
+                    prefix: collected.freeze(),
+                    rest: body,
+                });
+            }
+            collected.extend_from_slice(data);
+        }
+    }
+    Ok(CollectOutcome::Complete(collected.freeze()))
+}
+
+/// 先输出已读前缀，再继续输出原 body（用于超限后转流式）
+struct PrefixedBody<B> {
+    prefix: Option<Bytes>,
+    rest: B,
+}
+
+impl<B> Body for PrefixedBody<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, B::Error>>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            if !prefix.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(prefix))));
+            }
+        }
+        Pin::new(&mut this.rest).poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = self.rest.size_hint();
+        if let Some(prefix) = &self.prefix {
+            let extra = prefix.len() as u64;
+            let lower = hint.lower().saturating_add(extra);
+            let upper = hint.upper().map(|u| u.saturating_add(extra));
+            hint = SizeHint::new();
+            hint.set_lower(lower);
+            if let Some(upper) = upper {
+                hint.set_upper(upper);
+            }
+        }
+        hint
     }
 }
 
@@ -338,71 +417,99 @@ impl RelayContext {
         let mut body: ForwardBody = incoming_body.boxed();
 
         // —— 服务端脚本 onRequest 钩子（Phase 4b 新增能力）——
-        // 仅当匹配脚本存在请求钩子时缓冲 body；二进制 body 跳过（UTF-8 约定）
+        // 仅当匹配脚本存在请求钩子时缓冲 body；二进制 body 跳过（UTF-8 约定）。
+        // 请求体同样受 MAX_SCRIPT_BUFFER 限制：已知超限则直接跳过钩子、保持流式。
+        let request_too_large = parts
+            .headers
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > MAX_SCRIPT_BUFFER as u64);
+        if request_too_large {
+            tracing::warn!(
+                host = %host,
+                limit = MAX_SCRIPT_BUFFER,
+                "请求体超过脚本处理上限，跳过 onRequest 钩子"
+            );
+        }
         if let Some(hooks) = &self.hooks {
-            if hooks.has_request_hooks(scripts) {
-                // 缓冲请求体（collect 消耗 body，后续按结果恢复/替换）
-                let bytes = body
-                    .collect()
-                    .await
-                    .map_err(|e| format!("读取请求体失败: {e}"))?
-                    .to_bytes();
-                let outcome = if std::str::from_utf8(&bytes).is_ok() {
-                    let snapshot = RequestSnapshot {
-                        method: parts.method.as_str().to_string(),
-                        url: url.to_string(),
-                        headers: header_pairs(&parts.headers),
-                        body: bytes.to_vec(),
-                    };
-                    hooks.on_request(scripts, snapshot).await
-                } else {
-                    RequestHookOutcome::Passthrough
-                };
-                match outcome {
-                    RequestHookOutcome::Passthrough => {
-                        body = Full::new(bytes).map_err(|e| match e {}).boxed();
-                    }
-                    RequestHookOutcome::Redirect { location } => {
-                        return Response::builder()
-                            .status(StatusCode::FOUND)
-                            .header(hyper::header::LOCATION, location)
-                            .body(Full::new(Bytes::new()))
-                            .map(boxed_response)
-                            .map_err(|e| e.to_string());
-                    }
-                    RequestHookOutcome::Block { status, body } => {
-                        return Response::builder()
-                            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN))
-                            .body(Full::new(Bytes::from(body)))
-                            .map(boxed_response)
-                            .map_err(|e| e.to_string());
-                    }
-                    RequestHookOutcome::Modified(snap) => {
-                        if let Ok(m) = Method::from_bytes(snap.method.as_bytes()) {
-                            parts.method = m;
-                        }
-                        if let Ok(uri) = snap.url.parse::<Uri>() {
-                            if let Some(s) = uri.scheme_str() {
-                                scheme = s.to_string();
+            if hooks.has_request_hooks(scripts) && !request_too_large {
+                // 缓冲请求体：超限时保留已读前缀 + 剩余流式 body，跳过钩子继续转发
+                match collect_with_limit(body, MAX_SCRIPT_BUFFER).await {
+                    Ok(CollectOutcome::Complete(bytes)) => {
+                        let outcome = if std::str::from_utf8(&bytes).is_ok() {
+                            let snapshot = RequestSnapshot {
+                                method: parts.method.as_str().to_string(),
+                                url: url.to_string(),
+                                headers: header_pairs(&parts.headers),
+                                body: bytes.to_vec(),
+                            };
+                            hooks.on_request(scripts, snapshot).await
+                        } else {
+                            RequestHookOutcome::Passthrough
+                        };
+                        match outcome {
+                            RequestHookOutcome::Passthrough => {
+                                body = Full::new(bytes).map_err(|e| match e {}).boxed();
                             }
-                            if let Some(h) = uri.host() {
-                                host = h.to_string();
+                            RequestHookOutcome::Redirect { location } => {
+                                return Response::builder()
+                                    .status(StatusCode::FOUND)
+                                    .header(hyper::header::LOCATION, location)
+                                    .body(Full::new(Bytes::new()))
+                                    .map(boxed_response)
+                                    .map_err(|e| e.to_string());
                             }
-                            if let Some(pq) = uri.path_and_query() {
-                                if let Ok(u) = pq.as_str().parse() {
-                                    parts.uri = u;
+                            RequestHookOutcome::Block { status, body } => {
+                                return Response::builder()
+                                    .status(
+                                        StatusCode::from_u16(status)
+                                            .unwrap_or(StatusCode::FORBIDDEN),
+                                    )
+                                    .body(Full::new(Bytes::from(body)))
+                                    .map(boxed_response)
+                                    .map_err(|e| e.to_string());
+                            }
+                            RequestHookOutcome::Modified(snap) => {
+                                if let Ok(m) = Method::from_bytes(snap.method.as_bytes()) {
+                                    parts.method = m;
                                 }
+                                if let Ok(uri) = snap.url.parse::<Uri>() {
+                                    if let Some(s) = uri.scheme_str() {
+                                        scheme = s.to_string();
+                                    }
+                                    if let Some(h) = uri.host() {
+                                        host = h.to_string();
+                                    }
+                                    if let Some(pq) = uri.path_and_query() {
+                                        if let Ok(u) = pq.as_str().parse() {
+                                            parts.uri = u;
+                                        }
+                                    }
+                                }
+                                parts.headers = headermap_from_pairs(&snap.headers);
+                                body = Full::new(Bytes::from(snap.body))
+                                    .map_err(|e| match e {})
+                                    .boxed();
+                                tracing::debug!(
+                                    "onRequest 钩子修改请求: {} {scheme}://{host}",
+                                    parts.method
+                                );
                             }
                         }
-                        parts.headers = headermap_from_pairs(&snap.headers);
-                        body = Full::new(Bytes::from(snap.body))
-                            .map_err(|e| match e {})
-                            .boxed();
-                        tracing::debug!(
-                            "onRequest 钩子修改请求: {} {scheme}://{host}",
-                            parts.method
-                        );
                     }
+                    Ok(CollectOutcome::Overflow { prefix, rest }) => {
+                        tracing::warn!(
+                            host = %host,
+                            limit = MAX_SCRIPT_BUFFER,
+                            "chunked 请求体超过脚本处理上限，跳过 onRequest 钩子并流式转发"
+                        );
+                        body = BoxBody::new(PrefixedBody {
+                            prefix: Some(prefix),
+                            rest,
+                        });
+                    }
+                    Err(e) => return Err(format!("读取请求体失败: {e}")),
                 }
             }
         }
@@ -600,6 +707,25 @@ impl RelayContext {
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|ua| ua.contains("Valve Steam")));
 
+                    // 已知超大响应直接跳过脚本处理，保持流式转发：
+                    // 否则整包缓冲会给内存带来无上限压力（脚本/钩子路径）。
+                    let known_len = resp_parts
+                        .headers
+                        .get(hyper::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let too_large = known_len.is_some_and(|n| n > MAX_SCRIPT_BUFFER as u64);
+                    if too_large && (has_resp_hooks || should_inject) {
+                        tracing::warn!(
+                            host = %host,
+                            len = known_len.unwrap_or_default(),
+                            limit = MAX_SCRIPT_BUFFER,
+                            "响应体超过脚本处理上限，跳过注入/钩子并流式转发"
+                        );
+                    }
+                    let should_inject = should_inject && !too_large;
+                    let has_resp_hooks = has_resp_hooks && !too_large;
+
                     if !has_resp_hooks && !should_inject {
                         // —— 流式转发：边收边发，首字节随响应头立刻下发 ——
                         // Content-Length/Transfer-Encoding 交由 hyper 重新决定
@@ -618,15 +744,42 @@ impl RelayContext {
                     }
 
                     // —— 缓冲路径：脚本注入 / onResponse 钩子需要完整 body ——
-                    let mut body_bytes = match resp_body.collect().await {
-                        Ok(b) => b.to_bytes(),
+                    // 加硬上限：Content-Length 未知（chunked）时也不能无限 collect；
+                    // 超限则保留已读前缀 + 剩余流，跳过脚本处理后继续流式转发。
+                    let mut body_bytes = match collect_with_limit(resp_body, MAX_SCRIPT_BUFFER).await
+                    {
+                        Ok(CollectOutcome::Complete(bytes)) => bytes,
+                        Ok(CollectOutcome::Overflow { prefix, rest }) => {
+                            tracing::warn!(
+                                host = %host,
+                                limit = MAX_SCRIPT_BUFFER,
+                                "chunked 响应体超过脚本处理上限，跳过注入/钩子并流式转发"
+                            );
+                            let mut headers = resp_parts.headers.clone();
+                            headers.remove(hyper::header::CONTENT_LENGTH);
+                            headers.remove(hyper::header::TRANSFER_ENCODING);
+                            let mut builder = Response::builder().status(resp_parts.status);
+                            for (k, v) in headers.iter() {
+                                builder = builder.header(k, v);
+                            }
+                            let stream = PrefixedBody {
+                                prefix: Some(prefix),
+                                rest,
+                            };
+                            return builder
+                                .body(BoxBody::new(CountingBody {
+                                    inner: BoxBody::new(stream),
+                                    stats: self.stats.clone(),
+                                    head_counted: false,
+                                }))
+                                .map_err(|e| e.to_string());
+                        }
                         Err(e) => {
                             // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
                             // （RST 等，hyper display 为「connection error」）。
                             // 注意 is_closed() 只匹配 ChannelClosed（我方通道关闭），不覆盖 Kind::Io。
-                            let transient = e.is_incomplete_message()
-                                || is_io_error(&e)
-                                || e.is_body_write_aborted();
+                            let transient =
+                                e.is_incomplete_message() || is_io_error(&e) || e.is_body_write_aborted();
                             if transient {
                                 if let Some(a) = winner {
                                     connector.mark_failed(a);
@@ -822,10 +975,31 @@ fn domain_rule_from_fields(
     }
 }
 
+/// 子规则正则缓存：云端规则正则固定，避免每请求重复编译。
+/// 上限 2048，超限整体清空（规则集远小于此值）。
+const MAX_RULE_REGEX_CACHE: usize = 2048;
+
 fn regex_matches(pattern: &str, url: &str) -> bool {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(url))
-        .unwrap_or(false)
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static CACHE: Lazy<Mutex<HashMap<String, Option<regex::Regex>>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(pattern) {
+        return cached.as_ref().is_some_and(|re| re.is_match(url));
+    }
+    let compiled = regex::Regex::new(pattern).ok();
+    if cache.len() >= MAX_RULE_REGEX_CACHE {
+        cache.clear();
+    }
+    let hit = compiled.as_ref().is_some_and(|re| re.is_match(url));
+    cache.insert(pattern.to_string(), compiled);
+    hit
 }
 
 /// DNS 适配器：watt-dns → outbound::DnsResolve
@@ -1188,6 +1362,37 @@ fn not_found_response() -> RelayResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prefixed_body_emits_prefix_then_rest() {
+        let body = PrefixedBody {
+            prefix: Some(Bytes::from_static(b"ab")),
+            rest: Full::new(Bytes::from_static(b"cd")),
+        };
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"abcd");
+    }
+
+    #[tokio::test]
+    async fn collect_with_limit_overflow_keeps_prefix_and_rest() {
+        use futures::stream;
+        use http_body_util::StreamBody;
+
+        let frames = vec![
+            Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"ab"))),
+            Ok(Frame::data(Bytes::from_static(b"cd"))),
+            Ok(Frame::data(Bytes::from_static(b"ef"))),
+        ];
+        let body = StreamBody::new(stream::iter(frames));
+        match collect_with_limit(body, 3).await.unwrap() {
+            CollectOutcome::Overflow { prefix, rest } => {
+                assert_eq!(&prefix[..], b"abcd");
+                let rest = rest.collect().await.unwrap().to_bytes();
+                assert_eq!(&rest[..], b"ef");
+            }
+            CollectOutcome::Complete(_) => panic!("应判定为超限"),
+        }
+    }
 
     #[test]
     fn test_request_host_from_host_header() {

@@ -48,14 +48,24 @@ pub fn generate_pac(
     pac
 }
 
-/// 收集去重（大小写不敏感），按 JS 字符串字面量规则转义（先 `\` 后 `'`）
+/// 收集去重（大小写不敏感），按 JS 字符串字面量规则转义（先 `\` 后 `'`）。
+///
+/// 换行必须转成转义序列：匹配域名来自云端目录，若原样写入会闭合当前
+/// `if` 行并注入新的 PAC 语句（PAC 由系统代理引擎求值）。
 fn push_pattern(patterns: &mut Vec<String>, name: &str) {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty() {
         return;
     }
     if !patterns.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
-        patterns.push(name.replace('\\', "\\\\").replace('\'', "\\'"));
+        let escaped = name
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
+        patterns.push(escaped);
     }
 }
 
@@ -110,5 +120,19 @@ mod tests {
         let pac = generate_pac("127.0.0.1:26501", &rules, &[]);
         // 单引号前必须有反斜杠（转义序列 `\'`），字符串不会被提前闭合
         assert!(pac.contains(r"x\\\'"), "实际 PAC: {pac}");
+    }
+
+    /// 换行不得破坏 PAC 行结构（原样写入会注入新的 JS 语句）
+    #[test]
+    fn test_pac_pattern_escapes_newlines() {
+        let rules = DomainRules::new(vec![watt_config::DomainRule {
+            match_domain_names: vec!["a.com\n    return 'PROXY evil:1';//".into()],
+            ..Default::default()
+        }]);
+        let pac = generate_pac("127.0.0.1:26501", &rules, &[]);
+        // 除固定的函数头/尾外，注入内容必须仍在 shExpMatch 的单行字符串里
+        assert!(!pac.contains("\n    return 'PROXY evil:1'"), "实际 PAC: {pac}");
+        assert!(pac.contains(r"a.com\n    return"), "实际 PAC: {pac}");
+        assert_eq!(pac.lines().count(), 5, "实际 PAC: {pac}");
     }
 }

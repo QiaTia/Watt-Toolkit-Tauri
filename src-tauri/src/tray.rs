@@ -162,8 +162,6 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         })
         .unwrap_or_default();
 
-    let ca: Arc<CaCertificate> = state.ca.read().await.clone();
-
     let listen_ip: IpAddr = settings
         .system_proxy_ip
         .as_deref()
@@ -192,6 +190,10 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         }
     });
 
+    // 与 cert_regenerate 共用 engine 锁顺序：先锁引擎再读 CA，避免读到已被替换的旧 CA
+    let mut engine = state.engine.lock().await;
+    let ca: Arc<CaCertificate> = state.ca.read().await.clone();
+
     let config = EngineConfig {
         mode: settings.proxy_mode,
         listen_ip,
@@ -203,7 +205,11 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         },
         forward_proxy_port,
         socks5_port: if settings.socks5_proxy_enable {
-            Some(settings.socks5_proxy_port)
+            Some(if settings.socks5_proxy_port == 0 {
+                watt_config::constants::DEFAULT_SOCKS5_PROXY_PORT
+            } else {
+                settings.socks5_proxy_port
+            })
         } else {
             None
         },
@@ -228,7 +234,6 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         terminal_proxy,
     };
 
-    let mut engine = state.engine.lock().await;
     engine.start(config).await.map_err(|e| e.to_string())?;
     Ok(engine.state())
 }

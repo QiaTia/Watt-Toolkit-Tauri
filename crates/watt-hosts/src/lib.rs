@@ -229,13 +229,17 @@ impl HostsManager {
             .collect())
     }
 
-    /// 是否存在加速标记块
+    /// 是否存在加速标记块。
+    ///
+    /// 同时识别 Start / End：写入中途崩溃（文件被截断、只有 Start 没有 End）
+    /// 同样属于残留劫持，必须让启动清理得以执行，否则域名仍指向本机而无监听。
     pub fn contains_mark(&self) -> bool {
         std::fs::read_to_string(&self.path)
             .map(|c| {
-                c.lines()
-                    .rev()
-                    .any(|l| l.trim_start().starts_with(MARK_END))
+                c.lines().any(|l| {
+                    let trimmed = l.trim_start();
+                    trimmed.starts_with(MARK_START) || trimmed.starts_with(MARK_END)
+                })
             })
             .unwrap_or(false)
     }
@@ -260,27 +264,125 @@ impl HostsManager {
 /// 且引擎停监听后 hosts 标记块残留会造成「域名指向 127.0.0.1 但无服务」的黑洞。
 /// 用户取消 → [`HostsError::Unauthorized`]（调用方按"无权限"处理，与现有语义一致）。
 fn write_file(path: &std::path::Path, content: &str) -> Result<(), HostsError> {
-    match std::fs::write(path, content) {
+    match atomic_replace(path, content) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            #[cfg(target_os = "macos")]
-            {
-                write_file_elevated(path, content)
-            }
-            #[cfg(target_os = "windows")]
-            {
-                // Windows 无按需提权：hosts 位于受保护目录，只有管理员令牌可写。
-                // 正常入口（应用清单 requireAdministrator）不会命中此分支；
-                // 命中时给出可执行的中文指引，避免 UI 只看到裸 `os error 5`。
-                tracing::error!(path = %path.display(), error = %e, "hosts 写入被拒绝");
-                Err(HostsError::ElevationRequired(e.to_string()))
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            {
-                Err(HostsError::Io(e))
+        Err(AtomicWriteError::Rename(e)) => {
+            // Windows 上 hosts 常被杀软/其他进程持有句柄，rename 会共享冲突。
+            // 回退到直接写：牺牲原子性，但保证加速功能可用；记录警告便于排查。
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "hosts 原子替换失败，回退直接写入（存在写入中崩溃风险）"
+            );
+            match std::fs::write(path, content) {
+                Ok(()) => Ok(()),
+                Err(e) => handle_write_error(path, content, e),
             }
         }
-        Err(e) => Err(HostsError::Io(e)),
+        Err(AtomicWriteError::Io(e)) => handle_write_error(path, content, e),
+    }
+}
+
+/// 统一处理写入错误：权限拒绝时走平台兜底（macOS 提权 / Windows 给出明确指引）。
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn handle_write_error(
+    path: &std::path::Path,
+    content: &str,
+    e: std::io::Error,
+) -> Result<(), HostsError> {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        #[cfg(target_os = "macos")]
+        {
+            write_file_elevated(path, content)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 无按需提权：hosts 位于受保护目录，只有管理员令牌可写。
+            // 正常入口（应用清单 requireAdministrator）不会命中此分支；
+            // 命中时给出可执行的中文指引，避免 UI 只看到裸 `os error 5`。
+            tracing::error!(path = %path.display(), error = %e, "hosts 写入被拒绝");
+            Err(HostsError::ElevationRequired(e.to_string()))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Err(HostsError::Io(e))
+        }
+    } else {
+        Err(HostsError::Io(e))
+    }
+}
+
+/// 原子替换失败类型：rename 失败可安全回退直接写，其余错误按原语义处理。
+enum AtomicWriteError {
+    Io(std::io::Error),
+    Rename(std::io::Error),
+}
+
+/// 同目录临时文件 + fsync + rename，保证 hosts 不会出现「截断到一半」的中间态。
+///
+/// 临时文件放在目标目录而非 %TEMP%（跨卷 rename 会退化为复制，失去原子性）；
+/// Unix 下继承原文件权限（默认 0644），避免 umask 077 把 hosts 改成 0600。
+fn atomic_replace(path: &std::path::Path, content: &str) -> Result<(), AtomicWriteError> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let pid = std::process::id();
+    let mut created: Option<(std::path::PathBuf, std::fs::File)> = None;
+    for attempt in 0..8u32 {
+        let candidate = dir.join(format!(".watt-hosts-{pid}-{attempt}.tmp"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(AtomicWriteError::Io(e)),
+        }
+    }
+    let Some((tmp_path, mut file)) = created else {
+        return Err(AtomicWriteError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "hosts 临时文件创建失败（重试 8 次）",
+        )));
+    };
+
+    if let Err(e) = file
+        .write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AtomicWriteError::Io(e));
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644);
+        if let Err(e) =
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AtomicWriteError::Io(e));
+        }
+    }
+
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(AtomicWriteError::Rename(e))
+        }
     }
 }
 
@@ -383,6 +485,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_write_file_atomic_replaces_and_keeps_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("watt-hosts-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        write_file(&path, "127.0.0.1 localhost\n# new line\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "127.0.0.1 localhost\n# new line\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "原子替换不应改变 hosts 权限");
+        }
+
+        // 临时文件不得残留
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".watt-hosts-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_update_remove_roundtrip() {
         let dir = std::env::temp_dir().join(format!("watt-hosts-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -418,6 +563,40 @@ mod tests {
         assert!(!content2.contains(BACKUP_MARK_START));
         assert!(content2.contains("1.2.3.4 old.example.com"));
         assert!(content2.contains("# user comment"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_contains_mark_detects_truncated_block() {
+        let dir = std::env::temp_dir().join(format!("watt-hosts-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let mgr = HostsManager::with_path(&path);
+
+        // 只有 Start（写入中途崩溃）也必须判定为残留
+        std::fs::write(
+            &path,
+            "127.0.0.1 localhost\r\n# Steam++ Start\r\n127.0.0.1 github.com\r\n",
+        )
+        .unwrap();
+        assert!(mgr.contains_mark());
+
+        // remove_hosts_by_tag 可清掉不完整标记块，并保留普通条目
+        mgr.remove_hosts_by_tag().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains(MARK_START), "{content}");
+        assert!(!content.contains("github.com"), "{content}");
+        assert!(content.contains("127.0.0.1 localhost"), "{content}");
+
+        // 只有 End 同样是残留
+        std::fs::write(&path, "# Steam++ End\r\n").unwrap();
+        assert!(mgr.contains_mark());
+
+        // 干净文件不误报
+        std::fs::write(&path, "127.0.0.1 localhost\r\n").unwrap();
+        assert!(!mgr.contains_mark());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

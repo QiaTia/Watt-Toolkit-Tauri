@@ -6,6 +6,7 @@ import { useSettingsStore } from '@/stores/settings';
 import { useProxyStore } from '@/stores/proxy';
 import { useCertStore } from '@/stores/cert';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
+import { dnsProbeDoh } from '@/api';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
 import { isMacOS } from '@/utils/platform';
 import type { ProxyMode } from '@/types/ipc';
@@ -29,6 +30,9 @@ const language = computed<LocaleCode>({
 
 /** 证书操作错误（UAC 取消 / 引擎运行中等） */
 const certError = ref<string | null>(null);
+
+/** DoH 连通性测试中（防止重复点击） */
+const dohTesting = ref(false);
 
 onMounted(() => {
   if (!settings.loaded) void settings.ensureLoaded().catch(() => {});
@@ -162,6 +166,30 @@ async function regenerateCa(): Promise<void> {
     await cert.regenerate();
     message.warning(t('settings.certRegenerated'));
   });
+}
+
+/**
+ * DoH 连通性测试：显式验证 TLS 握手 + 真实解析。
+ * 引擎启动时若端点配置无效会回退系统 DNS，这里给用户一个「不静默」的检查入口。
+ */
+async function probeDoh(): Promise<void> {
+  if (dohTesting.value) return;
+  dohTesting.value = true;
+  try {
+    const r = await dnsProbeDoh(customDohAddress.value || null);
+    message.success(
+      t('settings.dohTestOk', {
+        host: r.host,
+        ips: r.ips.join(', '),
+        ms: r.elapsedMs,
+      }),
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    message.error(t('settings.dohTestFail', { error: msg }));
+  } finally {
+    dohTesting.value = false;
+  }
 }
 
 /** 格式化指纹为每组两字符的可读形式 */
@@ -343,11 +371,16 @@ function formatTime(iso: string): string {
           </a-col>
           <a-col v-if="settings.settings.dns.use_doh" :xs="24" :md="12" :lg="8">
             <a-form-item :label="$t('settings.dohAddr')">
-              <a-input
-                v-model:value="customDohAddress"
-                placeholder="https://dns.alidns.com/dns-query"
-                allow-clear
-              />
+              <div class="doh-row">
+                <a-input
+                  v-model:value="customDohAddress"
+                  placeholder="https://dns.alidns.com/dns-query"
+                  allow-clear
+                />
+                <a-button :loading="dohTesting" @click="probeDoh">
+                  {{ $t('settings.dohTest') }}
+                </a-button>
+              </div>
             </a-form-item>
           </a-col>
         </a-row>
@@ -435,6 +468,16 @@ function formatTime(iso: string): string {
 
 .w-full {
   width: 100%;
+}
+
+.doh-row {
+  display: flex;
+  gap: 8px;
+}
+
+.doh-row :deep(.ant-input-affix-wrapper),
+.doh-row :deep(.ant-input) {
+  flex: 1;
 }
 
 .cert-desc {

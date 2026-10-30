@@ -301,23 +301,19 @@ fn disable_impl(text: &str) -> Result<usize, String> {
 
 #[cfg(target_os = "windows")]
 fn write_backup(path: &Path, backup: &Backup) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
     let json = serde_json::to_string_pretty(backup).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| format!("写入备份失败: {e}"))
+    // 原子写：备份是唯一的还原依据，截断损坏会导致环境变量永久残留
+    watt_config::settings::write_atomic(path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 #[cfg(unix)]
 fn write_unix_backup(path: &Path, files: &[InjectedFile]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
     let json = serde_json::to_string_pretty(&UnixBackup {
         files: files.to_vec(),
     })
     .map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| format!("写入备份失败: {e}"))
+    // 原子写：理由同 Windows 分支
+    watt_config::settings::write_atomic(path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "windows")]

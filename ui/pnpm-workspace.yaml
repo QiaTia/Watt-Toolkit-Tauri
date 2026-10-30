@@ -2,3 +2,7 @@ allowBuilds:
   core-js: true
   esbuild: true
   vue-demi: true
+# 构建期依赖安全：source-map-js <1.2.2 存在事件循环 DoS（GHSA-68fv-2mgg-jv7q），
+# 由 @vue/compiler-* 与 @intlify/* 传递引入；1.2.2 与其 API 兼容。
+overrides:
+  source-map-js: ">=1.2.2"

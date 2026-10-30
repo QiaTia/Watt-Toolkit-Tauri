@@ -19,7 +19,7 @@ pub enum TrustError {
     Elevation(String),
 }
 
-/// CA 主题 CN（用于按名称删除）
+/// CA 主题 CN（仅用于展示/手动排查；删除一律按证书指纹/ DER 精确匹配）
 pub const CA_SUBJECT_CN: &str = crate::ca::CA_SUBJECT_CN;
 
 /// SHA-1 指纹（十六进制小写，与 security find-certificate -Z 输出一致）
@@ -38,6 +38,16 @@ pub fn sha256_hex_upper(data: &[u8]) -> String {
     hasher.update(data);
     let out = hasher.finalize();
     out.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// 读取 PEM 中的第一张证书 DER
+fn read_cert_der(cert_pem_path: &Path) -> Result<Vec<u8>, TrustError> {
+    let content = std::fs::read_to_string(cert_pem_path)?;
+    let der = rustls_pemfile::certs(&mut content.as_bytes())
+        .next()
+        .ok_or_else(|| TrustError::Trust("PEM 中无证书".into()))?
+        .map_err(|e| TrustError::Trust(format!("PEM 解析失败: {e}")))?;
+    Ok(der.to_vec())
 }
 
 // —————————————— macOS security 输出的纯逻辑（跨平台可单测） ——————————————
@@ -117,7 +127,7 @@ fn manual_install_hint(cert_path: &str, cause: &str) -> String {
 
 #[cfg(target_os = "windows")]
 pub mod platform {
-    use super::TrustError;
+    use super::{sha1_hex, TrustError};
     use std::path::Path;
 
     fn load_der_from_pem(cert_pem_path: &Path) -> Result<Vec<u8>, TrustError> {
@@ -209,57 +219,30 @@ pub mod platform {
         }
 
         // 直接写入失败（通常无管理员权限）→ 提权 certutil
+        // 必须带 -user：直接 API 写的是当前用户 Root，查询/删除也按用户存储；
+        // 不加 -user 会写到机器 Root，导致安装后校验不到、卸载后残留机器信任。
         let path_str = cert_pem_path.to_string_lossy().to_string();
-        tracing::warn!("直接写入 Root 存储失败，尝试提权 certutil -addstore");
-        run_elevated("certutil", &format!("-f -addstore Root \"{path_str}\""))
+        tracing::warn!("直接写入 Root 存储失败，尝试提权 certutil -addstore -user");
+        run_elevated(
+            "certutil",
+            &format!("-f -addstore -user Root \"{path_str}\""),
+        )
     }
 
-    /// 证书主题字符串（CERT_NAME_BLOB → CERT_SIMPLE_NAME_STR）
-    /// SAFETY: 调用方保证 ctx 指向有效 context；结果在函数内拷贝为 String。
-    unsafe fn cert_subject_string(
-        ctx: *const windows_sys::Win32::Security::Cryptography::CERT_CONTEXT,
-    ) -> String {
-        use windows_sys::Win32::Security::Cryptography::{
-            CertNameToStrA, CERT_SIMPLE_NAME_STR, X509_ASN_ENCODING,
-        };
-        let blob = (*(*ctx).pCertInfo).Subject;
-        let len = CertNameToStrA(
-            X509_ASN_ENCODING,
-            &blob,
-            CERT_SIMPLE_NAME_STR,
-            std::ptr::null_mut(),
-            0,
-        );
-        if len == 0 {
-            return String::new();
-        }
-        let mut buf = vec![0u8; len as usize];
-        CertNameToStrA(
-            X509_ASN_ENCODING,
-            &blob,
-            CERT_SIMPLE_NAME_STR,
-            buf.as_mut_ptr(),
-            len,
-        );
-        // 返回长度含结尾 NUL
-        String::from_utf8_lossy(&buf[..(len as usize).saturating_sub(1)]).into_owned()
-    }
-
-    /// 移除根证书（按 Subject CN 枚举删除；未命中/失败时提权 certutil）
-    pub fn remove_root_cert() -> Result<(), TrustError> {
-        let mut removed = false;
+    /// 移除根证书（按 DER 精确匹配；未命中时幂等返回成功）
+    pub fn remove_root_cert_der(der: &[u8]) -> Result<(), TrustError> {
+        let mut delete_failed = false;
         // SAFETY: CertEnumCertificatesInStore 每次调用释放上一个 context；
-        // CertDeleteCertificateFromStore 释放当前 context（随后枚举重置），无泄漏/双重释放。
+        // CertDeleteCertificateFromStore 成功后释放当前 context，失败时由我们释放。
         unsafe {
             use windows_sys::Win32::Security::Cryptography::{
                 CertCloseStore, CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
-                CertOpenSystemStoreA, CERT_CONTEXT,
+                CertFreeCertificateContext, CertOpenSystemStoreA, CERT_CONTEXT,
             };
             let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
             if store.is_null() {
                 return Err(TrustError::Trust("CertOpenSystemStore(ROOT) 失败".into()));
             }
-            let cn = super::CA_SUBJECT_CN.to_string();
             let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
             loop {
                 // 本次调用释放上一个 ctx（若非空）
@@ -267,26 +250,37 @@ pub mod platform {
                 if ctx.is_null() {
                     break;
                 }
-                let subject = cert_subject_string(ctx);
-                if subject.contains(&cn) {
-                    CertDeleteCertificateFromStore(ctx); // 释放 ctx
+                let encoded_ptr = (*ctx).pbCertEncoded as *const u8;
+                let encoded_len = (*ctx).cbCertEncoded as usize;
+                if encoded_ptr.is_null() || encoded_len == 0 {
+                    continue;
+                }
+                let bytes = std::slice::from_raw_parts(encoded_ptr, encoded_len);
+                if bytes == der {
+                    if CertDeleteCertificateFromStore(ctx) == 0 {
+                        // 删除失败时 context 未释放，需自行释放否则泄漏
+                        delete_failed = true;
+                        CertFreeCertificateContext(ctx);
+                    }
                     ctx = std::ptr::null_mut(); // 从头重新枚举
-                    removed = true;
                 }
             }
             CertCloseStore(store, 0);
         }
 
-        if removed {
-            Ok(())
-        } else {
-            // 未匹配到或无权限删除 → 提权 certutil 按主题删除
-            tracing::warn!("直接删除 Root 存储未命中/失败，尝试提权 certutil -delstore");
-            run_elevated(
-                "certutil",
-                &format!("-f -delstore Root \"{}\"", super::CA_SUBJECT_CN),
-            )
+        if delete_failed {
+            // 无权限/被安全软件锁定 → 按 SHA-1 thumbprint 提权精确删除（不再按 CN）。
+            // 同时覆盖用户存储（-user，与安装/查询一致）和旧版本可能写入的机器存储。
+            let thumbprint = sha1_hex(der).to_uppercase();
+            tracing::warn!("直接删除根证书失败，尝试提权 certutil -delstore {thumbprint}");
+            let args = format!(
+                "/C certutil -f -delstore -user Root {thumbprint} & \
+                 certutil -f -delstore Root {thumbprint} & exit /b 0"
+            );
+            return run_elevated("cmd.exe", &args);
         }
+        // 未命中即已不存在：保持幂等，不再按 CN 误删同名第三方根证书
+        Ok(())
     }
 
     /// 检查根证书是否已安装（LocalMachine\Root 中存在同 DER 证书）
@@ -505,15 +499,15 @@ pub mod platform {
         }
     }
 
-    /// 卸载根证书（用户域 / 系统域中的全部同名残留）
+    /// 移除根证书（按 SHA-1 精确匹配；未命中时幂等返回成功）
     ///
-    /// 只做 `delete-certificate`：macOS 的 trust settings 是 keychain item 的属性，
-    /// 随条目删除一并消失。原实现用 `security remove-trusted-cert "CN=<CN>"` 是错的
-    /// —— 该命令的参数是**证书文件路径**，传 CN 字符串必然 `no such file`。
+    /// 只做 `delete-certificate -Z <sha1>`：macOS 的 trust settings 是 keychain item
+    /// 的属性，随条目删除一并消失。按指纹而非 CN 删除，避免误删同名第三方证书。
     ///
     /// 用户域直删（免提权）；失败项（通常是系统域）合并为单条脚本提权一次。
-    pub fn remove_root_cert() -> Result<(), TrustError> {
-        let entries = find_cert_entries();
+    pub fn remove_root_cert_der(der: &[u8]) -> Result<(), TrustError> {
+        let sha1 = sha1_hex(der);
+        let entries = find_cert_entries(&sha1);
         if entries.is_empty() {
             return Ok(());
         }
@@ -552,8 +546,10 @@ pub mod platform {
         }
     }
 
-    /// 枚举用户/系统钥匙串中本 CA 的全部 (keychain, sha1)
-    fn find_cert_entries() -> Vec<(String, String)> {
+    /// 枚举用户/系统钥匙串中 SHA-1 命中的证书条目
+    ///
+    /// 先用 `-c <CN>` 缩小范围（本应用 CA 主题固定），再按 SHA-1 精确过滤。
+    fn find_cert_entries(sha1: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for keychain in [user_keychain(), SYSTEM_KEYCHAIN.to_string()] {
             let Ok(res) = security_output(&[
@@ -574,7 +570,7 @@ pub mod platform {
                 if let Some((k, v)) = line.split_once(':') {
                     if k.trim().eq_ignore_ascii_case("SHA-1 hash") {
                         let h = v.trim().to_ascii_lowercase();
-                        if !h.is_empty() {
+                        if h == sha1 {
                             out.push((keychain.clone(), h));
                         }
                     }
@@ -738,7 +734,7 @@ pub mod platform {
         }
     }
 
-    pub fn remove_root_cert() -> Result<(), TrustError> {
+    pub fn remove_root_cert_der(_der: &[u8]) -> Result<(), TrustError> {
         let _ = std::fs::remove_file(CERT_TARGET);
         let status = Command::new("update-ca-certificates")
             .status()
@@ -765,9 +761,18 @@ pub mod platform {
 /// 平台无关接口：安装根证书信任（PEM 路径入参）
 pub use platform::install_root_cert;
 
-/// 平台无关接口：移除根证书信任
-pub fn remove_root_cert() -> Result<(), TrustError> {
-    platform::remove_root_cert()
+/// 平台无关接口：移除根证书信任（按 PEM 中的证书精确匹配）
+pub fn remove_root_cert(cert_pem_path: &Path) -> Result<(), TrustError> {
+    let der = read_cert_der(cert_pem_path)?;
+    platform::remove_root_cert_der(&der)
+}
+
+/// 平台无关接口：按 DER 精确移除根证书信任
+///
+/// 用于「旧 CA 已被新证书覆盖」的场景（重新生成后清理旧信任）：调用方需在
+/// 覆盖前保存旧 `cert_der`，否则只能按 CN 模糊匹配（可能误删同名第三方根证书）。
+pub fn remove_root_cert_der(der: &[u8]) -> Result<(), TrustError> {
+    platform::remove_root_cert_der(der)
 }
 
 /// 平台无关接口：根证书是否已安装并信任

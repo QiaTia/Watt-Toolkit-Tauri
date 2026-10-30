@@ -39,6 +39,9 @@ use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// 等待上游响应头的累计上限：升级目标可能静默挂死，不能无限占用连接槽位
+const UPSTREAM_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 出站 IO 统一枚举（tokio 的 AsyncWrite 有泛型方法，不能进 trait object）
 enum OutboundIo {
     Plain(tokio::net::TcpStream),
@@ -188,13 +191,14 @@ pub async fn handle_upgrade(
         .await
         .map_err(|e| format!("Upgrade 写出站请求失败: {e}"))?;
 
-    // 读服务端响应头（至 \r\n\r\n）
+    // 读服务端响应头（至 \r\n\r\n）；累计截止时间防僵尸上游无限挂起
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + UPSTREAM_HEADER_TIMEOUT;
     let header_end = loop {
-        let n = outbound
-            .read(&mut chunk)
+        let n = tokio::time::timeout_at(deadline, outbound.read(&mut chunk))
             .await
+            .map_err(|_| "Upgrade 等待上游响应头超时".to_string())?
             .map_err(|e| format!("Upgrade 读上游响应失败: {e}"))?;
         if n == 0 {
             return Err("Upgrade 上游在响应头结束前关闭".into());

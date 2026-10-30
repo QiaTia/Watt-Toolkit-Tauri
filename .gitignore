@@ -36,7 +36,9 @@ ui/lerna-debug.log*
 **/target/
 **/*.rs.bk
 **/*.pdb
-Cargo.lock
+# 应用（非库）必须锁定依赖版本：Cargo.lock 需纳入版本控制，保证构建可复现、
+# 安全修复可审计（此前被忽略，CI/新机器会解析到不同的传递依赖）。
+# Cargo.lock
 src-tauri/target/
 src-tauri/.cargo/
 src-tauri/*.log

@@ -47,7 +47,8 @@ pub fn save_cached(catalog: &AccelerateCatalog, cache_dir: Option<&std::path::Pa
     }
     match serde_json::to_string_pretty(catalog) {
         Ok(text) => {
-            if let Err(e) = fs::write(&path, text) {
+            // 原子替换：截断写入中途崩溃会留下半截 JSON，下次启动只能降级内置目录
+            if let Err(e) = watt_config::settings::write_atomic(&path, text.as_bytes()) {
                 tracing::warn!(path = %path.display(), error = %e, "写入加速项目缓存失败");
             }
         }

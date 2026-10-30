@@ -50,5 +50,24 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
     sourcemap: false,
+    // 主 chunk 曾达 ~595KB（antd + vue 全打进入口）。按依赖分组拆成可长期缓存的
+    // vendor chunk，降低首包体积并避免每次业务代码变更都让整个 bundle 失效。
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (
+            id.includes('@vue/') ||
+            id.includes('/vue/') ||
+            id.includes('vue-router') ||
+            id.includes('vue-i18n') ||
+            id.includes('pinia')
+          ) {
+            return 'vue';
+          }
+          return undefined;
+        },
+      },
+    },
   },
 });

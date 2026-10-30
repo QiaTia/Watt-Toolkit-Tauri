@@ -16,12 +16,11 @@ use watt_dns::{DnsConfig, DnsResolver};
 
 use crate::AppState;
 
-/// 刷新用解析器优先级：用户配置的 DNS（仅 IP 字面量）→ 内置公共 DNS（UDP）
-/// → 系统 DNS。首个返回非空可用地址者胜出。
+/// 刷新用解析器优先级：DoH（启用且实际可用）→ 用户配置的 DNS（仅 IP 字面量）
+/// → 内置公共 DNS（UDP）→ 系统 DNS。首个返回非空可用地址者胜出。
 ///
-/// 注：**不使用 DoH**。`watt-dns` 的 DoH 只接受 IP 字面量端点，而 hickory 解析该
-/// URL 时实测报 `bad dns_name`（`https://223.5.5.5/dns-query` 直接失败）；域名型
-/// 端点又被 `parse_doh_url` 拒绝——两条路都不可用，故一律走 UDP/系统解析。
+/// DoH 端点若配置无效（非 https、路径不支持、引导解析失败），`DnsResolver`
+/// 会标记为非 DoH 且不会进入本链路，避免重复的系统 DNS 兜底。
 /// `1.1.1.1` 在本网络实测 UDP 需 ~6s（Cloudflare 多被阻断），一并剔除以免拖慢刷新。
 const PUBLIC_DNS_IPS: &[&str] = &["223.5.5.5", "119.29.29.29", "8.8.8.8"];
 
@@ -30,11 +29,33 @@ const MAX_HOSTS: usize = 64;
 /// 单候选探测超时（握手用途，3s 足够判死活）
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 构建解析器链
-fn build_resolvers(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
+/// 构建解析器链（含 DoH 引导解析，可能阻塞数秒 → 放 spawn_blocking）
+async fn build_resolvers(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
+    let dns = dns.clone();
+    tokio::task::spawn_blocking(move || build_resolvers_sync(&dns))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "构建 DNS 解析器任务异常，回退系统 DNS");
+            vec![Arc::new(DnsResolver::system())]
+        })
+}
+
+fn build_resolvers_sync(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
     let mut out: Vec<Arc<DnsResolver>> = Vec::new();
 
-    // 1. 用户配置的 DNS（仅当为 IP 字面量时生效；域名型 / DoH 不适用于本链路）
+    // 1. DoH（仅当启用且端点真正可用；失效时由后续 UDP 链路兜底）
+    if dns.use_doh {
+        let resolver = DnsResolver::with_config(DnsConfig {
+            master_dns: None,
+            use_doh: true,
+            custom_doh_address: dns.custom_doh_address.clone(),
+        });
+        if resolver.is_doh_active() {
+            out.push(Arc::new(resolver));
+        }
+    }
+
+    // 2. 用户配置的 DNS（仅当为 IP 字面量时生效；域名型不适用于本链路）
     if let Some(master) = dns.master_dns.as_deref().filter(|s| !s.is_empty()) {
         if master.parse::<IpAddr>().is_ok() {
             out.push(Arc::new(DnsResolver::with_config(DnsConfig {
@@ -45,7 +66,7 @@ fn build_resolvers(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
         }
     }
 
-    // 2. 内置公共 DNS（UDP）
+    // 3. 内置公共 DNS（UDP）
     for ip in PUBLIC_DNS_IPS {
         out.push(Arc::new(DnsResolver::with_config(DnsConfig {
             master_dns: Some((*ip).to_string()),
@@ -54,7 +75,7 @@ fn build_resolvers(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
         })));
     }
 
-    // 3. 系统 DNS（最终兜底）
+    // 4. 系统 DNS（最终兜底）
     out.push(Arc::new(DnsResolver::system()));
     out
 }
@@ -177,7 +198,7 @@ pub async fn ip_pool_refresh(
         return Ok(Vec::new());
     }
 
-    let resolvers = build_resolvers(&settings.dns);
+    let resolvers = build_resolvers(&settings.dns).await;
     let results = watt_core::ip_pool::refresh_hosts(&hosts, &resolvers, 443, PROBE_TIMEOUT).await;
 
     // 落盘（下次启动自动加载）
@@ -400,7 +421,7 @@ pub async fn ip_pool_refresh_host(
     let dir = pool_dir(&state);
     let settings =
         watt_config::settings::load_proxy_settings_in(&dir).map_err(|e| e.to_string())?;
-    let resolvers = build_resolvers(&settings.dns);
+    let resolvers = build_resolvers(&settings.dns).await;
 
     let mut results =
         watt_core::ip_pool::refresh_hosts(std::slice::from_ref(&host), &resolvers, 443, PROBE_TIMEOUT).await;
