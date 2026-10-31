@@ -5549,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "watt-cert"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5577,7 +5577,7 @@ dependencies = [
 
 [[package]]
 name = "watt-cloud"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "reqwest",
  "rustls",
@@ -5591,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "watt-config"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "dirs 5.0.1",
  "regex",
@@ -5603,7 +5603,7 @@ dependencies = [
 
 [[package]]
 name = "watt-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5643,7 +5643,7 @@ dependencies = [
 
 [[package]]
 name = "watt-dns"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "dashmap",
  "futures",
@@ -5659,7 +5659,7 @@ dependencies = [
 
 [[package]]
 name = "watt-elevate"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -5668,7 +5668,7 @@ dependencies = [
 
 [[package]]
 name = "watt-hosts"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -5678,7 +5678,7 @@ dependencies = [
 
 [[package]]
 name = "watt-script"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "futures",
  "rquickjs",
@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "watt-toolkit-app"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "chrono",
  "rustls",

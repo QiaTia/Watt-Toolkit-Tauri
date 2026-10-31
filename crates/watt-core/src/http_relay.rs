@@ -1102,10 +1102,14 @@ fn build_outbound_headers(
 
     if !cookie_parts.is_empty() {
         let joined = cookie_parts.join("; ");
-        out.insert(
-            COOKIE,
-            HeaderValue::from_str(&joined).map_err(|e| e.to_string())?,
-        );
+        let value = HeaderValue::from_str(&joined).map_err(|e| e.to_string())?;
+        if out.contains_key(COOKIE) {
+            // 上面有非可见 ASCII 的 Cookie 已逐条透传：这里必须 append，
+            // 用 insert 会把透传项整体清掉（与本函数「宁可多一条也不丢」的承诺相反）。
+            out.append(COOKIE, value);
+        } else {
+            out.insert(COOKIE, value);
+        }
         // 只在真的拆过段时记录，正常单条 Cookie 不产生噪音
         if cookie_fields > 1 {
             tracing::debug!(
@@ -1494,6 +1498,21 @@ mod tests {
         );
         assert_eq!(out.get(HOST).unwrap(), "www.figma.com");
         assert_eq!(out.get("accept").unwrap(), "*/*");
+    }
+
+    /// 非可见 ASCII 的 Cookie 走逐条透传，与合并项并存时不得被覆盖
+    #[test]
+    fn test_outbound_headers_keeps_binary_cookie_alongside_merged() {
+        let mut src = HeaderMap::new();
+        src.append(COOKIE, HeaderValue::from_static("normal=1"));
+        // 0x80 属 obs-text：HeaderValue 允许，但 to_str() 失败 → 走逐条透传分支
+        src.append(COOKIE, HeaderValue::from_bytes(b"raw=\x80\x81").unwrap());
+
+        let out = build_outbound_headers(&src, "x.com").unwrap();
+        let cookies: Vec<&[u8]> = out.get_all(COOKIE).iter().map(HeaderValue::as_bytes).collect();
+        assert_eq!(cookies.len(), 2, "透传项与合并项都必须保留");
+        assert!(cookies.iter().any(|c| *c == b"raw=\x80\x81"));
+        assert!(cookies.iter().any(|c| *c == b"normal=1"));
     }
 
     /// 单条 Cookie 原样保留，不应被加上分隔符或改写

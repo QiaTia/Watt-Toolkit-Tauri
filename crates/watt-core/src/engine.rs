@@ -318,6 +318,16 @@ impl ProxyEngine {
 
         self.state.send_replace(EngineState::Starting);
         let mode = config.mode;
+
+        // macOS：Hosts 模式需要 root（监听 443 属特权端口，非 root 进程 bind 必 EACCES）。
+        // 必须在写 hosts **之前**拦截 —— 否则会先留下「域名指向 127.0.0.1 但 443 无监听」
+        // 的黑洞窗口（项目铁律），且用户看到的只是裸 "Permission denied"。
+        if mode == ProxyMode::Hosts {
+            if let Some(reason) = crate::privileged::hosts_mode_block_reason() {
+                self.state.send_replace(EngineState::Error(reason.clone()));
+                return Err(EngineError::Other(reason));
+            }
+        }
         // 落盘配置存 engine（stop 时保存用；config 之后不再可用）
         self.probe_cache_path = config.probe_cache_path.clone();
         self.probe_cache_persist = config.probe_cache_persist;
@@ -754,6 +764,19 @@ fn authority(ip: &IpAddr, port: u16) -> String {
 
 /// 绑定失败描述（Windows 附带占用进程名诊断）
 fn describe_bind_error(e: std::io::Error, port: u16) -> String {
+    // 特权端口 + 权限拒绝：裸 "Permission denied" / "Access is denied" 对用户毫无指引，
+    // 直接给可执行的替代方案，而不是让用户去猜「为什么点加速就失败」。
+    if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+        let hint = if cfg!(target_os = "macos") {
+            "macOS 无放开手段"
+        } else {
+            "Linux 可设 net.ipv4.ip_unprivileged_port_start=0 放开"
+        };
+        return format!(
+            "绑定端口 {port} 被拒绝：1024 以下端口默认仅管理员可绑（{hint}）。\
+             请改用「系统代理」或「PAC」模式，或以管理员身份启动应用。"
+        );
+    }
     match crate::port_diag::find_listener_process(port) {
         Some(p) => format!("{e}（进程 {} / PID {}）", p.name, p.pid),
         None => e.to_string(),

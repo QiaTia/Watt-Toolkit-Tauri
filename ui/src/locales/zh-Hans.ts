@@ -69,7 +69,7 @@ const zhHans = {
         label: 'Hosts 模式',
         desc: '修改 hosts 指向本地 443 反代（需 443 端口空闲，写入 hosts 可能需要管理员权限）',
         descMac:
-          'macOS 下写入 /etc/hosts 需要管理员权限：启动与停止引擎各会弹出一次系统密码框。',
+          'macOS 上 Hosts 模式不可用：监听 443 属于特权端口，普通进程无法绑定。请改用系统代理或 PAC 模式（均无需管理员权限）。',
         descWin:
           'Windows 下程序以管理员身份运行（启动时弹一次 UAC），以便写入与还原 hosts。',
       },
@@ -151,7 +151,7 @@ const zhHans = {
     okRemove: '移除',
     okRegenerate: '重新生成',
     cancel: '取消',
-    certHint: '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下会弹出 UAC 提权确认，macOS 下会弹出系统信任确认（输入登录密码，无需管理员密码）。也可导出 PEM 后手动导入。',
+    certHint: '安装到系统信任存储是 HTTPS 加速（MITM）的前提：Windows 下装入当前用户的受信任根（无需管理员权限），macOS 下会弹出一次系统信任确认（输入登录密码）。也可导出 PEM 后手动导入。',
     elevateMacHint: 'macOS 下安装根证书会弹一次系统信任确认，输入登录密码即可（装入当前用户信任设置，无需管理员密码）。',
     elevateCancelled: '已取消管理员授权，操作未完成。',
     runningLockedHint: '加速运行中，代理模式与端口等设置已锁定；请先停止加速再修改。',

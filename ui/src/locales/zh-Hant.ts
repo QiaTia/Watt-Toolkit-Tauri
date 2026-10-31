@@ -67,7 +67,7 @@ const zhHant: Schema = {
         label: 'Hosts 模式',
         desc: '修改 hosts 指向本機 443 反代（需 443 連接埠空閒，寫入 hosts 可能需要管理員權限）',
         descMac:
-          'macOS 下寫入 /etc/hosts 需要管理員權限：啟動與停止引擎各會彈出一次系統密碼框。',
+          'macOS 上 Hosts 模式不可用：監聽 443 屬於特權連接埠，一般程序無法綁定。請改用系統代理或 PAC 模式（均無需管理員權限）。',
         descWin:
           'Windows 下程式以管理員身分執行（啟動時彈出一次 UAC），以便寫入與還原 hosts。',
       },
@@ -149,7 +149,7 @@ const zhHant: Schema = {
     okRemove: '移除',
     okRegenerate: '重新產生',
     cancel: '取消',
-    certHint: '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下會彈出 UAC 提權確認，macOS 下會彈出系統信任確認（輸入登入密碼，無需管理員密碼）。也可匯出 PEM 後手動匯入。',
+    certHint: '安裝到系統信任儲存是 HTTPS 加速（MITM）的前提：Windows 下裝入目前使用者的受信任根（無需管理員權限），macOS 下會彈出一次系統信任確認（輸入登入密碼）。也可匯出 PEM 後手動匯入。',
     elevateMacHint: 'macOS 下安裝根憑證會彈一次系統信任確認，輸入登入密碼即可（存入目前使用者的信任設定，無需管理員密碼）。',
     elevateCancelled: '已取消管理員授權，操作未完成。',
     runningLockedHint: '加速執行中，代理模式與連接埠等設定已鎖定；請先停止加速再修改。',

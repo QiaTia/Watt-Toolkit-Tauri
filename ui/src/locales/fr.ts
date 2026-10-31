@@ -72,8 +72,7 @@ const fr: Schema = {
           'Pointe hosts vers le proxy inverse local 443 (le port 443 doit être libre ; ' +
           'écrire hosts peut nécessiter les droits administrateur)',
         descMac:
-          'Sur macOS, écrire /etc/hosts nécessite les droits administrateur : une invite de ' +
-          'mot de passe au démarrage et à l’arrêt du moteur.',
+          'Indisponible sur macOS : le port 443 est privilégié, un processus normal ne peut pas l’écouter. Utilisez le proxy système ou le mode PAC (aucun droit administrateur requis).',
         descWin:
           'Sur Windows, l’application s’exécute en tant qu’administrateur (une invite UAC au ' +
           'lancement) afin d’écrire et de restaurer le fichier hosts.',
@@ -165,7 +164,7 @@ const fr: Schema = {
     okRemove: 'Retirer',
     okRegenerate: 'Régénérer',
     cancel: 'Annuler',
-    certHint: 'HTTPS (MITM) : Windows affiche une invite UAC, macOS une confirmation de confiance système (mot de passe de session). Vous pouvez aussi exporter le PEM et l’importer manuellement.',
+    certHint: "HTTPS (MITM) : Windows installe dans les racines de confiance de l’utilisateur courant (sans droits administrateur), macOS affiche une confirmation de confiance (mot de passe de session). Vous pouvez aussi exporter le PEM et l’importer manuellement.",
     elevateMacHint: "Sur macOS, l'installation affiche une confirmation de confiance (mot de passe de session) et s’applique à l’utilisateur courant, sans mot de passe administrateur.",
     elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
     runningLockedHint: "L'accélération est en cours ; le mode proxy et les ports sont verrouillés. Arrêtez l'accélération avant de les modifier.",

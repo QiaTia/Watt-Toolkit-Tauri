@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { settingsGetProxy, settingsSaveProxy } from '@/api';
+import { isMacOS } from '@/utils/platform';
 import type { ProxySettings } from '@/types/ipc';
 
 /** 默认设置（与 Rust ProxySettings::default 对齐） */
@@ -45,6 +46,12 @@ export const useSettingsStore = defineStore('settings', () => {
   async function load(): Promise<void> {
     try {
       settings.value = await settingsGetProxy();
+      // macOS 上 Hosts 模式不可用（443 是特权端口，非 root 无法监听）：磁盘里若残留
+      // Hosts（旧配置 / 从 Windows 搬来的配置），就地降级为 PAC —— 只改内存不改磁盘，
+      // 避免悄悄重写用户配置；否则用户点一次加速只会收到「端口绑定被拒绝」。
+      if (isMacOS() && settings.value.proxy_mode === 'Hosts') {
+        settings.value.proxy_mode = 'Pac';
+      }
       loadError.value = null;
       loaded.value = true;
     } catch (e) {

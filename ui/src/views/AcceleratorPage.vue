@@ -38,27 +38,33 @@ onMounted(async () => {
 /** 正向代理实际端口（0 = 默认 26501） */
 const forwardPort = computed(() => settings.settings.system_proxy_port || 26501);
 
-const modeOptions = computed<ReadonlyArray<{ value: ProxyMode; label: string; description: string }>>(
-  () => [
-    {
-      value: 'Hosts',
-      label: t('accel.modes.hosts.label'),
-      description: t('accel.modes.hosts.desc'),
-    },
+const modeOptions = computed<
+  ReadonlyArray<{ value: ProxyMode; label: string; description: string; disabled: boolean }>
+>(() => [
+  {
+    value: 'Hosts',
+    label: t('accel.modes.hosts.label'),
+    description: t('accel.modes.hosts.desc'),
+    // macOS：443 为特权端口，非 root 无法监听 → 直接禁用，避免用户点了才收到绑定失败
+    disabled: isMacOS(),
+  },
     {
       value: 'System',
       label: t('accel.modes.system.label'),
       description: t('accel.modes.system.desc', { port: forwardPort.value }),
+    disabled: false,
     },
     {
       value: 'Pac',
       label: t('accel.modes.pac.label'),
       description: t('accel.modes.pac.desc', { port: forwardPort.value }),
+    disabled: false,
     },
     {
       value: 'ProxyOnly',
       label: t('accel.modes.proxyOnly.label'),
       description: t('accel.modes.proxyOnly.desc', { port: forwardPort.value }),
+    disabled: false,
     },
   ],
 );
@@ -312,7 +318,7 @@ async function toggleEngine(): Promise<void> {
     <a-card :bordered="false" :title="$t('accel.modeTitle')" class="panel">
       <a-segmented
         v-model:value="selectedMode"
-        :options="modeOptions.map((o) => ({ value: o.value, label: o.label }))"
+        :options="modeOptions.map((o) => ({ value: o.value, label: o.label, disabled: o.disabled }))"
         :disabled="proxy.isRunning"
         size="large"
         block

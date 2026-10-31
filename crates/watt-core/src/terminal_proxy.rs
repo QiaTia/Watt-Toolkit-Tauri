@@ -556,20 +556,8 @@ mod imp {
             .parent()
             .ok_or_else(|| "Watt CA 路径无父目录".to_string())?;
         let out = dir.join("ca-bundle.pem");
-        let mut data = Vec::new();
-        for candidate in [
-            "/etc/ssl/cert.pem",
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-        ] {
-            if let Ok(bytes) = std::fs::read(candidate) {
-                data = bytes;
-                break;
-            }
-        }
-        if data.is_empty() {
-            return Err("未找到系统 CA bundle".to_string());
-        }
+        let mut data =
+            system_root_certs().ok_or_else(|| "未找到系统 CA bundle".to_string())?;
         if !data.ends_with(b"\n") {
             data.push(b'\n');
         }
@@ -577,6 +565,49 @@ mod imp {
         data.extend_from_slice(&pem);
         write_atomic(&out, &data).map_err(|e| format!("写入合并 CA bundle 失败: {e}"))?;
         Ok(out)
+    }
+
+    /// 系统根证书合集（PEM）。
+    ///
+    /// Linux 有标准 bundle 文件；**macOS 没有**——系统根只存在于
+    /// `SystemRootCertificates.keychain`，必须用 `security` 导出。原先只找 Linux 路径，
+    /// 在 macOS 上必然失败并退化成「只信任 Watt CA」，导致 `SSL_CERT_FILE` /
+    /// `CURL_CA_BUNDLE` / `GIT_SSL_CAINFO` 一旦注入，CLI 访问所有未加速站点全部
+    /// 证书校验失败（变量是替换语义，不会追加系统 CA）。
+    fn system_root_certs() -> Option<Vec<u8>> {
+        for candidate in [
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/opt/homebrew/etc/ca-certificates/cert.pem",
+            "/usr/local/etc/ca-certificates/cert.pem",
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // `-a` 导出全部证书，`-p` 输出 PEM
+            if let Ok(out) = std::process::Command::new("security")
+                .args([
+                    "find-certificate",
+                    "-a",
+                    "-p",
+                    "/System/Library/Keychains/SystemRootCertificates.keychain",
+                ])
+                .output()
+            {
+                if out.status.success() && !out.stdout.is_empty() {
+                    return Some(out.stdout);
+                }
+            }
+        }
+
+        None
     }
 
     /// 把标记块写入各配置文件（幂等：先移除旧块再追加）

@@ -106,11 +106,12 @@ const customDohAddress = nullableString(
   (v) => (settings.settings.dns.custom_doh_address = v),
 );
 
-const modeOptions = computed<Array<{ value: ProxyMode; label: string }>>(() => [
-  { value: 'Hosts', label: t('accel.modes.hosts.label') },
-  { value: 'System', label: t('accel.modes.system.label') },
-  { value: 'Pac', label: t('accel.modes.pac.label') },
-  { value: 'ProxyOnly', label: t('accel.modes.proxyOnly.label') },
+const modeOptions = computed<Array<{ value: ProxyMode; label: string; disabled: boolean }>>(() => [
+  // macOS：Hosts 需要监听 443（特权端口），非 root 不可用，直接置灰
+  { value: 'Hosts', label: t('accel.modes.hosts.label'), disabled: isMac },
+  { value: 'System', label: t('accel.modes.system.label'), disabled: false },
+  { value: 'Pac', label: t('accel.modes.pac.label'), disabled: false },
+  { value: 'ProxyOnly', label: t('accel.modes.proxyOnly.label'), disabled: false },
 ]);
 
 const themeOptions = computed<Array<{ value: ThemeMode; label: string }>>(() => [

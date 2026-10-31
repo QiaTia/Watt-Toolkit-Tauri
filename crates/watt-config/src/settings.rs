@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 代理模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProxyMode {
     /// hosts 模式：修改 hosts 将域名指向本地 443 反向代理
-    #[default]
     Hosts,
     /// 系统代理模式：设置系统代理走本地正向代理端口
     System,
@@ -17,7 +16,33 @@ pub enum ProxyMode {
     ProxyOnly,
 }
 
+impl Default for ProxyMode {
+    /// 平台默认模式。
+    ///
+    /// macOS 走 [`ProxyMode::Pac`]：Hosts 模式需要 root，因为监听 443 是特权端口
+    /// （`TcpListener::bind(127.0.0.1, 443)` 非 root 必 EACCES），而 macOS 没有
+    /// Linux 的 `ip_unprivileged_port_start` 之类放开手段。默认 Hosts 会让用户
+    /// 点一下加速就收到端口绑定失败。
+    ///
+    /// 其余平台保持 [`ProxyMode::Hosts`]（与原版 C# 行为一致；Windows 不限制 1024 以下端口）。
+    fn default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::Pac
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::Hosts
+        }
+    }
+}
+
 impl ProxyMode {
+    /// 该模式是否需要「写系统文件 / 绑定特权端口」级别的权限。
+    pub fn requires_privilege(self) -> bool {
+        matches!(self, ProxyMode::Hosts)
+    }
+
     /// 旧版 ProxyMode 枚举数值映射
     /// DNSIntercept(0)→Hosts+提示, Hosts(1)→Hosts, System(2)→System,
     /// VPN(3)→不支持(提示), ProxyOnly(4)→ProxyOnly, PAC(5)→Pac
@@ -166,7 +191,7 @@ fn default_true() -> bool {
 impl Default for ProxySettings {
     fn default() -> Self {
         Self {
-            proxy_mode: ProxyMode::Hosts,
+            proxy_mode: ProxyMode::default(),
             system_proxy_ip: None,
             system_proxy_port: crate::constants::DEFAULT_HTTP_PROXY_PORT,
             socks5_proxy_enable: false,

@@ -780,13 +780,16 @@ pub fn is_root_cert_installed(cert_pem_path: &Path) -> bool {
     platform::is_root_cert_installed(cert_pem_path)
 }
 
-/// 供上层决定是否走 helper 提权（当前三平台写入系统信任存储均需要特权）
+/// 供上层决定是否走 helper 提权。
+///
+/// 三平台都不再走「必须提权才能安装」：
+/// - Windows：装当前用户 Root 存储（`certutil -addstore -user`），用户令牌即可写
+/// - macOS：装用户信任域（`add-trusted-cert` 不带 `-d`），只需系统信任确认
+/// - Linux：写 `/usr/local/share/ca-certificates` 仍需要 root
+///
+/// 因此仅 Linux 返回 true；Windows/macOS 在个别失败场景才回落到提权兜底。
 pub fn install_requires_elevation() -> bool {
-    cfg!(any(
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "macos"
-    ))
+    cfg!(target_os = "linux")
 }
 
 #[cfg(test)]

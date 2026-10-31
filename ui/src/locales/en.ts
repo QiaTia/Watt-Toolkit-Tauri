@@ -71,8 +71,7 @@ const en: Schema = {
           'Points hosts at the local 443 reverse proxy (port 443 must be free; writing hosts ' +
           'may require admin rights)',
         descMac:
-          'On macOS, writing /etc/hosts requires administrator rights: one password prompt each ' +
-          'when starting and stopping the engine.',
+          'Unavailable on macOS: port 443 is a privileged port, so a normal process cannot listen on it. Use System proxy or PAC mode instead (neither needs admin rights).',
         descWin:
           'On Windows the app runs as administrator (one UAC prompt at launch) so it can write ' +
           'and restore the hosts file.',
@@ -161,7 +160,7 @@ const en: Schema = {
     okRemove: 'Remove',
     okRegenerate: 'Regenerate',
     cancel: 'Cancel',
-    certHint: 'Installing to the system trust store is required for HTTPS boost (MITM): Windows shows a UAC prompt, macOS shows a system trust confirmation (enter your login password). You can also export the PEM and import it manually.',
+    certHint: 'Installing to the system trust store is required for HTTPS boost (MITM): on Windows it goes into the current user trusted roots (no admin rights needed); on macOS a one-time system trust confirmation appears (enter your login password). You can also export the PEM and import it manually.',
     elevateMacHint: 'On macOS, installing the root certificate shows a one-time system trust confirmation (enter your login password). It applies to the current user - no administrator password needed.',
     elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
     runningLockedHint: 'Acceleration is running; proxy mode and ports are locked. Stop acceleration before changing them.',
