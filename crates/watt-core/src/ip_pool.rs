@@ -293,7 +293,7 @@ pub fn is_usable_ip(ip: &IpAddr) -> bool {
             let seg = v6.segments();
             // IPv6 转换/隧道前缀：可承载任意 IPv4（含云元数据 169.254.169.254），
             // 不能仅凭「IPv6 公网段」放行。
-            let transition = (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 64:ff9b::/96
+            let transition = (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 64:ff9b::/96 + 64:ff9b:1::/48
                 || seg[0] == 0x2002 // 6to4 2002::/16
                 || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001::/32
                 || seg[..6] == [0, 0, 0, 0, 0, 0]; // IPv4-compatible ::/96（已废弃）
@@ -304,7 +304,12 @@ pub fn is_usable_ip(ip: &IpAddr) -> bool {
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
                 || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 站点本地（已废弃）
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 文档
+                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 丢弃段
+                || (seg[0] == 0x2001 && seg[1] == 0x0002) // 2001:2::/48 基准测试
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0010) // 2001:10::/28 ORCHID
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 文档
+                || (seg[0] & 0xfff0) == 0x3ff0) // 3fff::/20 文档（RFC 9637）
         }
     }
 }
@@ -321,6 +326,7 @@ fn is_usable_v4(v4: std::net::Ipv4Addr) -> bool {
         || octets[0] == 0 // 0.0.0.0/8
         || (octets[0] == 100 && (octets[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 192.88.99.0/24 6to4 relay
         || (octets[0] == 198 && (octets[1] & 0xfe) == 18) // 198.18.0.0/15 基准测试
         || octets[0] >= 240) // 240.0.0.0/4 保留（含广播）
 }
@@ -358,11 +364,13 @@ pub async fn probe_ip(host: &str, ip: IpAddr, port: u16, timeout: Duration) -> O
     let name = crate::sni::server_name(host)?;
     let connector = crate::sni::outbound_tls_connector(crate::sni::OutboundVerify::Standard, None);
     let start = Instant::now();
-    let stream =
-        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(SocketAddr::new(ip, port)))
-            .await
-            .ok()?
-            .ok()?;
+    let stream = tokio::time::timeout(
+        timeout,
+        tokio::net::TcpStream::connect(SocketAddr::new(ip, port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
     tokio::time::timeout(timeout, connector.connect(name, stream))
         .await
         .ok()?
@@ -478,7 +486,10 @@ async fn refresh_one(
     // RTT 升序（未通过者沉底）
     probed.sort_by_key(|(_, rtt)| rtt.unwrap_or(u64::MAX));
 
-    let survivors: Vec<IpAddr> = probed.iter().filter_map(|(ip, rtt)| rtt.map(|_| *ip)).collect();
+    let survivors: Vec<IpAddr> = probed
+        .iter()
+        .filter_map(|(ip, rtt)| rtt.map(|_| *ip))
+        .collect();
     let ok = survivors.len();
 
     // 写池：仅在有通过者时更新；全灭保留旧值（刷新失败不代表旧 IP 全部失效）
@@ -578,23 +589,23 @@ mod tests {
     #[test]
     fn usable_ip_filters_reserved_and_mapped() {
         for s in [
-            "0.1.2.3",        // 0.0.0.0/8
-            "100.64.0.1",     // CGNAT
+            "0.1.2.3",         // 0.0.0.0/8
+            "100.64.0.1",      // CGNAT
             "100.127.255.254", // CGNAT 上界
-            "192.0.0.8",      // IETF 协议分配
-            "198.18.0.1",     // 基准测试
-            "198.19.255.254", // 基准测试上界
-            "240.0.0.1",      // 保留
+            "192.0.0.8",       // IETF 协议分配
+            "198.18.0.1",      // 基准测试
+            "198.19.255.254",  // 基准测试上界
+            "240.0.0.1",       // 保留
             "255.255.255.254",
             "::ffff:127.0.0.1",       // IPv4-mapped 回环
             "::ffff:169.254.169.254", // IPv4-mapped 链路本地（云元数据）
             "::ffff:10.0.0.1",
-            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254
-            "2002:a9fe:a9fe::1",  // 6to4 → 169.254.169.254
+            "64:ff9b::a9fe:a9fe",                   // NAT64 → 169.254.169.254
+            "2002:a9fe:a9fe::1",                    // 6to4 → 169.254.169.254
             "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
-            "::a9fe:a9fe",        // IPv4-compatible ::/96
-            "fec0::1",            // 站点本地
-            "2001:db8::1",        // 文档段
+            "::a9fe:a9fe",                          // IPv4-compatible ::/96
+            "fec0::1",                              // 站点本地
+            "2001:db8::1",                          // 文档段
         ] {
             assert!(!is_usable_ip(&ip(s)), "{s} 应判定为不可用");
         }

@@ -7,7 +7,8 @@ import type { ProxySettings } from '@/types/ipc';
 /** 默认设置（与 Rust ProxySettings::default 对齐） */
 export function defaultProxySettings(): ProxySettings {
   return {
-    proxy_mode: 'Hosts',
+    // 与 Rust ProxyMode::default 对齐：macOS 默认 PAC（Hosts 需 root 绑 443）
+    proxy_mode: isMacOS() ? 'Pac' : 'Hosts',
     system_proxy_ip: null,
     system_proxy_port: 26501,
     socks5_proxy_enable: false,

@@ -11,8 +11,8 @@
 //!
 //! 停止时序：摘除 hosts（失败阻止停止）→ 取消系统代理/PAC → 关闭监听。
 
-use crate::http_relay::RelayContext;
 use crate::access_log::AccessLogStore;
+use crate::http_relay::RelayContext;
 use crate::listener::{run_http_listener, run_mitm_listener, run_socks5_listener};
 use crate::local_domain::LocalDomainHandler;
 use crate::outbound::UpstreamProxy;
@@ -96,8 +96,7 @@ impl Default for EngineConfig {
             rules: Vec::new(),
             scripts: Vec::new(),
             ca: Arc::new(
-                CaCertificate::generate()
-                    .unwrap_or_else(|e| panic!("测试配置生成 CA 失败: {e}")),
+                CaCertificate::generate().unwrap_or_else(|e| panic!("测试配置生成 CA 失败: {e}")),
             ),
             hosts_path: None,
             probe_cache_path: None,
@@ -198,8 +197,9 @@ impl ProxyEngine {
         &self,
         hosts_path: Option<&std::path::Path>,
         proxy_ports: &[u16],
+        listen_ip: Option<IpAddr>,
     ) -> Vec<String> {
-        Self::cleanup_orphans_impl(hosts_path, proxy_ports)
+        Self::cleanup_orphans_impl(hosts_path, proxy_ports, listen_ip)
     }
 
     /// [`ProxyEngine::cleanup_orphans`] 的无 self 实现（可在 `spawn_blocking` 中调用：
@@ -207,6 +207,7 @@ impl ProxyEngine {
     pub fn cleanup_orphans_impl(
         hosts_path: Option<&std::path::Path>,
         proxy_ports: &[u16],
+        listen_ip: Option<IpAddr>,
     ) -> Vec<String> {
         let mut cleaned = Vec::new();
 
@@ -224,7 +225,7 @@ impl ProxyEngine {
         let mut proxy_owned = false;
         if enabled {
             if let Some(addr) = server.as_deref() {
-                if is_own_proxy_addr(addr, proxy_ports) {
+                if is_own_proxy_addr(addr, proxy_ports, listen_ip) {
                     proxy_owned = true;
                     match crate::system_proxy::set_system_proxy(false, "", 0) {
                         Ok(()) => cleaned.push(format!("system_proxy({addr})")),
@@ -234,7 +235,7 @@ impl ProxyEngine {
             }
         }
         if let Some(url) = pac_url.as_deref() {
-            if !url.is_empty() && is_own_proxy_addr(url, proxy_ports) {
+            if !url.is_empty() && is_own_proxy_addr(url, proxy_ports, listen_ip) {
                 proxy_owned = true;
                 match crate::system_proxy::set_system_pac(false, "") {
                     Ok(()) => cleaned.push(format!("pac({url})")),
@@ -254,7 +255,12 @@ impl ProxyEngine {
     /// 进程退出前清理（应用 `RunEvent::Exit` 调用）：
     /// 运行中 → 走正常 `stop`（摘 hosts + 取消系统代理 + 关监听）；
     /// 否则 → 兜底摘除残留，保证退出后本机不留黑洞。
-    pub async fn shutdown(&mut self, hosts_path: Option<&std::path::Path>, proxy_ports: &[u16]) {
+    pub async fn shutdown(
+        &mut self,
+        hosts_path: Option<&std::path::Path>,
+        proxy_ports: &[u16],
+        listen_ip: Option<IpAddr>,
+    ) {
         if matches!(self.state(), EngineState::Running { .. }) {
             if self.stop().await.is_ok() {
                 return;
@@ -264,7 +270,7 @@ impl ProxyEngine {
         let hosts_path_owned = hosts_path.map(std::path::Path::to_path_buf);
         let ports: Vec<u16> = proxy_ports.to_vec();
         let cleaned = tokio::task::spawn_blocking(move || {
-            Self::cleanup_orphans_impl(hosts_path_owned.as_deref(), &ports)
+            Self::cleanup_orphans_impl(hosts_path_owned.as_deref(), &ports, listen_ip)
         })
         .await
         .unwrap_or_else(|join_err| {
@@ -323,7 +329,12 @@ impl ProxyEngine {
         // 必须在写 hosts **之前**拦截 —— 否则会先留下「域名指向 127.0.0.1 但 443 无监听」
         // 的黑洞窗口（项目铁律），且用户看到的只是裸 "Permission denied"。
         if mode == ProxyMode::Hosts {
-            if let Some(reason) = crate::privileged::hosts_mode_block_reason() {
+            let http_port = config
+                .enable_http_to_https
+                .then(|| config.http_port.unwrap_or(80));
+            if let Some(reason) =
+                crate::privileged::hosts_mode_block_reason(config.https_port, http_port)
+            {
                 self.state.send_replace(EngineState::Error(reason.clone()));
                 return Err(EngineError::Other(reason));
             }
@@ -336,10 +347,18 @@ impl ProxyEngine {
         // 上次异常退出可能残留 hosts 标记块 / 系统代理：若不清掉，Hosts 模式下会先看到
         // 「域名指向 127.0.0.1 但 443 尚未监听」的短暂黑洞，其他模式则会残留误导性的
         // hosts 劫持（域名走本地却无服务）。这里统一摘除，随后按模式重新接入。
-        let hosts_path_owned = config.hosts_path.as_deref().map(std::path::Path::to_path_buf);
+        let hosts_path_owned = config
+            .hosts_path
+            .as_deref()
+            .map(std::path::Path::to_path_buf);
         let forward_port = config.forward_proxy_port;
+        let listen_ip = config.listen_ip;
         let cleaned = tokio::task::spawn_blocking(move || {
-            Self::cleanup_orphans_impl(hosts_path_owned.as_deref(), &[forward_port])
+            Self::cleanup_orphans_impl(
+                hosts_path_owned.as_deref(),
+                &[forward_port],
+                Some(listen_ip),
+            )
         })
         .await
         .unwrap_or_else(|join_err| {
@@ -655,6 +674,24 @@ impl ProxyEngine {
         }
         self.state.send_replace(EngineState::Stopping);
 
+        // —— 0. 还原终端代理环境变量 ——
+        // 必须在关闭监听**之前**成功：环境变量指向本引擎端口，若还原失败仍停止
+        // 引擎，新开的终端会全部连到一个死代理。失败时回滚为 Running 并保留监听。
+        // 文件 IO（Unix 改写 shell 启动文件）不得占用 tokio worker。
+        if let Some(path) = self.terminal_proxy_backup.clone() {
+            let result = tokio::task::spawn_blocking(move || crate::terminal_proxy::disable(&path))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            match result {
+                Ok(()) => self.terminal_proxy_backup = None,
+                Err(e) => {
+                    self.state.send_replace(prev_state);
+                    return Err(EngineError::Other(format!("还原终端代理环境变量失败: {e}")));
+                }
+            }
+        }
+
         // —— 1. 摘除 hosts（失败阻止停止：避免域名仍指向本地却无服务）——
         if let Some(path) = self.hosts_written.take() {
             let remove_path = path.clone();
@@ -714,23 +751,15 @@ impl ProxyEngine {
             task.abort();
         }
         if self.probe_cache_persist {
-            if let (Some(cache), Some(path)) = (self.probe_cache.clone(), self.probe_cache_path.clone())
+            if let (Some(cache), Some(path)) =
+                (self.probe_cache.clone(), self.probe_cache_path.clone())
             {
                 let _ = tokio::task::spawn_blocking(move || cache.save_to(&path)).await;
             }
         }
         self.probe_cache = None;
 
-        // —— 3. 还原终端代理环境变量（CLI 接入面）——
-        if let Some(path) = self.terminal_proxy_backup.clone() {
-            if let Err(e) = crate::terminal_proxy::disable(&path) {
-                tracing::warn!("还原终端代理环境变量失败（备份保留，下次启动重试）: {e}");
-            } else {
-                self.terminal_proxy_backup = None;
-            }
-        }
-
-        // —— 4. 关闭监听 ——
+        // —— 3. 关闭监听 ——
         self.shutdown_tx.send_replace(true);
         if let Some(task) = self.running_task.take() {
             if tokio::time::timeout(std::time::Duration::from_secs(5), task)
@@ -796,14 +825,30 @@ fn revert_proxy_settings(mode: ProxyMode) {
     }
 }
 
-/// 判断注册表 / PAC 里的代理地址是否指向本引擎（仅 127.0.0.1 / localhost / 0.0.0.0 + 本引擎端口）。
+/// 判断注册表 / PAC 里的代理地址是否指向本引擎。
 ///
-/// 用于兜底清理：只有确认是自己写下的系统代理才撤销，绝不误伤用户配置的其他代理。
-fn is_own_proxy_addr(addr: &str, own_ports: &[u16]) -> bool {
+/// 除 loopback / unspecified 外，也匹配本次配置的监听地址（例如用户把
+/// `system_proxy_ip` 设为局域网 IP，系统代理里写的就是该 IP；只认 127.0.0.1
+/// 会让崩溃后的残留永远清不掉）。IPv6 同时接受带方括号与非方括号形式。
+fn is_own_proxy_addr(addr: &str, own_ports: &[u16], listen_ip: Option<IpAddr>) -> bool {
     let lower = addr.trim().to_ascii_lowercase();
-    ["127.0.0.1", "localhost", "0.0.0.0"]
+    let mut hosts: Vec<String> = ["127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"]
         .iter()
-        .any(|host| own_ports.iter().any(|p| lower.contains(&format!("{host}:{p}"))))
+        .map(|s| s.to_string())
+        .collect();
+    match listen_ip {
+        Some(IpAddr::V4(v4)) => hosts.push(v4.to_string()),
+        Some(IpAddr::V6(v6)) => {
+            hosts.push(v6.to_string());
+            hosts.push(format!("[{v6}]"));
+        }
+        None => {}
+    }
+    own_ports.iter().any(|p| {
+        hosts
+            .iter()
+            .any(|host| lower.contains(&format!("{host}:{p}")))
+    })
 }
 
 /// hosts 管理器（None=系统默认路径）
@@ -1058,12 +1103,28 @@ mod tests {
     #[test]
     fn test_is_own_proxy_addr() {
         let ports = [26501u16];
-        assert!(is_own_proxy_addr("127.0.0.1:26501", &ports));
-        assert!(is_own_proxy_addr("localhost:26501", &ports));
-        assert!(is_own_proxy_addr("http://127.0.0.1:26501/pac", &ports));
-        assert!(!is_own_proxy_addr("127.0.0.1:8080", &ports));
-        assert!(!is_own_proxy_addr("proxy.corp.example:26501", &ports));
-        assert!(!is_own_proxy_addr("", &ports));
+        assert!(is_own_proxy_addr("127.0.0.1:26501", &ports, None));
+        assert!(is_own_proxy_addr("localhost:26501", &ports, None));
+        assert!(is_own_proxy_addr(
+            "http://127.0.0.1:26501/pac",
+            &ports,
+            None
+        ));
+        assert!(is_own_proxy_addr("[::1]:26501", &ports, None));
+        assert!(!is_own_proxy_addr("127.0.0.1:8080", &ports, None));
+        assert!(!is_own_proxy_addr("proxy.corp.example:26501", &ports, None));
+        assert!(!is_own_proxy_addr("", &ports, None));
+
+        // 自定义监听 IP（局域网 / IPv6）同样识别为本引擎
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(is_own_proxy_addr("192.168.1.20:26501", &ports, Some(lan)));
+        assert!(!is_own_proxy_addr("192.168.1.21:26501", &ports, Some(lan)));
+        let v6: IpAddr = "fd00::2".parse().unwrap();
+        assert!(is_own_proxy_addr(
+            "http://[fd00::2]:26501/pac",
+            &ports,
+            Some(v6)
+        ));
     }
 
     /// 兜底清理：残留 hosts 标记块必须被摘除，否则域名仍指向 127.0.0.1 而无人监听。
@@ -1080,7 +1141,7 @@ mod tests {
         .unwrap();
 
         let engine = ProxyEngine::new();
-        let cleaned = engine.cleanup_orphans(Some(&hosts), &[]);
+        let cleaned = engine.cleanup_orphans(Some(&hosts), &[], None);
         assert!(
             cleaned.iter().any(|c| c.starts_with("hosts(")),
             "应报告 hosts 清理: {cleaned:?}"
@@ -1105,7 +1166,7 @@ mod tests {
         std::fs::write(&hosts, "127.0.0.1 localhost\r\n").unwrap();
 
         let engine = ProxyEngine::new();
-        let cleaned = engine.cleanup_orphans(Some(&hosts), &[]);
+        let cleaned = engine.cleanup_orphans(Some(&hosts), &[], None);
         assert!(cleaned.is_empty(), "{cleaned:?}");
 
         let _ = std::fs::remove_dir_all(&dir);

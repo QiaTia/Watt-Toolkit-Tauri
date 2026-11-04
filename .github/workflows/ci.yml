@@ -70,6 +70,29 @@ jobs:
       - name: Relay integration tests
         run: cargo test -p watt-core --test proxy_integration
 
+  # macOS 是主要交付平台，但大量 #[cfg(macos)] 分支（networksetup、security、
+  # 信任校验、特权端口判定）在 Windows 任务里根本不参与编译，缺少该平台门禁时
+  # 编译错误会一路带到发版。这里只跑 check + lib 测试，不重复 Windows 集成测试。
+  rust-macos:
+    name: Rust (macOS check + lib tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets
+
+      - name: Unit tests
+        run: cargo test --workspace --lib
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

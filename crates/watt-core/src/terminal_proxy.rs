@@ -70,6 +70,22 @@ pub struct TerminalProxyPlan {
     pub ca_pem: Option<PathBuf>,
 }
 
+/// 终端代理 URL：按实际监听地址生成。
+///
+/// 监听地址为 unspecified（0.0.0.0 / ::）时回退 127.0.0.1 —— 环境变量里的
+/// 代理地址必须可连接，写 `0.0.0.0` 在部分客户端会被拒绝；IPv6 需加方括号。
+pub fn proxy_url(listen_ip: std::net::IpAddr, port: u16) -> String {
+    let ip = if listen_ip.is_unspecified() {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    } else {
+        listen_ip
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
+    }
+}
+
 /// 默认 NO_PROXY：本机 + 内网 CIDR + 官方 API。
 ///
 /// 注意**不能**直接复用系统代理的 bypass 列表：那是 WinINET 语法（`192.168.*`），
@@ -156,19 +172,35 @@ fn unix_targets(plan: &TerminalProxyPlan) -> Vec<(String, String)> {
     targets.extend(lowercase);
 
     if let Some(ca) = plan.ca_pem.as_deref().filter(|p| p.exists()) {
-        match imp::combined_ca_bundle(ca) {
-            Ok(bundle) => {
-                let value = bundle.display().to_string();
-                for (name, v) in targets.iter_mut() {
-                    if CA_ENV_VARS.contains(&name.as_str()) {
-                        *v = value.clone();
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("生成合并 CA bundle 失败，回退为 Watt CA 单文件: {e}"),
-        }
+        apply_combined_ca(&mut targets, imp::combined_ca_bundle(ca));
     }
     targets
+}
+
+/// 合并 bundle 成功才注入 CA 覆盖变量。
+///
+/// 失败时**必须移除**这些变量：`SSL_CERT_FILE` / `CURL_CA_BUNDLE` /
+/// `GIT_SSL_CAINFO` 是替换语义而非追加，指向「只有 Watt CA」的文件会让所有
+/// 未加速域名的 TLS 校验失败（比不注入破坏性大得多）。
+#[cfg(unix)]
+fn apply_combined_ca(
+    targets: &mut Vec<(String, String)>,
+    bundle: Result<std::path::PathBuf, String>,
+) {
+    match bundle {
+        Ok(bundle) => {
+            let value = bundle.display().to_string();
+            for (name, v) in targets.iter_mut() {
+                if CA_ENV_VARS.contains(&name.as_str()) {
+                    *v = value.clone();
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("生成合并 CA bundle 失败，跳过 CA 变量注入（避免替换系统根证书）: {e}");
+            targets.retain(|(name, _)| !CA_ENV_VARS.contains(&name.as_str()));
+        }
+    }
 }
 
 /// 注入终端代理环境变量（幂等：已有备份先还原再重新备份，避免把注入值当原值）
@@ -556,8 +588,7 @@ mod imp {
             .parent()
             .ok_or_else(|| "Watt CA 路径无父目录".to_string())?;
         let out = dir.join("ca-bundle.pem");
-        let mut data =
-            system_root_certs().ok_or_else(|| "未找到系统 CA bundle".to_string())?;
+        let mut data = system_root_certs().ok_or_else(|| "未找到系统 CA bundle".to_string())?;
         if !data.ends_with(b"\n") {
             data.push(b'\n');
         }
@@ -698,7 +729,7 @@ mod imp {
         let mut out = String::with_capacity(content.len());
         let mut in_block = false;
         for line in content.split_inclusive('\n') {
-            let marker = line.trim_end_matches(|c| c == '\r' || c == '\n').trim();
+            let marker = line.trim_end_matches(['\r', '\n']).trim();
             if marker == BLOCK_BEGIN {
                 in_block = true;
                 continue;
@@ -731,22 +762,56 @@ mod imp {
         out
     }
 
-    /// 同目录临时文件 + rename，避免写入中途崩溃截断用户的 dotfile
+    /// 同目录临时文件 + rename，避免写入中途崩溃截断用户的 dotfile。
+    ///
+    /// 临时名带 pid + 序号且 `create_new`（多个实例并发注入时不互相覆盖半成品），
+    /// `sync_all` 后再 rename（崩溃时不会留下「改名成功但内容为空」的文件）。
     fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("config");
-        let tmp = parent.join(format!(".{name}.watt-tmp"));
-        std::fs::write(&tmp, bytes)?;
-        // 保留原文件权限（dotfile 可能是 0600）
-        if let Ok(meta) = std::fs::metadata(path) {
-            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        let mut last_err: Option<std::io::Error> = None;
+
+        for attempt in 0..10u32 {
+            let tmp = parent.join(format!(".{name}.watt-tmp-{}-{attempt}", std::process::id()));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            // 保留原文件权限（dotfile 可能是 0600）
+            if let Ok(meta) = std::fs::metadata(path) {
+                let _ = file.set_permissions(meta.permissions());
+            }
+            let written = file.write_all(bytes).and_then(|_| file.sync_all());
+            drop(file);
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    last_err = Some(e);
+                }
+            }
         }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("无法创建临时文件")))
     }
 }
 
@@ -904,7 +969,7 @@ mod tests {
             ),
             ("CURL_CA_BUNDLE".to_string(), ca.display().to_string()),
         ];
-        imp::inject(&[file.clone()], &targets).unwrap();
+        imp::inject(std::slice::from_ref(&file), &targets).unwrap();
 
         let script = format!(
             ". '{}'; printf '%s|%s' \"$HTTP_PROXY\" \"$CURL_CA_BUNDLE\"",
@@ -974,6 +1039,37 @@ mod tests {
         for expected in ["http_proxy", "https_proxy", "all_proxy", "no_proxy"] {
             assert!(names.contains(&expected), "缺少小写变量 {expected}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_ca_replaces_ca_vars_on_success() {
+        let mut targets = sample_targets();
+        let bundle = PathBuf::from("/tmp/sys+Watt.pem");
+        apply_combined_ca(&mut targets, Ok(bundle.clone()));
+        for (name, value) in &targets {
+            if CA_ENV_VARS.contains(&name.as_str()) {
+                assert_eq!(PathBuf::from(value), bundle, "{name} 应指向合并 bundle");
+            } else {
+                assert_eq!(name, "HTTP_PROXY");
+            }
+        }
+    }
+
+    /// 合并失败时必须移除 CA 变量：这些变量是替换语义，指向只含 Watt CA 的
+    /// 文件会让所有未加速站点 TLS 校验失败。
+    #[cfg(unix)]
+    #[test]
+    fn combined_ca_drops_ca_vars_on_failure() {
+        let mut targets = sample_targets();
+        targets.push(("NODE_EXTRA_CA_CERTS".to_string(), "/tmp/watt.pem".into()));
+        apply_combined_ca(&mut targets, Err("没有系统 CA bundle".into()));
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "HTTP_PROXY");
+        assert!(!targets
+            .iter()
+            .any(|(name, _)| CA_ENV_VARS.contains(&name.as_str())));
     }
 
     #[cfg(unix)]

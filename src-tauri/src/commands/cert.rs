@@ -23,6 +23,9 @@ pub struct CertStatusDto {
     pub expired: bool,
     /// 是否已安装并信任
     pub installed: bool,
+    /// 非致命告警（如重新生成后旧信任未能清除），供 UI 明确提示
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 fn to_status(ca: &CaCertificate, installed: bool) -> CertStatusDto {
@@ -35,6 +38,7 @@ fn to_status(ca: &CaCertificate, installed: bool) -> CertStatusDto {
         days_remaining,
         expired: now > ca.not_after,
         installed,
+        warning: None,
     }
 }
 
@@ -76,6 +80,8 @@ pub async fn cert_export_ca(state: tauri::State<'_, AppState>) -> Result<String,
 /// 安装根证书到系统信任存储（对齐 SetupRootCertificate：安装后校验）
 #[tauri::command]
 pub async fn cert_install(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    // 提权对话框可能停留数十秒：期间 engine_start/tray 的 try_lock 会快速失败
+    let _cert_guard = state.cert_lock.lock().await;
     let ca = state.ca.read().await.clone();
     ensure_cert_file(&state, &ca)?;
 
@@ -98,14 +104,17 @@ pub async fn cert_install(state: tauri::State<'_, AppState>) -> Result<bool, Str
 /// 移除根证书信任（对齐 DeleteRootCertificate：移除信任后删除证书文件）
 #[tauri::command]
 pub async fn cert_uninstall(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    // 持 engine 锁贯穿「检查停止 → 移除信任 → 删除证书文件」：
-    // 否则并发 engine_start 可在移除信任后、删文件前启动，出现「引擎在跑但 CA 已不受信任」。
-    let engine = state.engine.lock().await;
-    if matches!(
-        engine.state(),
-        watt_core::engine::EngineState::Running { .. }
-    ) {
-        return Err("请先停止加速再移除证书".into());
+    // 串行化证书操作；engine_start/tray 持同一把锁的 try_lock，故可以安全地在
+    // 提权（UAC/钥匙串对话框，最长 120s）期间释放 engine 锁，避免阻塞其他引擎查询。
+    let _cert_guard = state.cert_lock.lock().await;
+    {
+        let engine = state.engine.lock().await;
+        if matches!(
+            engine.state(),
+            watt_core::engine::EngineState::Running { .. }
+        ) {
+            return Err("请先停止加速再移除证书".into());
+        }
     }
 
     // 移除信任（可能触发 UAC 提权）。按当前证书 DER 精确删除，避免误删同名第三方根证书。
@@ -127,7 +136,6 @@ pub async fn cert_uninstall(state: tauri::State<'_, AppState>) -> Result<bool, S
         let _ = std::fs::remove_file(CaCertificate::cert_path(&cert_dir));
         let _ = std::fs::remove_file(CaCertificate::key_path(&cert_dir));
     }
-    drop(engine);
     Ok(!installed)
 }
 
@@ -141,14 +149,18 @@ pub async fn cert_get_info(state: tauri::State<'_, AppState>) -> Result<Certific
 /// 重新生成 CA（需引擎停止状态；旧叶子证书全部失效）
 #[tauri::command]
 pub async fn cert_regenerate(state: tauri::State<'_, AppState>) -> Result<CertStatusDto, String> {
-    // 持 engine 锁完成「检查停止 → 生成 → 换内存 CA」全过程：与 engine_start
-    // （同样先拿 engine 锁再读 CA）互斥，避免引擎用旧 CA 服务新证书文件。
-    let engine = state.engine.lock().await;
-    if matches!(
-        engine.state(),
-        watt_core::engine::EngineState::Running { .. }
-    ) {
-        return Err("请先停止加速再重新生成证书".into());
+    // 持 cert_lock 贯穿「检查停止 → 生成 → 清理旧信任 → 换内存 CA」：
+    // engine_start/tray 用同一把锁的 try_lock 快速失败，故无需长期占用 engine 锁
+    // （旧的实现会在 UAC 弹窗的 120s 内一直阻塞引擎命令）。
+    let _cert_guard = state.cert_lock.lock().await;
+    {
+        let engine = state.engine.lock().await;
+        if matches!(
+            engine.state(),
+            watt_core::engine::EngineState::Running { .. }
+        ) {
+            return Err("请先停止加速再重新生成证书".into());
+        }
     }
 
     let cert_dir = state.cert_dir();
@@ -167,19 +179,28 @@ pub async fn cert_regenerate(state: tauri::State<'_, AppState>) -> Result<CertSt
     .await
     .map_err(|e| e.to_string())??;
 
-    // 旧受信任根不会被新 CA 自动替换：按旧 DER 精确移除，避免旧根长期留信任库
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        watt_cert::trust::remove_root_cert_der(&old_der)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    {
-        tracing::warn!("重新生成 CA 后清理旧信任失败（可手动卸载）: {e}");
-    }
+    // 旧受信任根不会被新 CA 自动替换：按旧 DER 精确移除，避免旧根长期留信任库。
+    // 删除失败不阻断轮换（新 CA 已落盘），但必须把失败传给 UI —— 否则用户会以为
+    // 旧根已清理，继续在新旧两张受信任根并存的状态下运行。
+    let warning =
+        match tokio::task::spawn_blocking(move || watt_cert::trust::remove_root_cert_der(&old_der))
+            .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => {
+                tracing::warn!("重新生成 CA 后清理旧信任失败（可手动卸载）: {e}");
+                Some(format!("旧证书信任未能自动移除，请手动删除旧根证书：{e}"))
+            }
+            Err(e) => {
+                tracing::warn!("重新生成 CA 后清理旧信任任务异常: {e}");
+                Some(format!("旧证书信任清理任务异常：{e}"))
+            }
+        };
 
     let mut ca = state.ca.write().await;
     *ca = new_ca.clone();
     drop(ca);
-    drop(engine);
-    Ok(to_status(&new_ca, false))
+    let mut status = to_status(&new_ca, false);
+    status.warning = warning;
+    Ok(status)
 }

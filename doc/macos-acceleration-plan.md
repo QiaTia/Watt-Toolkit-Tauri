@@ -20,7 +20,7 @@ macOS 编译与运行本身没有障碍。平台相关缺口共 4 处：
 已有的良好基础：
 
 - `trust.rs` macOS 分支已实现 install / remove / is_installed（SHA-1 比对），只差提权包装。
-- `trust.rs:385-391` 已定义 `install_requires_elevation()`，但目前无任何调用方——正好用它驱动 UI 提示。
+- `trust.rs` 的安装路径已按「用户域免提权 → 系统域直试 → 系统域提权」分级，UI 无需再依据提权标志做 gating。
 - `watt-hosts` 的标记块算法（`# Steam++ Start/End`）、默认内容、换行符均已分平台。
 - `doc/task.md:112` 早已规划特权 helper 方向（macOS 走 osascript），本方案是其落地。
 - UI 侧 `SettingsPage.vue` 未按平台禁用任何模式，无需前端 gating 改动（仅文案需补充）。

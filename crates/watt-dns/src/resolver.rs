@@ -15,6 +15,17 @@ const DEFAULT_DOH_PATH: &str = "/dns-query";
 const DOH_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
 /// 单个 DoH 端点最多保留的引导地址数（避免某个失败地址拖慢每次查询）
 const DOH_MAX_ADDRS: usize = 4;
+/// DoH 引导解析结果缓存时长（同一端点重复构造解析器时不再阻塞 getaddrinfo）
+const DOH_BOOTSTRAP_CACHE_TTL: Duration = Duration::from_secs(600);
+
+type BootstrapCache = std::sync::Mutex<
+    std::collections::HashMap<(String, u16), (std::time::Instant, Vec<SocketAddr>)>,
+>;
+
+/// 引导地址缓存：`DnsResolver` 可能在引擎重启、竞速测速时被反复构造，
+/// 每次都调用 getaddrinfo 会反复占用阻塞线程（超时后线程仍存活到系统返回）。
+static DOH_BOOTSTRAP_CACHE: Lazy<BootstrapCache> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// DNS 解析配置
 #[derive(Debug, Clone, Default)]
@@ -269,7 +280,10 @@ fn build_resolver(
             .build()
             .map_err(|e| format!("构建 UDP DNS 解析器失败: {e}"));
         }
-        tracing::warn!(master, "主 DNS 不是合法 IP，已回退到系统 DNS（设置页请填写 IP 字面量）");
+        tracing::warn!(
+            master,
+            "主 DNS 不是合法 IP，已回退到系统 DNS（设置页请填写 IP 字面量）"
+        );
     }
 
     Ok(system_resolver(use_hosts_file))
@@ -432,6 +446,15 @@ fn resolve_doh_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
+    let cache_key = (host.to_ascii_lowercase(), port);
+    if let Ok(cache) = DOH_BOOTSTRAP_CACHE.lock() {
+        if let Some((at, addrs)) = cache.get(&cache_key) {
+            if at.elapsed() < DOH_BOOTSTRAP_CACHE_TTL && !addrs.is_empty() {
+                return Ok(addrs.clone());
+            }
+        }
+    }
+
     let host_owned = host.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -468,6 +491,13 @@ fn resolve_doh_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     // 先排序再截断，避免 getaddrinfo 先返回一堆 IPv6 时把 IPv4 挤掉。
     addrs.sort_by_key(|addr| addr.is_ipv6());
     addrs.truncate(DOH_MAX_ADDRS);
+    if let Ok(mut cache) = DOH_BOOTSTRAP_CACHE.lock() {
+        // 简单容量上限：DoH 端点通常只有一两个，避免被大量自定义地址撑大
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(cache_key, (std::time::Instant::now(), addrs.clone()));
+    }
     Ok(addrs)
 }
 
@@ -503,17 +533,16 @@ pub async fn fastest_dns(
                         custom_doh_address: None,
                     }
                 };
-                let resolver = match tokio::task::spawn_blocking(move || {
-                    DnsResolver::with_config(config)
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "DNS 竞速解析器构造任务异常");
-                        return None;
-                    }
-                };
+                let resolver =
+                    match tokio::task::spawn_blocking(move || DnsResolver::with_config(config))
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DNS 竞速解析器构造任务异常");
+                            return None;
+                        }
+                    };
                 match resolver.resolve(crate::DNS_CHECK_HOST).await {
                     Ok(ips) if !ips.is_empty() => Some(c),
                     _ => None,

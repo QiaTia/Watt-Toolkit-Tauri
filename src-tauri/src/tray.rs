@@ -175,6 +175,18 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
         settings.system_proxy_port
     };
 
+    let https_port = watt_config::constants::HTTPS_PORT;
+    let http_port = settings.enable_http_proxy_to_https.then_some(80);
+    // 托盘菜单没有「模式选择」入口：磁盘里若残留 Hosts（旧配置 / 从其他平台
+    // 迁移），当前权限又绑不了特权端口时降级为 PAC，而不是让用户只看到绑定失败。
+    let mut mode = settings.proxy_mode;
+    if mode == ProxyMode::Hosts
+        && watt_core::privileged::hosts_mode_block_reason(https_port, http_port).is_some()
+    {
+        tracing::warn!("托盘启动：当前权限无法使用 Hosts 模式，回退为 PAC 模式");
+        mode = ProxyMode::Pac;
+    }
+
     // 终端（CLI）接入面：托盘恢复加速时同样按设置注入（与 engine_start 一致）
     let terminal_proxy = settings.terminal_proxy_enable.then(|| {
         let ca_pem = CaCertificate::cert_path(&state.cert_dir());
@@ -183,26 +195,26 @@ pub async fn start_engine_from_settings(app: &AppHandle) -> Result<EngineState, 
                 .data_dir
                 .join("Settings")
                 .join("TerminalProxyEnv.backup.json"),
-            proxy_url: (!matches!(settings.proxy_mode, ProxyMode::Hosts))
-                .then(|| format!("http://127.0.0.1:{forward_proxy_port}")),
+            proxy_url: (!matches!(mode, ProxyMode::Hosts))
+                .then(|| watt_core::terminal_proxy::proxy_url(listen_ip, forward_proxy_port)),
             no_proxy: watt_core::terminal_proxy::default_no_proxy(),
             ca_pem: ca_pem.exists().then_some(ca_pem),
         }
     });
 
-    // 与 cert_regenerate 共用 engine 锁顺序：先锁引擎再读 CA，避免读到已被替换的旧 CA
+    // 证书操作（UAC/钥匙串对话框）期间不启动引擎；锁顺序与命令层一致：cert → engine
+    let _cert_guard = state
+        .cert_lock
+        .try_lock()
+        .map_err(|_| "证书操作进行中，请稍后重试".to_string())?;
     let mut engine = state.engine.lock().await;
     let ca: Arc<CaCertificate> = state.ca.read().await.clone();
 
     let config = EngineConfig {
-        mode: settings.proxy_mode,
+        mode,
         listen_ip,
-        https_port: watt_config::constants::HTTPS_PORT,
-        http_port: if settings.enable_http_proxy_to_https {
-            Some(80)
-        } else {
-            None
-        },
+        https_port,
+        http_port,
         forward_proxy_port,
         socks5_port: if settings.socks5_proxy_enable {
             Some(if settings.socks5_proxy_port == 0 {

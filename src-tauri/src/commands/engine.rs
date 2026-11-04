@@ -143,13 +143,21 @@ pub async fn engine_start(
                 .join("Settings")
                 .join("TerminalProxyEnv.backup.json"),
             proxy_url: (!matches!(params.mode, ProxyMode::Hosts))
-                .then(|| format!("http://127.0.0.1:{forward_proxy_port}")),
+                .then(|| watt_core::terminal_proxy::proxy_url(listen_ip, forward_proxy_port)),
             no_proxy: watt_core::terminal_proxy::default_no_proxy(),
             ca_pem: ca_pem.exists().then_some(ca_pem),
         }
     });
 
-    // 先拿 engine 锁再读 CA：与 cert_regenerate（持 engine 锁生成新 CA）互斥，
+    // 证书操作（安装/卸载/重新生成）期间禁止启动引擎：提权对话框可能停留数十秒，
+    // 不能让引擎带着「即将被替换的 CA」启动。try_lock 快速失败，避免 UI 长时间转圈。
+    // 锁顺序固定为 cert_lock → engine：证书命令同样先拿 cert_lock 再检查引擎状态。
+    let _cert_guard = state
+        .cert_lock
+        .try_lock()
+        .map_err(|_| "证书操作进行中，请稍后重试".to_string())?;
+
+    // 先拿 engine 锁再读 CA：与证书操作互斥，
     // 避免「读到旧 CA → 等锁 → 新 CA 已落盘」导致引擎用旧 CA 服务新证书文件。
     let mut engine = state.engine.lock().await;
     let ca: Arc<CaCertificate> = state.ca.read().await.clone();
@@ -173,9 +181,9 @@ pub async fn engine_start(
         ca,
         hosts_path: None,
         // P2：探测缓存落盘（默认关；开启时路径为 {settings_dir}/probe-cache.json）
-        probe_cache_path: params.probe_cache_persist.then(|| {
-            watt_config::settings::settings_dir().join("probe-cache.json")
-        }),
+        probe_cache_path: params
+            .probe_cache_persist
+            .then(|| watt_config::settings::settings_dir().join("probe-cache.json")),
         probe_cache_persist: params.probe_cache_persist,
         probe_top_k: params.probe_top_k.filter(|k| *k > 0),
         terminal_proxy,

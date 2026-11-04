@@ -38,11 +38,6 @@ impl Default for ProxyMode {
 }
 
 impl ProxyMode {
-    /// 该模式是否需要「写系统文件 / 绑定特权端口」级别的权限。
-    pub fn requires_privilege(self) -> bool {
-        matches!(self, ProxyMode::Hosts)
-    }
-
     /// 旧版 ProxyMode 枚举数值映射
     /// DNSIntercept(0)→Hosts+提示, Hosts(1)→Hosts, System(2)→System,
     /// VPN(3)→不支持(提示), ProxyOnly(4)→ProxyOnly, PAC(5)→Pac
@@ -284,10 +279,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("config");
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{seq}",
-        std::process::id()
-    ));
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
 
     let write_result = (|| -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
@@ -338,7 +330,7 @@ mod tests {
         let settings = ProxySettings::default();
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: ProxySettings = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.proxy_mode, ProxyMode::Hosts);
+        assert_eq!(parsed.proxy_mode, ProxyMode::default());
         assert_eq!(
             parsed.system_proxy_port,
             crate::constants::DEFAULT_HTTP_PROXY_PORT
@@ -380,7 +372,7 @@ mod tests {
 
         // 空目录 → 默认
         let loaded = load_proxy_settings_in(&dir).unwrap();
-        assert_eq!(loaded.proxy_mode, ProxyMode::Hosts);
+        assert_eq!(loaded.proxy_mode, ProxyMode::default());
 
         // 保存后回读一致
         let settings = ProxySettings {
@@ -392,7 +384,7 @@ mod tests {
         let reloaded = load_proxy_settings_in(&dir).unwrap();
         assert_eq!(reloaded.system_proxy_port, 26502);
         assert_eq!(reloaded.enabled_accelerate_ids, vec!["steam"]);
-        assert_eq!(reloaded.proxy_mode, ProxyMode::Hosts);
+        assert_eq!(reloaded.proxy_mode, ProxyMode::default());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

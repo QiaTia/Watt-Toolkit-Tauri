@@ -65,11 +65,13 @@ export const useCertStore = defineStore('cert', () => {
     }
   }
 
-  async function regenerate(): Promise<void> {
+  async function regenerate(): Promise<CertStatusDto> {
     busy.value = true;
     try {
-      status.value = await certRegenerate();
+      const next = await certRegenerate();
+      status.value = next;
       info.value = null;
+      return next;
     } finally {
       busy.value = false;
     }

@@ -49,6 +49,8 @@ export interface CertStatusDto {
   expired: boolean;
   /** 是否已安装到系统信任存储 */
   installed: boolean;
+  /** 非致命告警（如重新生成后旧信任未能清除） */
+  warning?: string;
 }
 
 /** 证书详细信息（watt-cert，snake_case） */

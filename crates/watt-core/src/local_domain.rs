@@ -226,14 +226,18 @@ impl LocalDomainHandler {
             forward_headers.insert(hyper::header::USER_AGENT, ua.clone());
         }
 
-        // 目标地址校验：只允许公网地址，防止任意网页借桥访问内网/环回/云元数据；
-        // 解析结果全部可用才放行，并以首个 IP 直连防 DNS 重绑定。
+        // 目标地址校验：只允许公网地址，防止任意网页借桥访问内网/环回/云元数据。
+        // 过滤掉不可用地址后取首个可用 IP 直连（防 DNS 重绑定）；只要仍有公网
+        // 地址就放行 —— 某些 CDN 会同时返回 IPv6 链路本地/ULA 与公网 A 记录，
+        // 「任一不可用即整体拒绝」会把这些正常站点误杀。
         let target_host = target.host().unwrap_or_default().to_string();
-        let target_port = target.port_u16().unwrap_or(if target.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        });
+        let target_port = target
+            .port_u16()
+            .unwrap_or(if target.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
         let addrs: Vec<std::net::SocketAddr> = match tokio::time::timeout(
             XHR_DNS_TIMEOUT,
             tokio::net::lookup_host((target_host.as_str(), target_port)),
@@ -243,19 +247,17 @@ impl LocalDomainHandler {
             Ok(Ok(iter)) => iter.collect(),
             Ok(Err(e)) => return bad_request(&format!("目标解析失败: {e}")),
             Err(_) => {
-                return bad_request(&format!(
-                    "目标解析超时（{}s）",
-                    XHR_DNS_TIMEOUT.as_secs()
-                ))
+                return bad_request(&format!("目标解析超时（{}s）", XHR_DNS_TIMEOUT.as_secs()))
             }
         };
-        if addrs.is_empty() {
-            return bad_request("目标无可用地址");
-        }
-        if addrs.iter().any(|a| !crate::ip_pool::is_usable_ip(&a.ip())) {
+        let addrs: Vec<std::net::SocketAddr> = addrs
+            .into_iter()
+            .filter(|a| crate::ip_pool::is_usable_ip(&a.ip()))
+            .collect();
+        let Some(first) = addrs.first() else {
             return forbidden();
-        }
-        let connect_ip = addrs[0].ip();
+        };
+        let connect_ip = first.ip();
 
         // 转发（直连校验后的 IP）。整段请求加超时：慢目标不能长期占用连接。
         let body = Limited::new(body, MAX_XHR_BODY);
@@ -499,7 +501,9 @@ mod tests {
                 .unwrap()
         };
         // 命中脚本域名的页面
-        assert!(handler.allowed_origin(&req("https://www.example.com")).is_some());
+        assert!(handler
+            .allowed_origin(&req("https://www.example.com"))
+            .is_some());
         assert!(handler.allowed_origin(&req("http://example.com")).is_some());
         // 未命中 / null / 自定义协议 / 带路径的伪 Origin
         assert!(handler.allowed_origin(&req("https://evil.com")).is_none());

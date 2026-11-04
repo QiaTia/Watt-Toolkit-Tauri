@@ -3,9 +3,9 @@
 //! 流程：脚本匹配 → 域名规则匹配（子规则递归）→ DNS 污染判定 → 静态响应 →
 //! HTTP→HTTPS 重定向 → Destination 模板 → UA 替换 → 服务端代理头 → 出站转发 → 脚本注入。
 
+use crate::access_log::{now_ms, AccessLogEntry, AccessLogStore, Disposition, DEFAULT_CAPACITY};
 use crate::inject::{inject_scripts, ContentCompression};
 use crate::local_domain::LocalDomainHandler;
-use crate::access_log::{now_ms, AccessLogEntry, AccessLogStore, Disposition, DEFAULT_CAPACITY};
 use crate::outbound::{CandidateHealth, OutboundConnector, OutboundTarget, UpstreamProxy};
 use crate::stats::FlowStats;
 use bytes::BytesMut;
@@ -90,7 +90,12 @@ impl Body for CountingBody {
 /// 缓冲结果：完整读完，或超过上限（保留已读前缀 + 未读 stream）
 enum CollectOutcome<B> {
     Complete(Bytes),
-    Overflow { prefix: Bytes, rest: B },
+    Overflow {
+        prefix: Bytes,
+        /// 溢出前已读到的非数据帧（trailers）：转流式时必须按序补发
+        pending: Vec<Frame<Bytes>>,
+        rest: B,
+    },
 }
 
 /// 限长收集：超过上限时不丢弃已读数据，而是返回前缀 + 剩余 body，
@@ -100,6 +105,7 @@ where
     B: Body<Data = Bytes> + Unpin,
 {
     let mut collected = BytesMut::new();
+    let mut pending: Vec<Frame<Bytes>> = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         if let Some(data) = frame.data_ref() {
@@ -108,10 +114,14 @@ where
                 collected.extend_from_slice(data);
                 return Ok(CollectOutcome::Overflow {
                     prefix: collected.freeze(),
+                    pending,
                     rest: body,
                 });
             }
             collected.extend_from_slice(data);
+        } else {
+            // trailers 等非数据帧：溢出转流式后仍需按原顺序下发
+            pending.push(frame);
         }
     }
     Ok(CollectOutcome::Complete(collected.freeze()))
@@ -120,6 +130,7 @@ where
 /// 先输出已读前缀，再继续输出原 body（用于超限后转流式）
 struct PrefixedBody<B> {
     prefix: Option<Bytes>,
+    pending: std::collections::VecDeque<Frame<Bytes>>,
     rest: B,
 }
 
@@ -139,6 +150,9 @@ where
             if !prefix.is_empty() {
                 return Poll::Ready(Some(Ok(Frame::data(prefix))));
             }
+        }
+        if let Some(frame) = this.pending.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
         }
         Pin::new(&mut this.rest).poll_frame(cx)
     }
@@ -498,7 +512,11 @@ impl RelayContext {
                             }
                         }
                     }
-                    Ok(CollectOutcome::Overflow { prefix, rest }) => {
+                    Ok(CollectOutcome::Overflow {
+                        prefix,
+                        pending,
+                        rest,
+                    }) => {
                         tracing::warn!(
                             host = %host,
                             limit = MAX_SCRIPT_BUFFER,
@@ -506,6 +524,7 @@ impl RelayContext {
                         );
                         body = BoxBody::new(PrefixedBody {
                             prefix: Some(prefix),
+                            pending: pending.into(),
                             rest,
                         });
                     }
@@ -746,52 +765,58 @@ impl RelayContext {
                     // —— 缓冲路径：脚本注入 / onResponse 钩子需要完整 body ——
                     // 加硬上限：Content-Length 未知（chunked）时也不能无限 collect；
                     // 超限则保留已读前缀 + 剩余流，跳过脚本处理后继续流式转发。
-                    let mut body_bytes = match collect_with_limit(resp_body, MAX_SCRIPT_BUFFER).await
-                    {
-                        Ok(CollectOutcome::Complete(bytes)) => bytes,
-                        Ok(CollectOutcome::Overflow { prefix, rest }) => {
-                            tracing::warn!(
-                                host = %host,
-                                limit = MAX_SCRIPT_BUFFER,
-                                "chunked 响应体超过脚本处理上限，跳过注入/钩子并流式转发"
-                            );
-                            let mut headers = resp_parts.headers.clone();
-                            headers.remove(hyper::header::CONTENT_LENGTH);
-                            headers.remove(hyper::header::TRANSFER_ENCODING);
-                            let mut builder = Response::builder().status(resp_parts.status);
-                            for (k, v) in headers.iter() {
-                                builder = builder.header(k, v);
-                            }
-                            let stream = PrefixedBody {
-                                prefix: Some(prefix),
+                    let mut body_bytes =
+                        match collect_with_limit(resp_body, MAX_SCRIPT_BUFFER).await {
+                            Ok(CollectOutcome::Complete(bytes)) => bytes,
+                            Ok(CollectOutcome::Overflow {
+                                prefix,
+                                pending,
                                 rest,
-                            };
-                            return builder
-                                .body(BoxBody::new(CountingBody {
-                                    inner: BoxBody::new(stream),
-                                    stats: self.stats.clone(),
-                                    head_counted: false,
-                                }))
-                                .map_err(|e| e.to_string());
-                        }
-                        Err(e) => {
-                            // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
-                            // （RST 等，hyper display 为「connection error」）。
-                            // 注意 is_closed() 只匹配 ChannelClosed（我方通道关闭），不覆盖 Kind::Io。
-                            let transient =
-                                e.is_incomplete_message() || is_io_error(&e) || e.is_body_write_aborted();
-                            if transient {
-                                if let Some(a) = winner {
-                                    connector.mark_failed(a);
+                            }) => {
+                                tracing::warn!(
+                                    host = %host,
+                                    limit = MAX_SCRIPT_BUFFER,
+                                    "chunked 响应体超过脚本处理上限，跳过注入/钩子并流式转发"
+                                );
+                                let mut headers = resp_parts.headers.clone();
+                                headers.remove(hyper::header::CONTENT_LENGTH);
+                                headers.remove(hyper::header::TRANSFER_ENCODING);
+                                let mut builder = Response::builder().status(resp_parts.status);
+                                for (k, v) in headers.iter() {
+                                    builder = builder.header(k, v);
                                 }
+                                let stream = PrefixedBody {
+                                    prefix: Some(prefix),
+                                    pending: pending.into(),
+                                    rest,
+                                };
+                                return builder
+                                    .body(BoxBody::new(CountingBody {
+                                        inner: BoxBody::new(stream),
+                                        stats: self.stats.clone(),
+                                        head_counted: false,
+                                    }))
+                                    .map_err(|e| e.to_string());
                             }
-                            if attempt == 0 && idempotent && transient {
-                                tracing::warn!("出站连接中断，换连接重试: {host} ({e})");
-                                continue;
+                            Err(e) => {
+                                // 可重试 = 连接级失败：消息不完整（对端提前关闭）或 IO 错误
+                                // （RST 等，hyper display 为「connection error」）。
+                                // 注意 is_closed() 只匹配 ChannelClosed（我方通道关闭），不覆盖 Kind::Io。
+                                let transient = e.is_incomplete_message()
+                                    || is_io_error(&e)
+                                    || e.is_body_write_aborted();
+                                if transient {
+                                    if let Some(a) = winner {
+                                        connector.mark_failed(a);
+                                    }
+                                }
+                                if attempt == 0 && idempotent && transient {
+                                    tracing::warn!("出站连接中断，换连接重试: {host} ({e})");
+                                    continue;
+                                }
+                                return Err(format!("请求失败: {e}"));
                             }
-                            return Err(format!("请求失败: {e}"));
-                        }
-                    };
+                        };
                     self.stats.add_down(body_bytes.len() as u64 + 128);
 
                     // —— 服务端脚本 onResponse 钩子（Phase 4b 新增能力）——
@@ -1032,9 +1057,13 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 
 /// (名, 值) 列表 → HeaderMap（脚本修改结果；无效头跳过并告警）
 ///
-/// 用 `append` 而非 `insert`：`Set-Cookie` 天然是多值的，`insert` 会让后一条
-/// 覆盖前一条 —— 登录类响应常同时下发多个 cookie（session + csrf + waf token），
-/// 被合并掉一个就会出现「登录成功但刷新即掉登录」。
+/// `Set-Cookie` 用 `append`：它天然是多值的，`insert` 会让后一条覆盖前一条 ——
+/// 登录类响应常同时下发多个 cookie（session + csrf + waf token），被合并掉一个
+/// 就会出现「登录成功但刷新即掉登录」。
+///
+/// 其余头用 `insert`：脚本返回的列表里若出现重复的普通头（如两个
+/// `Content-Type`），按 HTTP/1.1 语义是脚本的显式覆盖意图，全部 append 会让
+/// 下游收到互相矛盾的头。
 fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
     let mut map = HeaderMap::new();
     for (k, v) in pairs {
@@ -1043,7 +1072,11 @@ fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
             HeaderValue::from_str(v),
         ) {
             (Ok(name), Ok(value)) => {
-                map.append(name, value);
+                if name == hyper::header::SET_COOKIE {
+                    map.append(name, value);
+                } else {
+                    map.insert(name, value);
+                }
             }
             _ => {
                 tracing::warn!("脚本修改的请求头无效，已跳过: {k}");
@@ -1067,10 +1100,7 @@ fn headermap_from_pairs(pairs: &[(String, String)]) -> HeaderMap {
 ///    上游（Java Servlet `getHeader`、部分 WAF）只会读到第一条，仍会丢 cookie。
 ///
 /// 其余头一律 `append` 保序保留。`Host` 只允许一个值，故单独 `insert`。
-fn build_outbound_headers(
-    src: &HeaderMap,
-    authority: &str,
-) -> Result<HeaderMap, String> {
+fn build_outbound_headers(src: &HeaderMap, authority: &str) -> Result<HeaderMap, String> {
     let mut out = HeaderMap::new();
     out.insert(
         HOST,
@@ -1371,6 +1401,7 @@ mod tests {
     async fn prefixed_body_emits_prefix_then_rest() {
         let body = PrefixedBody {
             prefix: Some(Bytes::from_static(b"ab")),
+            pending: std::collections::VecDeque::new(),
             rest: Full::new(Bytes::from_static(b"cd")),
         };
         let bytes = body.collect().await.unwrap().to_bytes();
@@ -1389,8 +1420,13 @@ mod tests {
         ];
         let body = StreamBody::new(stream::iter(frames));
         match collect_with_limit(body, 3).await.unwrap() {
-            CollectOutcome::Overflow { prefix, rest } => {
+            CollectOutcome::Overflow {
+                prefix,
+                pending,
+                rest,
+            } => {
                 assert_eq!(&prefix[..], b"abcd");
+                assert!(pending.is_empty());
                 let rest = rest.collect().await.unwrap().to_bytes();
                 assert_eq!(&rest[..], b"ef");
             }
@@ -1509,7 +1545,11 @@ mod tests {
         src.append(COOKIE, HeaderValue::from_bytes(b"raw=\x80\x81").unwrap());
 
         let out = build_outbound_headers(&src, "x.com").unwrap();
-        let cookies: Vec<&[u8]> = out.get_all(COOKIE).iter().map(HeaderValue::as_bytes).collect();
+        let cookies: Vec<&[u8]> = out
+            .get_all(COOKIE)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect();
         assert_eq!(cookies.len(), 2, "透传项与合并项都必须保留");
         assert!(cookies.iter().any(|c| *c == b"raw=\x80\x81"));
         assert!(cookies.iter().any(|c| *c == b"normal=1"));

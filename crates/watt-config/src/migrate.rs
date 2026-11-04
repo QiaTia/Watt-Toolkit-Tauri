@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_migrate_empty_object() {
         let outcome = migrate_legacy_settings("{}").unwrap();
-        assert_eq!(outcome.settings.proxy_mode, ProxyMode::Hosts);
+        assert_eq!(outcome.settings.proxy_mode, ProxyMode::default());
         assert!(outcome.warnings.is_empty());
         assert!(outcome.settings.enabled_accelerate_ids.is_empty());
     }

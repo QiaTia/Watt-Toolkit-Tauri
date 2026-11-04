@@ -1,7 +1,8 @@
 //! 证书信任：三平台根证书安装/移除/查询。对齐 CertificateManagerImpl。
 //!
-//! - Windows：LocalMachine\Root 存储（CertOpenSystemStore），直接 API 失败时
-//!   经 ShellExecute "runas" 提权运行 certutil（对齐原实现子进程提权语义）。
+//! - Windows：当前用户 Root 存储（`certutil -addstore -user` 等价），查询/清理
+//!   同时覆盖机器 Root 存储以兼容旧版本安装；直接 API 失败时经 ShellExecute
+//!   "runas" 提权运行 certutil（对齐原实现子进程提权语义）。
 //! - macOS：security add-trusted-cert / remove-trusted-cert。
 //! - Linux：/usr/local/share/ca-certificates + update-ca-certificates。
 //!
@@ -143,6 +144,108 @@ pub mod platform {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// 打开 Root 存储：`machine=false` 当前用户，`machine=true` 本机。
+    /// SAFETY: 返回的 HCERTSTORE 由调用方用 `CertCloseStore` 关闭。
+    unsafe fn open_root_store(
+        machine: bool,
+    ) -> windows_sys::Win32::Security::Cryptography::HCERTSTORE {
+        use windows_sys::Win32::Security::Cryptography::{CertOpenSystemStoreA, HCRYPTPROV_LEGACY};
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        // CertOpenSystemStoreA 的 hprov 是 HCRYPTPROV_LEGACY(usize)，不是 HKEY 指针
+        let hprov: HCRYPTPROV_LEGACY = if machine {
+            HKEY_LOCAL_MACHINE as HCRYPTPROV_LEGACY
+        } else {
+            HKEY_CURRENT_USER as HCRYPTPROV_LEGACY
+        };
+        CertOpenSystemStoreA(hprov, c"ROOT".as_ptr() as _)
+    }
+
+    /// Root 存储中是否存在与 DER 完全一致的证书
+    /// SAFETY: 枚举约定同 `delete_from_store`。
+    unsafe fn store_contains(
+        store: windows_sys::Win32::Security::Cryptography::HCERTSTORE,
+        der: &[u8],
+    ) -> bool {
+        use windows_sys::Win32::Security::Cryptography::{
+            CertEnumCertificatesInStore, CertFreeCertificateContext, CERT_CONTEXT,
+        };
+        let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
+        loop {
+            ctx = CertEnumCertificatesInStore(store, ctx);
+            if ctx.is_null() {
+                return false;
+            }
+            let encoded_ptr = (*ctx).pbCertEncoded as *const u8;
+            let encoded_len = (*ctx).cbCertEncoded as usize;
+            if encoded_ptr.is_null() || encoded_len == 0 {
+                continue;
+            }
+            if std::slice::from_raw_parts(encoded_ptr, encoded_len) == der {
+                CertFreeCertificateContext(ctx);
+                return true;
+            }
+        }
+    }
+
+    /// 删除存储中所有同 DER 条目；返回 (是否命中, 是否有删除失败)
+    /// SAFETY: CertEnumCertificatesInStore 每次调用释放上一个 context；
+    /// CertDeleteCertificateFromStore 成功后释放当前 context，失败时由我们释放。
+    unsafe fn delete_from_store(
+        store: windows_sys::Win32::Security::Cryptography::HCERTSTORE,
+        der: &[u8],
+    ) -> (bool, bool) {
+        use windows_sys::Win32::Security::Cryptography::{
+            CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
+            CertFreeCertificateContext, CERT_CONTEXT,
+        };
+        let mut present = false;
+        let mut failed = false;
+        let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
+        loop {
+            ctx = CertEnumCertificatesInStore(store, ctx);
+            if ctx.is_null() {
+                break;
+            }
+            let encoded_ptr = (*ctx).pbCertEncoded as *const u8;
+            let encoded_len = (*ctx).cbCertEncoded as usize;
+            if encoded_ptr.is_null() || encoded_len == 0 {
+                continue;
+            }
+            if std::slice::from_raw_parts(encoded_ptr, encoded_len) == der {
+                present = true;
+                if CertDeleteCertificateFromStore(ctx) == 0 {
+                    // 删除失败时 context 未释放，需自行释放否则泄漏。
+                    // 不能再从头枚举：同一条目仍在，会无限重试；交给提权兜底处理。
+                    failed = true;
+                    CertFreeCertificateContext(ctx);
+                    break;
+                }
+                ctx = std::ptr::null_mut(); // 删除成功，从头重新枚举其余同名条目
+            }
+        }
+        (present, failed)
+    }
+
+    /// 证书是否存在于用户或机器 Root 存储（用于幂等判断与提权删除后的校验）
+    fn der_in_root_stores(der: &[u8]) -> bool {
+        use windows_sys::Win32::Security::Cryptography::CertCloseStore;
+        // SAFETY: 句柄在函数内关闭
+        unsafe {
+            for machine in [false, true] {
+                let store = open_root_store(machine);
+                if store.is_null() {
+                    continue;
+                }
+                let found = store_contains(store, der);
+                CertCloseStore(store, 0);
+                if found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 以管理员权限运行命令并等待退出（UAC 弹窗）。
     /// SAFETY: ShellExecuteExW 按 SHELLEXECUTEINFOW 语义管理 hProcess，句柄在函数内关闭。
     fn run_elevated(exe: &str, args: &str) -> Result<(), TrustError> {
@@ -190,16 +293,20 @@ pub mod platform {
         }
     }
 
-    /// 安装根证书到 LocalMachine\Root（按 thumbprint 去重）
+    /// 安装根证书到当前用户 Root 存储（已存在则直接返回，避免重复条目）
     pub fn install_root_cert(cert_pem_path: &Path) -> Result<(), TrustError> {
         let der = load_der_from_pem(cert_pem_path)?;
+        // 机器存储中的旧版安装也算已安装：不再重复写入用户存储
+        if der_in_root_stores(&der) {
+            return Ok(());
+        }
         // SAFETY: windows-sys FFI，所有句柄在函数内关闭
         unsafe {
             use windows_sys::Win32::Security::Cryptography::{
-                CertAddEncodedCertificateToStore, CertCloseStore, CertOpenSystemStoreA,
-                CERT_STORE_ADD_ALWAYS, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+                CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_REPLACE_EXISTING,
+                PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
             };
-            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
+            let store = open_root_store(false);
             if store.is_null() {
                 return Err(TrustError::Trust("CertOpenSystemStore(ROOT) 失败".into()));
             }
@@ -209,7 +316,8 @@ pub mod platform {
                 encoding,
                 der.as_ptr(),
                 der.len() as u32,
-                CERT_STORE_ADD_ALWAYS, // 系统按 thumbprint 去重
+                // 同 issuer+serial 的证书替换而非叠加（ADD_ALWAYS 会产生重复条目）
+                CERT_STORE_ADD_REPLACE_EXISTING,
                 std::ptr::null_mut(),
             );
             CertCloseStore(store, 0);
@@ -220,7 +328,7 @@ pub mod platform {
 
         // 直接写入失败（通常无管理员权限）→ 提权 certutil
         // 必须带 -user：直接 API 写的是当前用户 Root，查询/删除也按用户存储；
-        // 不加 -user 会写到机器 Root，导致安装后校验不到、卸载后残留机器信任。
+        // 不加 -user 会写到机器 Root，导致后续清理路径不一致。
         let path_str = cert_pem_path.to_string_lossy().to_string();
         tracing::warn!("直接写入 Root 存储失败，尝试提权 certutil -addstore -user");
         run_elevated(
@@ -229,98 +337,85 @@ pub mod platform {
         )
     }
 
-    /// 移除根证书（按 DER 精确匹配；未命中时幂等返回成功）
+    /// 移除根证书（用户 + 机器存储，按 DER 精确匹配；未命中时幂等返回成功）
     pub fn remove_root_cert_der(der: &[u8]) -> Result<(), TrustError> {
-        let mut delete_failed = false;
-        // SAFETY: CertEnumCertificatesInStore 每次调用释放上一个 context；
-        // CertDeleteCertificateFromStore 成功后释放当前 context，失败时由我们释放。
+        use windows_sys::Win32::Security::Cryptography::CertCloseStore;
+
+        let mut user_failed = false;
+        let mut machine_failed = false;
+        // SAFETY: 句柄在函数内关闭；枚举/删除所有权约定见 delete_from_store
         unsafe {
-            use windows_sys::Win32::Security::Cryptography::{
-                CertCloseStore, CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
-                CertFreeCertificateContext, CertOpenSystemStoreA, CERT_CONTEXT,
-            };
-            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
-            if store.is_null() {
-                return Err(TrustError::Trust("CertOpenSystemStore(ROOT) 失败".into()));
-            }
-            let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
-            loop {
-                // 本次调用释放上一个 ctx（若非空）
-                ctx = CertEnumCertificatesInStore(store, ctx);
-                if ctx.is_null() {
-                    break;
-                }
-                let encoded_ptr = (*ctx).pbCertEncoded as *const u8;
-                let encoded_len = (*ctx).cbCertEncoded as usize;
-                if encoded_ptr.is_null() || encoded_len == 0 {
+            for machine in [false, true] {
+                let store = open_root_store(machine);
+                if store.is_null() {
+                    // 存储打不开时无法确认证书是否残留：标记失败走提权兜底，
+                    // 由删除后的存在性校验给出最终结论。
+                    if machine {
+                        machine_failed = true;
+                    } else {
+                        user_failed = true;
+                    }
                     continue;
                 }
-                let bytes = std::slice::from_raw_parts(encoded_ptr, encoded_len);
-                if bytes == der {
-                    if CertDeleteCertificateFromStore(ctx) == 0 {
-                        // 删除失败时 context 未释放，需自行释放否则泄漏
-                        delete_failed = true;
-                        CertFreeCertificateContext(ctx);
+                let (present, failed) = delete_from_store(store, der);
+                CertCloseStore(store, 0);
+                if present && failed {
+                    if machine {
+                        machine_failed = true;
+                    } else {
+                        user_failed = true;
                     }
-                    ctx = std::ptr::null_mut(); // 从头重新枚举
                 }
             }
-            CertCloseStore(store, 0);
         }
 
-        if delete_failed {
-            // 无权限/被安全软件锁定 → 按 SHA-1 thumbprint 提权精确删除（不再按 CN）。
-            // 同时覆盖用户存储（-user，与安装/查询一致）和旧版本可能写入的机器存储。
-            let thumbprint = sha1_hex(der).to_uppercase();
-            tracing::warn!("直接删除根证书失败，尝试提权 certutil -delstore {thumbprint}");
-            let args = format!(
-                "/C certutil -f -delstore -user Root {thumbprint} & \
-                 certutil -f -delstore Root {thumbprint} & exit /b 0"
-            );
-            return run_elevated("cmd.exe", &args);
+        if !user_failed && !machine_failed {
+            return Ok(());
         }
-        // 未命中即已不存在：保持幂等，不再按 CN 误删同名第三方根证书
+
+        // 无权限/被安全软件锁定 → 按 SHA-1 thumbprint 提权精确删除（不再按 CN）。
+        // 仅对实际失败的存储执行；任一命令失败时置 ERR=1（不要再 `exit /b 0`，
+        // 那会把「只删掉一半」伪装成成功）。
+        let thumbprint = sha1_hex(der).to_uppercase();
+        tracing::warn!("直接删除根证书失败，尝试提权 certutil -delstore {thumbprint}");
+        let mut steps = vec!["set ERR=0".to_string()];
+        if user_failed {
+            steps.push(format!(
+                "certutil -f -delstore -user Root {thumbprint} || set ERR=1"
+            ));
+        }
+        if machine_failed {
+            steps.push(format!(
+                "certutil -f -delstore Root {thumbprint} || set ERR=1"
+            ));
+        }
+        steps.push("exit /b !ERR!".to_string());
+        let args = format!("/V:ON /C \"{}\"", steps.join(" & "));
+
+        // certutil 对「本来就不存在」也返回非零：以删除后的真实存在性为准。
+        match run_elevated("cmd.exe", &args) {
+            Ok(()) => {}
+            Err(e) => {
+                if der_in_root_stores(der) {
+                    return Err(e);
+                }
+                tracing::warn!("certutil 返回非零但证书已不存在，视为删除成功: {e}");
+            }
+        }
+        if der_in_root_stores(der) {
+            return Err(TrustError::Trust(
+                "提权删除后根证书仍存在于 Root 存储".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// 检查根证书是否已安装（LocalMachine\Root 中存在同 DER 证书）
+    /// 检查根证书是否已安装（用户或机器 Root 存储中存在同 DER 证书）
     pub fn is_root_cert_installed(cert_pem_path: &Path) -> bool {
         let Ok(der) = load_der_from_pem(cert_pem_path) else {
             return false;
         };
-        // SAFETY: 同 remove_root_cert 的枚举所有权约定
-        unsafe {
-            use windows_sys::Win32::Security::Cryptography::{
-                CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateContext,
-                CertOpenSystemStoreA, CERT_CONTEXT,
-            };
-            let store = CertOpenSystemStoreA(0, c"ROOT".as_ptr() as _);
-            if store.is_null() {
-                return false;
-            }
-            let mut found = false;
-            let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
-            loop {
-                ctx = CertEnumCertificatesInStore(store, ctx);
-                if ctx.is_null() {
-                    break;
-                }
-                let encoded_ptr = (*ctx).pbCertEncoded as *const u8;
-                let encoded_len = (*ctx).cbCertEncoded as usize;
-                if encoded_ptr.is_null() || encoded_len == 0 {
-                    continue;
-                }
-                let bytes = std::slice::from_raw_parts(encoded_ptr, encoded_len);
-                if bytes == der.as_slice() {
-                    found = true;
-                    // 终止枚举：释放当前 context 避免泄漏
-                    CertFreeCertificateContext(ctx);
-                    break;
-                }
-            }
-            CertCloseStore(store, 0);
-            found
-        }
+        der_in_root_stores(&der)
     }
 }
 
@@ -624,10 +719,10 @@ pub mod platform {
         let admin_export = export_trust_settings(true);
         if user_export
             .as_ref()
-            .map_or(false, |d| trust_export_contains(d, sha1))
+            .is_some_and(|d| trust_export_contains(d, sha1))
             || admin_export
                 .as_ref()
-                .map_or(false, |d| trust_export_contains(d, sha1))
+                .is_some_and(|d| trust_export_contains(d, sha1))
         {
             return TrustLookup::Found;
         }
@@ -663,9 +758,7 @@ pub mod platform {
                 saw_hash_field = true;
             }
         }
-        if read_any && saw_hash_field {
-            TrustLookup::Absent
-        } else if read_any && !saw_entries {
+        if read_any && (saw_hash_field || !saw_entries) {
             TrustLookup::Absent
         } else {
             TrustLookup::Unknown
@@ -780,18 +873,6 @@ pub fn is_root_cert_installed(cert_pem_path: &Path) -> bool {
     platform::is_root_cert_installed(cert_pem_path)
 }
 
-/// 供上层决定是否走 helper 提权。
-///
-/// 三平台都不再走「必须提权才能安装」：
-/// - Windows：装当前用户 Root 存储（`certutil -addstore -user`），用户令牌即可写
-/// - macOS：装用户信任域（`add-trusted-cert` 不带 `-d`），只需系统信任确认
-/// - Linux：写 `/usr/local/share/ca-certificates` 仍需要 root
-///
-/// 因此仅 Linux 返回 true；Windows/macOS 在个别失败场景才回落到提权兜底。
-pub fn install_requires_elevation() -> bool {
-    cfg!(target_os = "linux")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,8 +924,10 @@ mod tests {
         // dump-trust-settings 部分版本：大写 + 冒号分隔
         let coloned = "0A:1B:2C:3D:4E:5F:60:71:82:93:A4:B5:C6:D7:E8:F9:01:23:45:67";
         assert!(trust_dump_contains(
-            &format!("	SHA-1 hash: {coloned}
-	Num trust settings: 1"),
+            &format!(
+                "	SHA-1 hash: {coloned}
+	Num trust settings: 1"
+            ),
             sha1
         ));
         // 未命中

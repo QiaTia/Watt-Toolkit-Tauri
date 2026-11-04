@@ -22,6 +22,11 @@ pub struct AppState {
     /// ProxySettings.json 的读-改-写串行化：设置页整对象保存与加速页
     /// 「保存勾选」都会写同一文件，并发执行会互相覆盖（丢勾选 / 丢设置）
     pub settings_lock: tokio::sync::Mutex<()>,
+    /// 证书操作串行化（安装/卸载/重新生成）。
+    ///
+    /// engine_start 启动前 `try_lock` 快速失败：证书操作的提权对话框可能停留
+    /// 数十秒，期间不能让引擎带着「即将被替换的 CA」启动。
+    pub cert_lock: tokio::sync::Mutex<()>,
     /// 应用数据目录（{AppData}/WattToolkit）
     pub data_dir: PathBuf,
     /// 首启迁移报告（旧版数据导入结果）
@@ -73,6 +78,12 @@ pub fn run() {
             let data_dir = resolve_data_dir(app.handle());
             std::fs::create_dir_all(&data_dir)?;
 
+            // macOS 系统代理原值快照（Windows 用注册表）：初始化时注入路径，
+            // 启动清理/停止时按快照还原用户原有代理。
+            watt_core::system_proxy::set_system_proxy_snapshot_path(Some(
+                data_dir.join("Settings").join("SystemProxyBackup.json"),
+            ));
+
             // 首启迁移：旧版设置 + CA PFX 导入（PFX 成功后由 load_or_generate 加载）
             let migration = migrate::run_startup_migration(&data_dir);
 
@@ -91,12 +102,16 @@ pub fn run() {
                 // 是持久化的、而运行态记忆随进程消失，会残留「域名 → 127.0.0.1 但无人监听
                 // 443」的黑洞（浏览器报连接被拒绝 / 找不到此网页）。此处仅清理确定属于本
                 // 引擎的残留（hosts 标记块 + 指向本引擎端口的系统代理 / PAC）。
-                let proxy_port =
+                let proxy_settings =
                     watt_config::settings::load_proxy_settings_in(&data_dir.join("Settings"))
-                        .unwrap_or_default()
-                        .system_proxy_port;
+                        .unwrap_or_default();
+                let proxy_port = proxy_settings.system_proxy_port;
+                let listen_ip = proxy_settings
+                    .system_proxy_ip
+                    .as_deref()
+                    .and_then(|s| s.parse().ok());
                 let engine = ProxyEngine::new();
-                let cleaned = engine.cleanup_orphans(None, &[proxy_port]);
+                let cleaned = engine.cleanup_orphans(None, &[proxy_port], listen_ip);
                 if !cleaned.is_empty() {
                     tracing::warn!("启动清理残留代理状态: {}", cleaned.join(", "));
                 }
@@ -117,6 +132,7 @@ pub fn run() {
                     engine: tokio::sync::Mutex::new(engine),
                     ca: tokio::sync::RwLock::new(ca),
                     settings_lock: tokio::sync::Mutex::new(()),
+                    cert_lock: tokio::sync::Mutex::new(()),
                     data_dir,
                     migration,
                 }
@@ -178,13 +194,17 @@ pub fn run() {
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
             let state = handle.state::<AppState>();
-            let port =
+            let settings =
                 watt_config::settings::load_proxy_settings_in(&state.data_dir.join("Settings"))
-                    .map(|s| s.system_proxy_port)
-                    .unwrap_or(watt_config::constants::DEFAULT_HTTP_PROXY_PORT);
+                    .unwrap_or_default();
+            let port = settings.system_proxy_port;
+            let listen_ip = settings
+                .system_proxy_ip
+                .as_deref()
+                .and_then(|s| s.parse().ok());
             tauri::async_runtime::block_on(async {
                 let mut engine = state.engine.lock().await;
-                engine.shutdown(None, &[port]).await;
+                engine.shutdown(None, &[port], listen_ip).await;
             });
             // 兜底：引擎非运行态时 shutdown 不会走 stop()，终端代理环境变量需单独还原
             let tp_backup = state

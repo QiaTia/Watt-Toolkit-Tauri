@@ -32,10 +32,13 @@ pub fn allows_unprivileged_privileged_port() -> bool {
 
 /// Hosts 模式的阻塞原因；`None` 表示当前进程可尝试 Hosts 模式。
 ///
-/// 只在「确定绑定会失败」时返回原因（macOS 非 root），避免误伤 Linux 上通过
-/// sysctl 放开特权端的部署。
-pub fn hosts_mode_block_reason() -> Option<String> {
-    if allows_unprivileged_privileged_port() || is_elevated() {
+/// `https_port` / `http_port` 为本次实际要绑定的端口：只有其中出现 <1024 的
+/// 特权端口时才可能被系统拒绝。这样端口可配置（测试/自定义高位端口）时，
+/// macOS 非 root 也能正常使用 Hosts 模式；仅在「确定绑定会失败」时拦截，
+/// 避免误伤 Linux 上通过 sysctl 放开特权端的部署。
+pub fn hosts_mode_block_reason(https_port: u16, http_port: Option<u16>) -> Option<String> {
+    let binds_privileged_port = https_port < 1024 || http_port.is_some_and(|p| p < 1024);
+    if !binds_privileged_port || allows_unprivileged_privileged_port() || is_elevated() {
         return None;
     }
     Some(
@@ -54,16 +57,26 @@ mod tests {
     fn non_macos_never_blocks_hosts_mode() {
         // Windows / Linux 不受 macOS 的 443 限制；Linux 由 sysctl 决定，交由真实 bind 判定
         if cfg!(not(target_os = "macos")) {
-            assert!(hosts_mode_block_reason().is_none());
+            assert!(hosts_mode_block_reason(443, Some(80)).is_none());
             assert!(allows_unprivileged_privileged_port());
         }
     }
 
     #[test]
+    fn high_ports_never_block_hosts_mode() {
+        // 自定义高位端口不涉及特权端口绑定，任何平台都不应被前置拦截
+        assert!(hosts_mode_block_reason(18443, Some(18480)).is_none());
+        assert!(hosts_mode_block_reason(18443, None).is_none());
+    }
+
+    #[test]
     fn block_reason_is_actionable_when_present() {
-        // macOS 非 root 时才可能有原因；文案必须给出可直接切换的替代模式
-        if let Some(reason) = hosts_mode_block_reason() {
-            assert!(reason.contains("系统代理"), "文案应指向系统代理模式: {reason}");
+        // macOS 非 root 且绑定特权端口时才可能有原因；文案必须给出可直接切换的替代模式
+        if let Some(reason) = hosts_mode_block_reason(443, Some(80)) {
+            assert!(
+                reason.contains("系统代理"),
+                "文案应指向系统代理模式: {reason}"
+            );
             assert!(reason.contains("PAC"), "文案应指向 PAC 模式: {reason}");
         }
     }

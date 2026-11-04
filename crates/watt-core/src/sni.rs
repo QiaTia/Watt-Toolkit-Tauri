@@ -34,11 +34,24 @@ pub fn outbound_tls_connector(
     verify: OutboundVerify,
     alt_name: Option<String>,
 ) -> Arc<tokio_rustls::TlsConnector> {
+    // 标准验证的 ClientConfig 与连接无关（根证书 / 密码套件固定），每个 TCP
+    // 连接都重建一次只是浪费 CPU（TLS 配置构建包含证书解析）。进程内缓存复用。
+    if verify == OutboundVerify::Standard {
+        static STANDARD: std::sync::OnceLock<Arc<tokio_rustls::TlsConnector>> =
+            std::sync::OnceLock::new();
+        return STANDARD
+            .get_or_init(|| {
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store())
+                    .with_no_client_auth();
+                Arc::new(tokio_rustls::TlsConnector::from(Arc::new(config)))
+            })
+            .clone();
+    }
+
     let builder = rustls::ClientConfig::builder();
     let config = match verify {
-        OutboundVerify::Standard => builder
-            .with_root_certificates(root_store())
-            .with_no_client_auth(),
+        OutboundVerify::Standard => unreachable!("Standard 已在上面提前返回"),
         OutboundVerify::IgnoreNameMismatch => {
             let roots = root_store();
             match alt_name.map(|n| server_name(&n)).and_then(|s| s) {
@@ -58,9 +71,7 @@ pub fn outbound_tls_connector(
                     // 没有可校验的替代名称时退回标准验证：IgnoreNameMismatch 只应
                     // 放宽名称匹配，绝不应退化为全放行。
                     tracing::warn!("IgnoreNameMismatch 缺少替代名称，回退标准证书验证");
-                    builder
-                        .with_root_certificates(roots)
-                        .with_no_client_auth()
+                    builder.with_root_certificates(roots).with_no_client_auth()
                 }
             }
         }

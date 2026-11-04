@@ -164,8 +164,10 @@ async function uninstallCa(): Promise<void> {
 
 async function regenerateCa(): Promise<void> {
   await withCertError(async () => {
-    await cert.regenerate();
+    const status = await cert.regenerate();
     message.warning(t('settings.certRegenerated'));
+    // 旧信任清理失败是非致命告警：必须显式提示，避免用户误以为旧根已移除
+    if (status.warning) message.warning(status.warning);
   });
 }
 

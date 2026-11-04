@@ -226,7 +226,8 @@ pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Registry::{
-            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ,
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+            REG_EXPAND_SZ, REG_SZ,
         };
 
         const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
@@ -266,7 +267,14 @@ pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
                     std::ptr::null_mut(),
                     &mut len,
                 );
-                if st != 0 || ty != REG_SZ || len == 0 || !len.is_multiple_of(2) || len > 2048 {
+                // ProxyServer / ProxyOverride / AutoConfigURL 也可能被写成
+                // REG_EXPAND_SZ（组策略 / 用户手改），状态读取同样要认。
+                if st != 0
+                    || (ty != REG_SZ && ty != REG_EXPAND_SZ)
+                    || len == 0
+                    || !len.is_multiple_of(2)
+                    || len > 2048
+                {
                     return None;
                 }
                 let mut buf = vec![0u16; (len / 2) as usize];
@@ -302,16 +310,42 @@ pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
     }
 }
 
-/// 启用系统代理失败后是否应执行回滚（Windows）。
+/// macOS 系统代理快照的落盘位置（启动时由应用壳注入）。
 ///
-/// Windows 只有快照已建立时才允许回滚，否则会把用户原有代理关掉；
-/// macOS 没有快照机制，沿用原有「失败即关闭代理」的回滚；Linux 无写入。
+/// Windows 把快照放在注册表；macOS 没有等价的白名单键，改为数据目录下的
+/// JSON 文件。未注入路径时快照不落盘，停用时退化为「关闭代理」（旧行为）。
+static SNAPSHOT_PATH: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn configured_snapshot_path() -> Option<std::path::PathBuf> {
+    SNAPSHOT_PATH
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+}
+
+/// 配置 macOS 系统代理快照文件路径（应用启动时调用；其他平台忽略）。
+pub fn set_system_proxy_snapshot_path(path: Option<std::path::PathBuf>) {
+    let cell = SNAPSHOT_PATH.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = path;
+    }
+}
+
+/// 启用系统代理失败后是否应执行回滚。
+///
+/// 只有快照已建立时才允许回滚，否则会把用户原有代理关掉（Windows 注册表 /
+/// macOS JSON 快照同理）；Linux 无实际写入，保持原行为。
 pub fn should_rollback_proxy_on_failure() -> bool {
     #[cfg(target_os = "windows")]
     {
         win_backup::has_backup()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::snapshot_exists()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         true
     }
@@ -325,6 +359,10 @@ pub fn discard_stale_proxy_backup() {
         if win_backup::has_backup() {
             win_backup::discard_backup();
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::discard_snapshot();
     }
 }
 
@@ -350,7 +388,6 @@ fn notify_settings_changed() {
         );
     }
 }
-
 
 /// macOS networksetup / route 输出解析（纯函数，跨平台单测覆盖）
 ///
@@ -406,12 +443,15 @@ mod netparse {
     }
 
     /// 从服务列表 + 默认路由设备解析目标服务集合（VPN/多活动服务兜底策略，纯函数）
-    pub fn resolve_from(services: &[(String, String)], default_dev: &Option<String>) -> Vec<String> {
+    pub fn resolve_from(
+        services: &[(String, String)],
+        default_dev: &Option<String>,
+    ) -> Vec<String> {
         if let Some(dev) = default_dev {
-        if let Some((name, _)) = services
-            .iter()
-            .find(|(_, d)| d == dev && is_proxy_capable(d))
-        {
+            if let Some((name, _)) = services
+                .iter()
+                .find(|(_, d)| d == dev && is_proxy_capable(d))
+            {
                 return vec![name.clone()];
             }
         }
@@ -445,7 +485,10 @@ mod netparse {
             assert_eq!(services.len(), 4);
             assert_eq!(services[0], ("Wi-Fi".to_string(), "en0".to_string()));
             assert_eq!(services[1], ("Ethernet".to_string(), "en1".to_string()));
-            assert_eq!(services[2], ("Thunderbolt Bridge".to_string(), "bridge0".to_string()));
+            assert_eq!(
+                services[2],
+                ("Thunderbolt Bridge".to_string(), "bridge0".to_string())
+            );
             assert_eq!(services[3], ("My VPN".to_string(), String::new()));
         }
 
@@ -536,7 +579,10 @@ mod macos {
 
     /// 默认路由接口
     fn default_route_interface() -> Option<String> {
-        let out = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
+        let out = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -549,10 +595,14 @@ mod macos {
             .arg("-listnetworkserviceorder")
             .output()
         else {
-            return Err("无法获取网络服务列表（networksetup -listnetworkserviceorder 执行失败）".into());
+            return Err(
+                "无法获取网络服务列表（networksetup -listnetworkserviceorder 执行失败）".into(),
+            );
         };
         if !out.status.success() {
-            return Err("无法获取网络服务列表（networksetup -listnetworkserviceorder 退出非零）".into());
+            return Err(
+                "无法获取网络服务列表（networksetup -listnetworkserviceorder 退出非零）".into(),
+            );
         }
         let services = parse_service_list(&String::from_utf8_lossy(&out.stdout));
         if services.is_empty() {
@@ -561,7 +611,9 @@ mod macos {
 
         let resolved = resolve_from(&services, &default_route_interface());
         if resolved.is_empty() {
-            return Err("无法确定可设置代理的网络服务（默认路由非物理网卡，且无硬件类活动服务）".into());
+            return Err(
+                "无法确定可设置代理的网络服务（默认路由非物理网卡，且无硬件类活动服务）".into(),
+            );
         }
         Ok(resolved)
     }
@@ -591,8 +643,220 @@ mod macos {
             .then(|| String::from_utf8_lossy(&out.stdout).to_string())
     }
 
+    // —— 系统代理原值快照（停止/回滚时逐服务还原）——
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct EndpointState {
+        enabled: bool,
+        server: Option<String>,
+        port: Option<u16>,
+    }
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct PacState {
+        enabled: bool,
+        url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ServiceState {
+        service: String,
+        web: EndpointState,
+        secure_web: EndpointState,
+        pac: PacState,
+        bypass: Vec<String>,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Snapshot {
+        version: u32,
+        services: Vec<ServiceState>,
+    }
+
+    /// 读取 `-getwebproxy` / `-getsecurewebproxy` 的输出
+    fn read_endpoint(svc: &str, flag: &str) -> EndpointState {
+        let Some(text) = query(&[flag, svc]) else {
+            return EndpointState::default();
+        };
+        EndpointState {
+            enabled: parse_field(&text, "Enabled").as_deref() == Some("Yes"),
+            server: parse_field(&text, "Server").filter(|s| !s.eq_ignore_ascii_case("(null)")),
+            port: parse_field(&text, "Port").and_then(|p| p.parse().ok()),
+        }
+    }
+
+    fn read_pac(svc: &str) -> PacState {
+        let Some(text) = query(&["-getautoproxyurl", svc]) else {
+            return PacState::default();
+        };
+        PacState {
+            enabled: parse_field(&text, "Enabled").as_deref() == Some("Yes"),
+            url: parse_field(&text, "URL")
+                .filter(|u| !u.is_empty() && !u.eq_ignore_ascii_case("(null)")),
+        }
+    }
+
+    fn read_bypass(svc: &str) -> Vec<String> {
+        let Some(text) = query(&["-getproxybypassdomains", svc]) else {
+            return Vec::new();
+        };
+        // 未配置时输出 "There aren't any bypass domains set on <service>."
+        if text.to_ascii_lowercase().contains("aren't any") || text.trim().is_empty() {
+            return Vec::new();
+        }
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    pub(super) fn snapshot_exists() -> bool {
+        super::configured_snapshot_path().is_some_and(|p| p.exists())
+    }
+
+    pub(super) fn discard_snapshot() {
+        if let Some(path) = super::configured_snapshot_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 启用前抓取目标服务的原值（幂等：已有快照不覆盖）。
+    ///
+    /// `capture` 失败必须中止启用：否则停止时会退化为「关闭代理」，把用户原有
+    /// 的公司代理 / PAC 一起关掉。
+    fn capture_snapshot(services: &[String]) -> Result<(), String> {
+        if snapshot_exists() {
+            return Ok(());
+        }
+        let Some(path) = super::configured_snapshot_path() else {
+            // 未配置落盘路径：无从还原，回滚判定会返回 false，不会误关用户代理
+            return Ok(());
+        };
+        let snapshot = Snapshot {
+            version: 1,
+            services: services
+                .iter()
+                .map(|svc| ServiceState {
+                    service: svc.clone(),
+                    web: read_endpoint(svc, "-getwebproxy"),
+                    secure_web: read_endpoint(svc, "-getsecurewebproxy"),
+                    pac: read_pac(svc),
+                    bypass: read_bypass(svc),
+                })
+                .collect(),
+        };
+        let json = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| format!("序列化系统代理快照失败: {e}"))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension(format!("watt-tmp-{}", std::process::id()));
+        let write = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("保存系统代理原值失败，已中止: {e}"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn restore_endpoint(
+        svc: &str,
+        set_flag: &str,
+        state_flag: &str,
+        state: &EndpointState,
+    ) -> Result<(), String> {
+        match (state.enabled, state.server.as_deref(), state.port) {
+            (true, Some(server), Some(port)) => {
+                let port_s = port.to_string();
+                run(&[set_flag, svc, server, &port_s]).and_then(|_| run(&[state_flag, svc, "on"]))
+            }
+            // 未启用：保留/写回原 server（若存在）但确保状态关闭，
+            // 避免残留指向本引擎的地址（例如原值为空时）。
+            _ => {
+                if let (Some(server), Some(port)) = (state.server.as_deref(), state.port) {
+                    let port_s = port.to_string();
+                    run(&[set_flag, svc, server, &port_s])?;
+                }
+                run(&[state_flag, svc, "off"])
+            }
+        }
+    }
+
+    fn restore_service(s: &ServiceState) -> Result<(), String> {
+        let svc = s.service.as_str();
+        restore_endpoint(svc, "-setwebproxy", "-setwebproxystate", &s.web)?;
+        restore_endpoint(
+            svc,
+            "-setsecurewebproxy",
+            "-setsecurewebproxystate",
+            &s.secure_web,
+        )?;
+
+        if s.pac.enabled {
+            if let Some(url) = s.pac.url.as_deref() {
+                run(&["-setautoproxyurl", svc, url])?;
+                run(&["-setautoproxystate", svc, "on"])?;
+            } else {
+                run(&["-setautoproxystate", svc, "off"])?;
+            }
+        } else {
+            // 关闭状态；原 URL 有值则写回（供用户之后手动开启），无值则清空
+            run(&["-setautoproxyurl", svc, s.pac.url.as_deref().unwrap_or("")])?;
+            run(&["-setautoproxystate", svc, "off"])?;
+        }
+
+        let mut args: Vec<&str> = vec!["-setproxybypassdomains", svc];
+        if s.bypass.is_empty() {
+            args.push("Empty");
+        } else {
+            args.extend(s.bypass.iter().map(String::as_str));
+        }
+        run(&args)
+    }
+
+    /// 按快照还原；无快照返回 false（调用方退化为「关闭代理」）。
+    ///
+    /// 任一服务还原失败都保留快照并返回错误，供下次停止/启动清理重试。
+    fn restore_snapshot() -> Result<bool, String> {
+        let Some(path) = super::configured_snapshot_path() else {
+            return Ok(false);
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("读取系统代理快照失败: {e}")),
+        };
+        let snapshot: Snapshot =
+            serde_json::from_slice(&bytes).map_err(|e| format!("系统代理快照解析失败: {e}"))?;
+        let mut errors: Vec<String> = Vec::new();
+        for state in &snapshot.services {
+            if let Err(e) = restore_service(state) {
+                errors.push(format!("[{}] {e}", state.service));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(format!("还原系统代理设置失败: {}", errors.join("; ")));
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(true)
+    }
+
     pub fn set_system_proxy(enable: bool, ip: &str, port: u16) -> Result<(), String> {
+        // 还原优先：快照自带服务列表，不必先解析当前服务；服务解析失败时
+        // 也能把用户原有代理恢复回去。
+        if !enable && restore_snapshot()? {
+            return Ok(());
+        }
         let services = resolve_target_services()?;
+        if enable {
+            capture_snapshot(&services)?;
+        }
         let bypass = no_proxy_host_names();
         let mut errors: Vec<String> = Vec::new();
 
@@ -621,7 +885,14 @@ mod macos {
     }
 
     pub fn set_system_pac(enable: bool, pac_url: &str) -> Result<(), String> {
+        // 还原优先：理由同 set_system_proxy
+        if !enable && restore_snapshot()? {
+            return Ok(());
+        }
         let services = resolve_target_services()?;
+        if enable {
+            capture_snapshot(&services)?;
+        }
         let mut errors: Vec<String> = Vec::new();
 
         for svc in &services {
@@ -652,16 +923,18 @@ mod macos {
     /// 若把本查询嵌在 webproxy 分支内，PAC 模式的状态读取会失效
     /// （`cleanup_orphans` 的残留检测同样依赖此返回值）。
     fn query_pac_status(svc: &str) -> Option<String> {
+        // `-getautoproxyurl` 的实际输出（macOS 13+ 实测）：
+        //   URL: (null)
+        //   Enabled: No
+        // 旧实现按 "Auto Proxy URL" 取值并调用不存在的 `-getautoproxystate`
+        // （networksetup 退出码 5），导致 PAC 状态永远读不到。
         let t = query(&["-getautoproxyurl", svc])?;
-        let url = parse_field(&t, "Auto Proxy URL").or_else(|| {
-            let v = t.trim();
-            v.starts_with("http").then(|| v.to_string())
-        })?;
-        let state_on = query(&["-getautoproxystate", svc])
-            .and_then(|s| parse_field(&s, "Enabled"))
-            .as_deref()
-            == Some("Yes");
-        state_on.then_some(url)
+        if parse_field(&t, "Enabled").as_deref() != Some("Yes") {
+            return None;
+        }
+        let url = parse_field(&t, "URL")?;
+        let url = url.trim();
+        (!url.is_empty() && !url.eq_ignore_ascii_case("(null)")).then(|| url.to_string())
     }
 
     pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
@@ -669,26 +942,30 @@ mod macos {
             return (false, None, None);
         };
 
+        // 先汇总全部服务的 PAC：启用判定与 webproxy 完全独立，
+        // 不能因某个服务先读到 webproxy 就提前返回而漏掉 PAC。
+        let pac = services.iter().find_map(|svc| query_pac_status(svc));
+
+        let mut inactive_web: Option<String> = None;
         for svc in &services {
-            // PAC 独立查询（不依赖 webproxy 是否配置）
-            let pac = query_pac_status(svc);
-
-            if let Some(text) = query(&["-getwebproxy", svc]) {
-                let enabled = parse_field(&text, "Enabled").as_deref() == Some("Yes");
-                let server = parse_field(&text, "Server");
-                let port = parse_field(&text, "Port");
-                if let (Some(server), Some(port)) = (server, port) {
-                    return (enabled, Some(format!("{server}:{port}")), pac);
-                }
+            let Some(text) = query(&["-getwebproxy", svc]) else {
+                continue;
+            };
+            let Some(addr) = parse_field(&text, "Server")
+                .zip(parse_field(&text, "Port"))
+                .map(|(server, port)| format!("{server}:{port}"))
+            else {
+                continue;
+            };
+            if parse_field(&text, "Enabled").as_deref() == Some("Yes") {
+                return (true, Some(addr), pac);
             }
-
-            // 未配置 webproxy 但 PAC 生效：以 PAC 状态返回
-            // （消费方 connect_test::system_proxy_addr / cleanup_orphans 均独立判定 pac）
-            if pac.is_some() {
-                return (false, None, pac);
-            }
+            inactive_web.get_or_insert(addr);
         }
-        (false, None, None)
+
+        // 未启用的 webproxy 仍返回地址（供 UI 展示「已配置但未启用」），
+        // PAC 独立返回给 cleanup_orphans 等消费方判定。
+        (false, inactive_web, pac)
     }
 }
 
@@ -703,9 +980,44 @@ mod win_backup {
     use super::notify_settings_changed;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
-        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
-        REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
     };
+
+    /// 按原始类型/字节写入（快照还原保留 REG_SZ / REG_EXPAND_SZ 差异）
+    fn write_raw(key: HKEY, name: &str, ty: u32, bytes: &[u8]) -> Result<(), String> {
+        unsafe {
+            let name_w = to_wide(name);
+            let status = RegSetValueExW(
+                key,
+                name_w.as_ptr(),
+                0,
+                ty,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            );
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(format!("写入 {name} 失败: {status:#x}"))
+            }
+        }
+    }
+
+    /// 写入可选原值：None = 删除该值（用户原本没有配置）
+    fn write_optional_raw(
+        key: HKEY,
+        name: &str,
+        value: Option<&(u32, Vec<u8>)>,
+    ) -> Result<(), String> {
+        match value {
+            Some((ty, bytes)) => write_raw(key, name, *ty, bytes),
+            None => {
+                delete_value(key, name);
+                Ok(())
+            }
+        }
+    }
 
     const SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     const BACKUP_SUBKEY: &str = r"Software\WattToolkit\SystemProxyBackup";
@@ -872,9 +1184,11 @@ mod win_backup {
         let settings = open_key(settings_subkey, KEY_READ)
             .ok_or_else(|| "读取系统代理设置失败（Internet Settings 不可访问）".to_string())?;
         let enabled = read_dword(settings, "ProxyEnable").unwrap_or(0);
-        let server = read_sz(settings, "ProxyServer");
-        let override_list = read_sz(settings, "ProxyOverride");
-        let pac = read_sz(settings, "AutoConfigURL");
+        // 保留原始 (类型, 字节)：用户/组策略可能把这些值写成 REG_EXPAND_SZ，
+        // 只按 REG_SZ 还原会把 `%USERPROFILE%\...` 之类的可展开变量变成字面量。
+        let server = read_raw(settings, "ProxyServer");
+        let override_list = read_raw(settings, "ProxyOverride");
+        let pac = read_raw(settings, "AutoConfigURL");
         unsafe { RegCloseKey(settings) };
 
         let backup = create_key(backup_subkey, KEY_READ | KEY_WRITE)?;
@@ -883,14 +1197,11 @@ mod win_backup {
             // 下次 capture 会重新抓取，restore 也不会拿半份数据覆盖用户配置。
             write_dword(backup, "ProxyEnable", enabled)?;
             for (name, value) in [
-                ("ProxyServer", server.as_deref()),
-                ("ProxyOverride", override_list.as_deref()),
-                ("AutoConfigURL", pac.as_deref()),
+                ("ProxyServer", server.as_ref()),
+                ("ProxyOverride", override_list.as_ref()),
+                ("AutoConfigURL", pac.as_ref()),
             ] {
-                match value {
-                    Some(v) => write_sz(backup, name, v)?,
-                    None => delete_value(backup, name),
-                }
+                write_optional_raw(backup, name, value)?;
             }
             write_dword(backup, "Complete", 1)?;
             Ok(())
@@ -915,23 +1226,20 @@ mod win_backup {
             return Ok(false);
         }
         let enabled = read_dword(backup, "ProxyEnable").unwrap_or(0);
-        let server = read_sz(backup, "ProxyServer");
-        let override_list = read_sz(backup, "ProxyOverride");
-        let pac = read_sz(backup, "AutoConfigURL");
+        let server = read_raw(backup, "ProxyServer");
+        let override_list = read_raw(backup, "ProxyOverride");
+        let pac = read_raw(backup, "AutoConfigURL");
         unsafe { RegCloseKey(backup) };
 
         let settings = create_key(settings_subkey, KEY_READ | KEY_WRITE)?;
         let result = (|| -> Result<(), String> {
             write_dword(settings, "ProxyEnable", enabled)?;
             for (name, value) in [
-                ("ProxyServer", server.as_deref()),
-                ("ProxyOverride", override_list.as_deref()),
-                ("AutoConfigURL", pac.as_deref()),
+                ("ProxyServer", server.as_ref()),
+                ("ProxyOverride", override_list.as_ref()),
+                ("AutoConfigURL", pac.as_ref()),
             ] {
-                match value {
-                    Some(v) => write_sz(settings, name, v)?,
-                    None => delete_value(settings, name),
-                }
+                write_optional_raw(settings, name, value)?;
             }
             Ok(())
         })();
@@ -969,10 +1277,7 @@ mod win_backup {
         use super::*;
 
         fn temp_key(tag: &str) -> String {
-            format!(
-                r"Software\WattToolkit\Test-{tag}-{}",
-                std::process::id()
-            )
+            format!(r"Software\WattToolkit\Test-{tag}-{}", std::process::id())
         }
 
         #[test]
