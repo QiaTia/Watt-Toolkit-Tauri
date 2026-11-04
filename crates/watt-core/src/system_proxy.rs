@@ -776,14 +776,22 @@ mod macos {
                 let port_s = port.to_string();
                 run(&[set_flag, svc, server, &port_s]).and_then(|_| run(&[state_flag, svc, "on"]))
             }
-            // 未启用：保留/写回原 server（若存在）但确保状态关闭，
-            // 避免残留指向本引擎的地址（例如原值为空时）。
+            // 未启用：先确保关闭（安全终点：不再指向本引擎），再尽力写回原
+            // server。写回失败只告警 —— 它不影响「代理已关闭」，不能让停止流程
+            // 因此回滚（否则用户会看到「点了停止但仍在运行」）。
             _ => {
+                run(&[state_flag, svc, "off"])?;
                 if let (Some(server), Some(port)) = (state.server.as_deref(), state.port) {
                     let port_s = port.to_string();
-                    run(&[set_flag, svc, server, &port_s])?;
+                    if let Err(e) = run(&[set_flag, svc, server, &port_s]) {
+                        tracing::warn!(
+                            service = svc,
+                            flag = set_flag,
+                            "还原代理原值失败（状态已关闭）: {e}"
+                        );
+                    }
                 }
-                run(&[state_flag, svc, "off"])
+                Ok(())
             }
         }
     }
@@ -806,18 +814,41 @@ mod macos {
                 run(&["-setautoproxystate", svc, "off"])?;
             }
         } else {
-            // 关闭状态；原 URL 有值则写回（供用户之后手动开启），无值则清空
-            run(&["-setautoproxyurl", svc, s.pac.url.as_deref().unwrap_or("")])?;
+            // 先关状态再处理 URL：关闭是安全终点，必须成功；URL 恢复失败只告警。
             run(&["-setautoproxystate", svc, "off"])?;
+            match s.pac.url.as_deref() {
+                // 原 URL 有值 → 写回，供用户之后手动开启
+                Some(url) => {
+                    if let Err(e) = run(&["-setautoproxyurl", svc, url]) {
+                        tracing::warn!(service = svc, "还原 PAC URL 失败（状态已关闭）: {e}");
+                    }
+                }
+                // 原值为空 → 尽力清掉本引擎写入的 PAC URL。
+                // 注意不能把空串当作必成功的还原步骤：networksetup 会拒绝空 URL，
+                // 导致整个 stop 回滚成「仍在运行」（本 bug 的根因）。
+                None => {
+                    if let Err(e) = run(&["-setautoproxyurl", svc, ""]) {
+                        tracing::debug!(
+                            service = svc,
+                            "清除 PAC URL 未成功（维持已关闭状态即可）: {e}"
+                        );
+                    }
+                }
+            }
         }
 
+        // bypass 列表属于展示/后续使用配置，不影响「流量是否仍指向本引擎」；
+        // 还原失败只告警，避免因它阻挡停止。
         let mut args: Vec<&str> = vec!["-setproxybypassdomains", svc];
         if s.bypass.is_empty() {
             args.push("Empty");
         } else {
             args.extend(s.bypass.iter().map(String::as_str));
         }
-        run(&args)
+        if let Err(e) = run(&args) {
+            tracing::warn!(service = svc, "还原代理 bypass 列表失败: {e}");
+        }
+        Ok(())
     }
 
     /// 按快照还原；无快照返回 false（调用方退化为「关闭代理」）。
@@ -900,10 +931,13 @@ mod macos {
                 run(&["-setautoproxyurl", svc, pac_url])
                     .and_then(|_| run(&["-setautoproxystate", svc, "on"]))
             } else {
-                // 取消：关 autoproxy 状态并清空 URL（对齐 Windows：AutoConfigURL 写空串），
-                // 防止引擎停止后用户手动开启系统 PAC 时连到已停的本地代理
-                run(&["-setautoproxyurl", svc, ""])
-                    .and_then(|_| run(&["-setautoproxystate", svc, "off"]))
+                // 先关状态（必须成功），清空 URL 尽力而为：networksetup 可能拒绝空
+                // URL，不能因此让整个停止流程失败回滚。关闭状态是安全终点。
+                run(&["-setautoproxystate", svc, "off"]).map(|()| {
+                    if let Err(e) = run(&["-setautoproxyurl", svc, ""]) {
+                        tracing::debug!(service = svc, "清空 PAC URL 未成功（已关闭即可）: {e}");
+                    }
+                })
             };
             if let Err(e) = result {
                 errors.push(format!("[{svc}] {e}"));
