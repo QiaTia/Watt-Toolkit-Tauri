@@ -54,6 +54,7 @@ const zhHant: Schema = {
     noMatch: '沒有符合的加速項目',
     loadFailed: '加速項目載入失敗：{error}',
     connectivityTest: '連通性測試',
+    groupUnavailable: '目前網路不可用',
     testEmpty: '沒有可測試的項目：請先勾選該分組內的加速項',
     testAllFailed: '目前測試項全部未通過，請檢查網路連線狀況，以及代理設定裡的設定項是否正常。',
     serverSide: '伺服器端加速',

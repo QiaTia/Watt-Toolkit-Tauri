@@ -54,6 +54,7 @@ const ja: Schema = {
     noMatch: '一致する加速項目がありません',
     loadFailed: '加速項目の読み込みに失敗しました：{error}',
     connectivityTest: '接続テスト',
+    groupUnavailable: '現在のネットワークでは利用不可',
     testEmpty: 'テスト可能な項目がありません：先にこのグループ内の加速項目にチェックを入れてください',
     testAllFailed:
       'テスト項目がすべて失敗しました。ネットワーク接続と、プロキシ設定の内容を確認してください。',

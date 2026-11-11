@@ -1,8 +1,11 @@
 //! 连通性测试：对目标域名发起一次完整 HTTPS GET 并计时。
 //!
-//! 对齐原版 `NetworkTestService.TestOpenUrlAsync`：
-//! - `HttpClient.GetAsync(url, ResponseContentRead)` → 完整收到响应即成功
-//!   （**不校验状态码**，404/302 均算连通）；
+//! 对齐原版 `NetworkTestService.TestOpenUrlAsync` 的传输层语义：
+//! - `HttpClient.GetAsync(url, ResponseContentRead)` → 完整收到响应即 `ok`
+//!   （**任意状态码**，404/302 也算收到响应）；
+//! - 额外提供 `healthy`：仅 **HTTP 2xx** 视为服务可用。Google 翻译等固定
+//!   覆盖 IP 的节点可能返回 404，必须按 `healthy` 标记为不可用，避免
+//!   “能连上但打不开”被误报为加速成功。
 //! - Stopwatch 计时 → 延迟毫秒；异常 → 失败；> 20s → Timeout（UI 层判定）；
 //! - 分组内全部域名**并发**测试。
 //!
@@ -80,11 +83,18 @@ pub struct ProbeResult {
     pub host: String,
     /// 完整收到 HTTP 响应（任意状态码）
     pub ok: bool,
+    /// HTTP 2xx：服务真正可用；404/5xx 等为 false
+    pub healthy: bool,
     /// 响应状态码（ok 时必有）
     pub status: Option<u16>,
     /// 总耗时（连接 + TLS + 请求 + 完整响应体）
     pub latency_ms: u64,
     pub error: Option<String>,
+}
+
+/// HTTP 状态码是否代表服务可用（仅 2xx）
+fn status_is_healthy(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 /// 经 HTTP 正向代理建立 CONNECT 隧道（对齐 HttpClient 走系统代理的路径）。
@@ -160,6 +170,7 @@ pub async fn probe_https_with_proxy(
         return ProbeResult {
             host: host.clone(),
             ok: false,
+            healthy: false,
             status: None,
             latency_ms: 0,
             error: Some("空域名".into()),
@@ -236,6 +247,7 @@ pub async fn probe_https_with_proxy(
         Ok(status) => ProbeResult {
             host,
             ok: true,
+            healthy: status_is_healthy(status),
             status: Some(status),
             latency_ms: started.elapsed().as_millis() as u64,
             error: None,
@@ -243,6 +255,7 @@ pub async fn probe_https_with_proxy(
         Err(e) => ProbeResult {
             host,
             ok: false,
+            healthy: false,
             status: None,
             latency_ms: started.elapsed().as_millis() as u64,
             error: Some(e),
@@ -272,6 +285,7 @@ pub async fn probe_https_all(hosts: &[String], timeout: Duration) -> Vec<ProbeRe
             Err(e) => out.push(ProbeResult {
                 host: String::new(),
                 ok: false,
+                healthy: false,
                 status: None,
                 latency_ms: 0,
                 error: Some(format!("任务异常: {e}")),
@@ -297,6 +311,16 @@ mod tests {
         assert!(!is_timeout(500, true));
         // 失败不算 Timeout（显示 error）
         assert!(!is_timeout(25_000, false));
+    }
+
+    #[test]
+    fn test_status_is_healthy() {
+        assert!(status_is_healthy(200));
+        assert!(status_is_healthy(204));
+        assert!(status_is_healthy(299));
+        assert!(!status_is_healthy(301)); // 重定向不等于服务可用
+        assert!(!status_is_healthy(404)); // Google 翻译边缘节点当前返回 404
+        assert!(!status_is_healthy(500));
     }
 
     #[test]
@@ -367,8 +391,8 @@ mod tests {
         ] {
             let r = probe_https(host, Duration::from_secs(15)).await;
             println!(
-                "[probe] {host:<28} ok={} status={:?} {}ms err={:?}",
-                r.ok, r.status, r.latency_ms, r.error
+                "[probe] {host:<28} ok={} healthy={} status={:?} {}ms err={:?}",
+                r.ok, r.healthy, r.status, r.latency_ms, r.error
             );
         }
     }

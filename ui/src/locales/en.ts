@@ -54,6 +54,7 @@ const en: Schema = {
     noMatch: 'No matching boost projects',
     loadFailed: 'Failed to load boost projects: {error}',
     connectivityTest: 'Connectivity Test',
+    groupUnavailable: 'Unavailable on this network',
     testEmpty: 'Nothing to test: check some projects in this group first',
     testAllFailed:
       'All tests failed. Check your network connection and the proxy settings.',

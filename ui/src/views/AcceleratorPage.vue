@@ -262,13 +262,36 @@ async function runGroupTest(group: AccelerateProjectGroup): Promise<void> {
   }
 }
 
-/** 延迟文本配色（对齐原版：≤1000ms 绿 / >1000ms 橙 / Timeout·error 红） */
+/** 延迟文本配色（对齐原版：≤1000ms 绿 / >1000ms 橙 / Timeout·error·HTTP 4xx/5xx 红） */
 function delayClass(text: string | undefined): string {
   if (!text) return 'delay-ok';
-  if (text === 'Timeout' || text === 'error') return 'delay-bad';
+  if (text === 'Timeout' || text === 'error' || text.startsWith('HTTP ')) return 'delay-bad';
   const ms = Number.parseInt(text, 10);
   return Number.isFinite(ms) && ms > 1000 ? 'delay-mid' : 'delay-ok';
 }
+
+/**
+ * 带覆盖 IP 的项目自动健康检查：这类项目最容易因边缘 IP 过期出现
+ * “TLS 能握手、HTTP 404”。只在引擎运行后探测——此时系统代理生效，
+ * 测到的才是真实加速路径；引擎停止时避免对不可达域名做长达 25s 的自动探测。
+ */
+async function scanOverrideHealth(): Promise<void> {
+  const targets = accel.ipOverrideTargets();
+  if (targets.length === 0) return;
+  try {
+    await accel.probeTargets(targets);
+  } catch {
+    // 自动检查失败不打扰用户；手动「连通性测试」仍会显示错误
+  }
+}
+
+watch(
+  () => proxy.isRunning,
+  (running) => {
+    if (running) void scanOverrideHealth();
+  },
+  { immediate: true },
+);
 
 function isChecked(p: AccelerateProject): boolean {
   return accel.checkedIds.has(p.id);
@@ -422,6 +445,9 @@ async function toggleEngine(): Promise<void> {
                 <span class="group-title">{{ group.name }}</span>
                 <a-tag>
                   {{ groupCount(group).hit }}/{{ groupCount(group).total }}
+                </a-tag>
+                <a-tag v-if="accel.groupHealth(group) === 'bad'" color="red">
+                  {{ $t('accel.groupUnavailable') }}
                 </a-tag>
                 <a-button
                   size="small"

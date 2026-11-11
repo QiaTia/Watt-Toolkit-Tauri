@@ -1015,8 +1015,11 @@ mod win_backup {
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
         RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
+        REG_OPTION_NON_VOLATILE,
     };
+
+    #[cfg(test)]
+    use windows_sys::Win32::System::Registry::REG_SZ;
 
     /// 按原始类型/字节写入（快照还原保留 REG_SZ / REG_EXPAND_SZ 差异）
     fn write_raw(key: HKEY, name: &str, ty: u32, bytes: &[u8]) -> Result<(), String> {
@@ -1136,6 +1139,7 @@ mod win_backup {
         }
     }
 
+    #[cfg(test)]
     fn read_sz(key: HKEY, name: &str) -> Option<String> {
         let (ty, buf) = read_raw(key, name)?;
         if ty != REG_SZ || buf.len() % 2 != 0 {
@@ -1168,6 +1172,7 @@ mod win_backup {
         }
     }
 
+    #[cfg(test)]
     fn write_sz(key: HKEY, name: &str, value: &str) -> Result<(), String> {
         unsafe {
             let name_w = to_wide(name);

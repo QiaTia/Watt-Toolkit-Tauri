@@ -55,6 +55,7 @@ const zhHans = {
     noMatch: '没有匹配的加速项目',
     loadFailed: '加速项目加载失败：{error}',
     connectivityTest: '连通性测试',
+    groupUnavailable: '当前网络不可用',
     testEmpty: '没有可测试的项目：请先勾选该分组内的加速项',
     testAllFailed:
       '当前测试项全部未通过，请检查网络链接状况，以及代理设置里的设置项是否正常。',

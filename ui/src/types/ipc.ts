@@ -197,6 +197,8 @@ export interface ConnectivityTestItem {
   host: string;
   /** 完整收到 HTTP 响应（任意状态码均算连通） */
   ok: boolean;
+  /** HTTP 2xx：服务真正可用；404/5xx 为 false */
+  healthy: boolean;
   status?: number | null;
   /** 总耗时（连接 + TLS + 请求 + 完整响应体），毫秒 */
   latencyMs: number;

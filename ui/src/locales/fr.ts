@@ -55,6 +55,7 @@ const fr: Schema = {
     noMatch: 'Aucun projet correspondant',
     loadFailed: "Échec du chargement des projets : {error}",
     connectivityTest: 'Test de connectivité',
+    groupUnavailable: 'Indisponible sur ce réseau',
     testEmpty: "Rien à tester : cochez d'abord des projets de ce groupe",
     testAllFailed:
       'Tous les tests ont échoué. Vérifiez votre connexion réseau et les réglages du proxy.',

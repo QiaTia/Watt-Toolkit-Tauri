@@ -7,7 +7,7 @@
 | 审计日期 | 2026-10-30 |
 | 审计范围 | 全部 Rust 源码、Vue 3 前端、Tauri 配置、构建与发布脚本、依赖清单 |
 | 代码规模 | Rust 源文件 61 个 / 19,654 行；前端源文件 30 个 / 5,961 行；9 个 workspace 成员；33 个 IPC 命令 |
-| 验证结果 | Rust 单元测试 234 通过 / 6 忽略；中继集成 19 + Cookie 1 通过；`cargo clippy -D warnings` 通过；`cargo audit` 0 漏洞；`pnpm build` 通过（无 >500KB 警告） |
+| 验证结果 | Rust 单元测试 239 通过 / 6 忽略；中继集成 19 + Cookie 1 通过；`cargo clippy -D warnings` 通过；`cargo audit` 0 漏洞；`pnpm build` 通过（无 >500KB 警告） |
 | 总体评级 | **B**：架构清晰、关键路径测试充分；仍需 macOS 系统代理状态恢复、macOS/Linux 实机与 GUI E2E 验证 |
 
 > 本报告中的“已修复”均已在工作区落地并通过编译与测试，但**尚未提交 Git**。修改清单见第 8 节。
@@ -412,6 +412,7 @@ pnpm --dir ui audit --prod
 - macOS 提权命令有白名单与双层转义，设计良好；但系统代理仍未实现快照还原，且本次修复未在 macOS 实机验证。
 - 运行日志只在内存，崩溃后丢失；没有持久化日志或错误上报（Sentry 等），排障依赖用户复现。
 - 没有健康检查/指标导出；桌面应用可接受，但远程诊断能力弱。
+- 内置 Google 翻译分组依赖的国内边缘 IP 在 2026-11 实测已失效：`translate.google.com` / `translate.googleapis.com` 返回 Google 404，`translate.gstatic.com` 已 NXDOMAIN，全局 Google IP 在当前网络超时。连通性测试现按 HTTP 2xx 判定健康，引擎运行后自动探测并在分组标红“当前网络不可用”；分组保留，但当前网络下实际不可加速。
 - release 工作流没有测试门槛，tag 可直接产出未签名 macOS 包。
 
 ---
@@ -463,7 +464,8 @@ pnpm --dir ui audit --prod
 | 18 | XHR 桥 Origin 仅校验协议前缀；脚本路径缓冲/解压无上限 | Origin 必须命中已启用脚本 match 域名；XHR 30s 整体超时；脚本缓冲 16MB、解压 32MB 上限，超限跳过注入/钩子并流式转发 | `crates/watt-core/src/local_domain.rs`、`http_relay.rs`、`inject.rs` | 新增 Origin 白名单、限长读取测试；watt-core 114 单测 + 中继集成 19 通过 |
 | 19 | 根证书按 CN 删除；hosts 非原子写 | 根证书按 DER/SHA-1 精确删除（macOS 同步过滤，Windows 提权按 thumbprint）；hosts 同目录临时文件 + fsync + rename，保留权限 | `crates/watt-cert/src/trust.rs`、`src-tauri/src/commands/cert.rs`、`crates/watt-hosts/src/lib.rs` | hosts 原子替换/权限保留测试通过；重新生成 CA 先取旧 DER 再删 |
 | 20 | 无 PR CI；每请求编译正则；前端主 chunk 594KB | 新增 `.github/workflows/ci.yml`；URL/子规则正则编译缓存；Vite manualChunks 拆 vendor | `.github/workflows/ci.yml`、`watt-config/src/domain_rule.rs`、`watt-core/src/http_relay.rs`、`ui/vite.config.ts` | clippy `-D warnings` 通过；前端入口 0.1KB、最大 chunk 430KB，无 >500KB 警告 |
-| 21 | 代码审查发现的代理/配置/脚本边界问题 | 快照失败不回滚、快照 Complete 最后写并清理陈旧快照；配置 rename 失败不再删旧文件；DNS 构造提前并 spawn_blocking；XHR DNS 3s 超时；阻断 NAT64/6to4/Teredo/IPv4-compatible；证书统一用户存储并清理机器旧值；chunked 超限转流式；CI 补 cookie 测试 | `system_proxy.rs`、`engine.rs`、`settings.rs`、`commands/dns.rs`、`local_domain.rs`、`ip_pool.rs`、`trust.rs`、`commands/cert.rs`、`http_relay.rs`、`ci.yml` | 单测 234 通过 / 6 忽略；中继 19 + Cookie 1；真实 DoH 通过 |
+| 21 | 代码审查发现的代理/配置/脚本边界问题 | 快照失败不回滚、快照 Complete 最后写并清理陈旧快照；配置 rename 失败不再删旧文件；DNS 构造提前并 spawn_blocking；XHR DNS 3s 超时；阻断 NAT64/6to4/Teredo/IPv4-compatible；证书统一用户存储并清理机器旧值；chunked 超限转流式；CI 补 cookie 测试 | `system_proxy.rs`、`engine.rs`、`settings.rs`、`commands/dns.rs`、`local_domain.rs`、`ip_pool.rs`、`trust.rs`、`commands/cert.rs`、`http_relay.rs`、`ci.yml` | 单测 239 通过 / 6 忽略；中继 19 + Cookie 1；真实 DoH 通过 |
+| 22 | Google 翻译内置分组固定 IP 已失效（404/NXDOMAIN），连通性测试把 404 误判为成功 | `ProbeResult` 增加 `healthy`（仅 2xx）；UI 显示 `HTTP 404` 并按不可用标红；引擎运行后自动探测带覆盖 IP 的项目，分组标记“当前网络不可用” | `connect_test.rs`、`commands/accelerate.rs`、`ui/src/types/ipc.ts`、`ui/src/stores/accelerate.ts`、`ui/src/views/AcceleratorPage.vue`、5 个 locale | 新增 `status_is_healthy` 测试；`pnpm build` 通过 |
 
 变更规模：上一轮 24 个已跟踪文件，约 +834 / -96 行；两轮 DoH/加固/审查修复共涉及约 28 个文件（含新增 `commands/dns.rs`、`ci.yml`）与 `Cargo.lock`（hickory 0.26.3 / rustls 0.23 / webpki-roots 1），未提交 Git。
 
@@ -476,7 +478,7 @@ pnpm --dir ui audit --prod
 ```text
 cargo check --workspace --all-targets                 通过
 cargo clippy --workspace --all-targets -- -D warnings 通过
-cargo test --workspace --lib                          234 passed / 0 failed / 6 ignored
+cargo test --workspace --lib                          239 passed / 0 failed / 6 ignored
 cargo test -p watt-core --test cookie_forwarding      1 passed
 cargo test -p watt-core --test proxy_integration      19 passed
 cargo test -p watt-dns --lib -- --ignored             2 passed（真实网络 DoH：域名 + IP 端点）

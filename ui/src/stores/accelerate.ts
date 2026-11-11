@@ -169,7 +169,7 @@ export const useAccelerateStore = defineStore('accelerate', () => {
 
   /* ========== 连通性测试（对齐原版 ProxyDomainGroupViewModel.ConnectTestCommand） ========== */
 
-  /** 项目 Id → 延迟显示文本（'123 ms' | 'Timeout' | 'error'） */
+  /** 项目 Id → 延迟显示文本（'123 ms' | 'HTTP 404' | 'Timeout' | 'error'） */
   const probeResults = ref<Record<string, string>>({});
   /** 正在测试的分组 Id 集合 */
   const testingGroups = ref<Set<string>>(new Set());
@@ -182,11 +182,83 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     return host.replace(/^\*\./, '').toLowerCase();
   }
 
-  /** 结果格式化：失败区分超时/错误，成功 >20s 判 Timeout（对齐原版阈值） */
+  /**
+   * 结果格式化：
+   * - 传输失败 → Timeout / error；
+   * - 收到响应但非 2xx（如 Google 边缘节点返回 404）→ `HTTP 404`，明确标记不可用；
+   * - 2xx 且 >20s → Timeout；否则显示延迟。
+   */
   function formatProbeResult(r: ConnectivityTestItem): string {
     if (!r.ok) return r.error?.includes('超时') === true ? 'Timeout' : 'error';
+    if (!r.healthy) {
+      return typeof r.status === 'number' ? `HTTP ${r.status}` : 'error';
+    }
     if (r.latencyMs > 20_000) return 'Timeout';
     return `${r.latencyMs} ms`;
+  }
+
+  /** 仅「2xx 且在超时阈值内」算健康 */
+  function isProbeHealthy(r: ConnectivityTestItem): boolean {
+    return r.ok && r.healthy && r.latencyMs <= 20_000;
+  }
+
+  /**
+   * 探测一组 target，并写回 probeResults。
+   * 同 host 去重；返回 host → 原始结果，供分组测试判定 fail-all。
+   */
+  async function probeTargets(
+    targets: Array<{ id: string; host: string }>,
+  ): Promise<Map<string, ConnectivityTestItem>> {
+    const hosts = [...new Set(targets.map((t) => t.host))];
+    const results = hosts.length > 0 ? await accelerateConnectivityTest(hosts) : [];
+    const byHost = new Map(results.map((r) => [r.host, r]));
+    const next = { ...probeResults.value };
+    for (const t of targets) {
+      const r = byHost.get(t.host);
+      if (r) next[t.id] = formatProbeResult(r);
+    }
+    probeResults.value = next;
+    return byHost;
+  }
+
+  /**
+   * 带覆盖 IP 的项目（`.fields.ip_address`）：这类项目最容易因边缘 IP 过期
+   * 出现「TLS 能握手但 HTTP 404」，页面加载时自动做一次健康探测。
+   */
+  function ipOverrideTargets(
+    list: AccelerateProjectGroup[] = groups.value,
+  ): Array<{ id: string; host: string }> {
+    const out: Array<{ id: string; host: string }> = [];
+    const seen = new Set<string>();
+    const walk = (p: AccelerateProject): void => {
+      if (p.rule.ip_address) {
+        const host = projectHost(p);
+        if (host && !seen.has(p.id)) {
+          seen.add(p.id);
+          out.push({ id: p.id, host });
+        }
+      }
+      p.items.forEach(walk);
+    };
+    list.forEach((g) => g.items.forEach(walk));
+    return out.slice(0, 12);
+  }
+
+  /** 分组健康度：已探测项全部非 2xx/超时 → bad；有任一可用 → ok；未探测 → unknown */
+  function groupHealth(group: AccelerateProjectGroup): 'unknown' | 'ok' | 'bad' {
+    let seen = 0;
+    let good = 0;
+    const walk = (p: AccelerateProject): void => {
+      const text = probeResults.value[p.id];
+      if (text) {
+        seen += 1;
+        if (text !== 'Timeout' && text !== 'error' && !text.startsWith('HTTP ')) good += 1;
+      }
+      p.items.forEach(walk);
+    };
+    group.items.forEach(walk);
+    if (seen === 0) return 'unknown';
+    return good > 0 ? 'ok' : 'bad';
   }
 
   /**
@@ -208,19 +280,12 @@ export const useAccelerateStore = defineStore('accelerate', () => {
 
     testingGroups.value = new Set(testingGroups.value).add(group.id);
     try {
-      const hosts = [...new Set(targets.map((t) => t.host))];
-      const results = await accelerateConnectivityTest(hosts);
-      const byHost = new Map(results.map((r) => [r.host, r]));
-      const next = { ...probeResults.value };
+      const byHost = await probeTargets(targets);
       let failAll = true;
       for (const t of targets) {
         const r = byHost.get(t.host);
-        if (!r) continue;
-        const text = formatProbeResult(r);
-        next[t.id] = text;
-        if (text !== 'Timeout' && text !== 'error') failAll = false;
+        if (r && isProbeHealthy(r)) failAll = false;
       }
-      probeResults.value = next;
       return failAll ? 'fail-all' : 'ok';
     } finally {
       const rest = new Set(testingGroups.value);
@@ -253,6 +318,9 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     persist,
     buildEngineAssets,
     testGroup,
+    probeTargets,
+    ipOverrideTargets,
+    groupHealth,
     projectHost,
     clearProbes,
   };
