@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, defineAsyncComponent, onMounted, ref } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import zhCN from 'ant-design-vue/es/locale/zh_CN';
@@ -13,8 +13,12 @@ import { useAppStore } from '@/stores/app';
 import { useSettingsStore } from '@/stores/settings';
 import { useCertStore } from '@/stores/cert';
 import { useThemeStore } from '@/stores/theme';
+import { useUpdateStore } from '@/stores/update';
 import { i18n, type LocaleCode } from '@/locales';
 import AppHeader from '@/components/AppHeader.vue';
+// 更新弹窗懒加载：仅它用到的 antd 组件（如 a-progress）随之拆到独立异步 chunk，
+// 避免把共享 antd vendor chunk 推过 500KB 警告阈值；弹窗首次唤起时才加载。
+const UpdateModal = defineAsyncComponent(() => import('@/components/UpdateModal.vue'));
 import appIcon from '@/assets/app-icon.png';
 
 const route = useRoute();
@@ -25,6 +29,7 @@ const appStore = useAppStore();
 const settings = useSettingsStore();
 const cert = useCertStore();
 const themeStore = useThemeStore();
+const update = useUpdateStore();
 
 const collapsed = ref(false);
 
@@ -91,6 +96,11 @@ onMounted(() => {
   void settings.ensureLoaded().catch(() => {});
   void cert.refresh();
   void proxy.refreshState();
+  // 静默检查更新：延迟 5 秒避开启动期（CA 加载 / 迁移 / 引擎状态查询），
+  // 不阻塞首屏；是否真的发请求由设置里的开关与间隔决定
+  window.setTimeout(() => {
+    void update.maybeAutoCheck();
+  }, 5000);
 });
 </script>
 
@@ -165,6 +175,8 @@ onMounted(() => {
           </a-layout-content>
         </a-layout>
       </a-layout>
+      <!-- 全局更新弹窗：顶栏 / 首页横幅 / 关于页共用同一个实例与状态 -->
+      <UpdateModal />
     </a-app>
   </a-config-provider>
 </template>

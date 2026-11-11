@@ -197,7 +197,7 @@ export interface ConnectivityTestItem {
   host: string;
   /** 完整收到 HTTP 响应（任意状态码均算连通） */
   ok: boolean;
-  /** HTTP 2xx：服务真正可用；404/5xx 为 false */
+  /** 服务端返回了正常语义的响应（非 5xx）；3xx/4xx 仍算链路可达 */
   healthy: boolean;
   status?: number | null;
   /** 总耗时（连接 + TLS + 请求 + 完整响应体），毫秒 */
@@ -332,4 +332,40 @@ export interface RuntimeLogPage {
   total: number;
   page: number;
   pageSize: number;
+}
+
+/* ========== 自动更新（命令层 camelCase；UpdateSettings 来自 watt-config） ========== */
+
+/** 更新检查结果（只含元信息，安装时会由后端重新检查一次） */
+export interface UpdateInfoDto {
+  /** 远端新版本号 */
+  version: string;
+  /** 当前版本号 */
+  currentVersion: string;
+  /** 发布日期（ISO 字符串，可能为空） */
+  date: string | null;
+  /** 更新说明（Release body 原文） */
+  body: string | null;
+  /** 实际命中的更新源；null = tauri.conf.json 里的官方源 */
+  endpoint: string | null;
+}
+
+/** 下载/安装进度事件载荷（事件名 watt://update-progress） */
+export interface UpdateProgressDto {
+  stage: 'downloading' | 'installing';
+  downloaded: number;
+  /** 总字节数（服务端未给 Content-Length 时为 null） */
+  total: number | null;
+}
+
+/** 软件更新设置 */
+export interface UpdateSettings {
+  /** 启动后自动检查 */
+  autoCheck: boolean;
+  /** 自动检查最小间隔（小时），0 = 每次启动都查 */
+  checkIntervalHours: number;
+  /** 自定义更新源（镜像 latest.json），null = 官方源 */
+  endpoint: string | null;
+  /** 用户选择「跳过」的版本 */
+  skippedVersion: string | null;
 }

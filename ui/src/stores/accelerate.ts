@@ -185,21 +185,26 @@ export const useAccelerateStore = defineStore('accelerate', () => {
   /**
    * 结果格式化：
    * - 传输失败 → Timeout / error；
-   * - 收到响应但非 2xx（如 Google 边缘节点返回 404）→ `HTTP 404`，明确标记不可用；
-   * - 2xx 且 >20s → Timeout；否则显示延迟。
+   * - 固定覆盖 IP 的项目（`strict`）：4xx/5xx 说明钉住的边缘节点已失效，
+   *   显示 `HTTP 404` 明确标记不可用；
+   * - 其他项目：3xx（根路径跳转）、401/403（鉴权/WAF）、400/404（CDN、API 根路径）
+   *   都证明链路可达，按延迟显示；只有 5xx 视为不可用；
+   * - 可用且 >20s → Timeout。
    */
-  function formatProbeResult(r: ConnectivityTestItem): string {
+  function formatProbeResult(r: ConnectivityTestItem, strict = false): string {
     if (!r.ok) return r.error?.includes('超时') === true ? 'Timeout' : 'error';
-    if (!r.healthy) {
-      return typeof r.status === 'number' ? `HTTP ${r.status}` : 'error';
-    }
+    const status = typeof r.status === 'number' ? r.status : null;
+    if (strict && status !== null && status >= 400) return `HTTP ${status}`;
+    if (!r.healthy) return status !== null ? `HTTP ${status}` : 'error';
     if (r.latencyMs > 20_000) return 'Timeout';
     return `${r.latencyMs} ms`;
   }
 
-  /** 仅「2xx 且在超时阈值内」算健康 */
-  function isProbeHealthy(r: ConnectivityTestItem): boolean {
-    return r.ok && r.healthy && r.latencyMs <= 20_000;
+  /** 仅「非 5xx（固定 IP 项目额外要求非 4xx）且在超时阈值内」算健康 */
+  function isProbeHealthy(r: ConnectivityTestItem, strict = false): boolean {
+    if (!r.ok || !r.healthy || r.latencyMs > 20_000) return false;
+    if (strict && typeof r.status === 'number' && r.status >= 400) return false;
+    return true;
   }
 
   /**
@@ -207,7 +212,7 @@ export const useAccelerateStore = defineStore('accelerate', () => {
    * 同 host 去重；返回 host → 原始结果，供分组测试判定 fail-all。
    */
   async function probeTargets(
-    targets: Array<{ id: string; host: string }>,
+    targets: Array<{ id: string; host: string; strict?: boolean }>,
   ): Promise<Map<string, ConnectivityTestItem>> {
     const hosts = [...new Set(targets.map((t) => t.host))];
     const results = hosts.length > 0 ? await accelerateConnectivityTest(hosts) : [];
@@ -215,7 +220,7 @@ export const useAccelerateStore = defineStore('accelerate', () => {
     const next = { ...probeResults.value };
     for (const t of targets) {
       const r = byHost.get(t.host);
-      if (r) next[t.id] = formatProbeResult(r);
+      if (r) next[t.id] = formatProbeResult(r, t.strict === true);
     }
     probeResults.value = next;
     return byHost;
@@ -227,15 +232,16 @@ export const useAccelerateStore = defineStore('accelerate', () => {
    */
   function ipOverrideTargets(
     list: AccelerateProjectGroup[] = groups.value,
-  ): Array<{ id: string; host: string }> {
-    const out: Array<{ id: string; host: string }> = [];
+  ): Array<{ id: string; host: string; strict: boolean }> {
+    const out: Array<{ id: string; host: string; strict: boolean }> = [];
     const seen = new Set<string>();
     const walk = (p: AccelerateProject): void => {
       if (p.rule.ip_address) {
         const host = projectHost(p);
         if (host && !seen.has(p.id)) {
           seen.add(p.id);
-          out.push({ id: p.id, host });
+          // 固定 IP 项目：4xx 说明钉住的边缘节点已失效，需要收紧判定
+          out.push({ id: p.id, host, strict: true });
         }
       }
       p.items.forEach(walk);
@@ -267,11 +273,11 @@ export const useAccelerateStore = defineStore('accelerate', () => {
    */
   async function testGroup(group: AccelerateProjectGroup): Promise<'empty' | 'ok' | 'fail-all'> {
     if (testingGroups.value.has(group.id)) return 'empty';
-    const targets: Array<{ id: string; host: string }> = [];
+    const targets: Array<{ id: string; host: string; strict: boolean }> = [];
     const walk = (p: AccelerateProject): void => {
       if (checkedIds.value.has(p.id)) {
         const host = projectHost(p);
-        if (host) targets.push({ id: p.id, host });
+        if (host) targets.push({ id: p.id, host, strict: Boolean(p.rule.ip_address) });
       }
       p.items.forEach(walk);
     };
@@ -284,7 +290,7 @@ export const useAccelerateStore = defineStore('accelerate', () => {
       let failAll = true;
       for (const t of targets) {
         const r = byHost.get(t.host);
-        if (r && isProbeHealthy(r)) failAll = false;
+        if (r && isProbeHealthy(r, t.strict)) failAll = false;
       }
       return failAll ? 'fail-all' : 'ok';
     } finally {

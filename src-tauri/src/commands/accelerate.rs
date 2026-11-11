@@ -103,7 +103,7 @@ pub async fn accelerate_get_rules(
 pub struct ConnectivityTestItem {
     pub host: String,
     pub ok: bool,
-    /// HTTP 2xx：服务可用；404/5xx 为 false
+    /// 服务端返回了正常语义的响应（非 5xx）：3xx/4xx 属于跳转与鉴权语义，仍算可达
     pub healthy: bool,
     pub status: Option<u16>,
     pub latency_ms: u64,
@@ -111,7 +111,7 @@ pub struct ConnectivityTestItem {
 }
 
 /// 分组连通性测试：并发对每个域名发起完整 HTTPS GET 并计时。
-/// `ok` 表示收到 HTTP 响应；`healthy` 仅对 2xx 为 true（404/5xx 标记不可用）。
+/// `ok` 表示收到 HTTP 响应；`healthy` 表示响应非 5xx（3xx/4xx 视为链路可达）。
 #[tauri::command]
 pub async fn accelerate_connectivity_test(hosts: Vec<String>) -> Vec<ConnectivityTestItem> {
     let results =

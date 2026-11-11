@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n';
 import AntApp from 'ant-design-vue/es/app';
 import { useSettingsStore } from '@/stores/settings';
 import { useIpPoolStore } from '@/stores/ipPool';
+import { useUpdateStore } from '@/stores/update';
 
 defineProps<{ title: string; collapsed: boolean }>();
 
@@ -14,6 +15,7 @@ const route = useRoute();
 const { t } = useI18n();
 const settings = useSettingsStore();
 const pool = useIpPoolStore();
+const update = useUpdateStore();
 // 由 <a-app>（App.vue）提供的上下文创建，跟随全局主题
 const { message } = AntApp.useApp();
 
@@ -28,6 +30,15 @@ async function onSave(): Promise<void> {
     void message.success(t('common.saved'));
   } else {
     void message.error(t('common.saveFailed'));
+  }
+}
+
+async function onCheckUpdate(): Promise<void> {
+  const result = await update.checkAndOpen();
+  if (result === 'upToDate') {
+    void message.info(t('update.upToDate'));
+  } else if (result === 'error') {
+    void message.error(update.error ?? t('update.failed'));
   }
 }
 
@@ -63,6 +74,17 @@ async function onRefreshPool(): Promise<void> {
     <!-- 绝对定位居中，不随左右两侧宽度漂移 -->
     <span class="header-title">{{ title }}</span>
     <div class="header-right">
+      <a-badge :dot="update.shouldNotify" :offset="[-4, 4]">
+        <a-button
+          type="text"
+          class="update-entry"
+          :loading="update.isChecking"
+          :title="$t('update.title')"
+          @click="onCheckUpdate"
+        >
+          <template #icon><CloudDownloadOutlined /></template>
+        </a-button>
+      </a-badge>
       <a-button v-if="showSave" type="primary" :loading="settings.saving" @click="onSave">
         {{ $t('common.save') }}
       </a-button>
@@ -116,5 +138,15 @@ async function onRefreshPool(): Promise<void> {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.update-entry {
+  color: var(--text);
+}
+
+.update-entry:hover,
+.update-entry:focus-visible {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
 }
 </style>

@@ -412,7 +412,7 @@ pnpm --dir ui audit --prod
 - macOS 提权命令有白名单与双层转义，设计良好；但系统代理仍未实现快照还原，且本次修复未在 macOS 实机验证。
 - 运行日志只在内存，崩溃后丢失；没有持久化日志或错误上报（Sentry 等），排障依赖用户复现。
 - 没有健康检查/指标导出；桌面应用可接受，但远程诊断能力弱。
-- 内置 Google 翻译分组依赖的国内边缘 IP 在 2026-11 实测已失效：`translate.google.com` / `translate.googleapis.com` 返回 Google 404，`translate.gstatic.com` 已 NXDOMAIN，全局 Google IP 在当前网络超时。连通性测试现按 HTTP 2xx 判定健康，引擎运行后自动探测并在分组标红“当前网络不可用”；分组保留，但当前网络下实际不可加速。
+- 内置 Google 翻译分组依赖的国内边缘 IP 在 2026-11 实测已失效：`translate.google.com` / `translate.googleapis.com` 返回 Google 404，`translate.gstatic.com` 已 NXDOMAIN，全局 Google IP 在当前网络超时。连通性测试按「非 5xx 即可达」判定，仅对**固定覆盖 IP 的项目**（`ip_address`）额外要求非 4xx，因此该分组仍会标红“当前网络不可用”；分组保留，但当前网络下实际不可加速。
 - release 工作流没有测试门槛，tag 可直接产出未签名 macOS 包。
 
 ---

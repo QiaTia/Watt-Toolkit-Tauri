@@ -4,6 +4,7 @@ import { useProxyStore } from '@/stores/proxy';
 import { useAppStore } from '@/stores/app';
 import { useCertStore } from '@/stores/cert';
 import { formatBytes } from '@/utils/format';
+import UpdateBanner from '@/components/UpdateBanner.vue';
 
 const proxy = useProxyStore();
 const app = useAppStore();
@@ -34,6 +35,7 @@ const badgeStatus = computed(() => {
 
 <template>
   <div class="page">
+    <UpdateBanner />
     <a-card :bordered="false" class="hero-card">
       <div class="hero">
         <div class="hero-status">

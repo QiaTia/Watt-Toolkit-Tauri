@@ -39,6 +39,7 @@ declare module 'vue' {
     AModal: typeof import('ant-design-vue/es')['Modal']
     APopconfirm: typeof import('ant-design-vue/es')['Popconfirm']
     AppHeader: typeof import('./components/AppHeader.vue')['default']
+    AProgress: typeof import('ant-design-vue/es')['Progress']
     ARow: typeof import('ant-design-vue/es')['Row']
     ASegmented: typeof import('ant-design-vue/es')['Segmented']
     ASelect: typeof import('ant-design-vue/es')['Select']
@@ -52,9 +53,11 @@ declare module 'vue' {
     ATabs: typeof import('ant-design-vue/es')['Tabs']
     ATag: typeof import('ant-design-vue/es')['Tag']
     ATextarea: typeof import('ant-design-vue/es')['Textarea']
+    ATypographyLink: typeof import('ant-design-vue/es')['TypographyLink']
     ATypographyParagraph: typeof import('ant-design-vue/es')['TypographyParagraph']
     ATypographyText: typeof import('ant-design-vue/es')['TypographyText']
     ATypographyTitle: typeof import('ant-design-vue/es')['TypographyTitle']
+    CloudDownloadOutlined: typeof import('@ant-design/icons-vue')['CloudDownloadOutlined']
     ClusterOutlined: typeof import('@ant-design/icons-vue')['ClusterOutlined']
     FileTextOutlined: typeof import('@ant-design/icons-vue')['FileTextOutlined']
     HomeOutlined: typeof import('@ant-design/icons-vue')['HomeOutlined']
@@ -67,5 +70,7 @@ declare module 'vue' {
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     SettingOutlined: typeof import('@ant-design/icons-vue')['SettingOutlined']
+    UpdateBanner: typeof import('./components/UpdateBanner.vue')['default']
+    UpdateModal: typeof import('./components/UpdateModal.vue')['default']
   }
 }

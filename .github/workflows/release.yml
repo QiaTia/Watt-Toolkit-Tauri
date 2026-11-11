@@ -12,8 +12,37 @@ permissions:
   contents: write
 
 jobs:
+  # 版本号一致性门禁：workspace / tauri.conf.json / ui/package.json / tag 四者必须相同。
+  # 不一致会导致客户端反复提示同一个更新，或永远检测不到更新。
+  version-check:
+    name: Version check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 校验四处版本号一致
+        run: |
+          WS=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          TC=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed 's/.*"\([0-9][^"]*\)".*/\1/')
+          PKG=$(grep -m1 '"version"' ui/package.json | sed 's/.*"\([0-9][^"]*\)".*/\1/')
+          echo "workspace=$WS tauri=$TC package=$PKG ref=$GITHUB_REF"
+          if [ "$WS" != "$TC" ] || [ "$WS" != "$PKG" ]; then
+            echo "::error::三处版本号不一致：workspace=$WS tauri=$TC package=$PKG"
+            exit 1
+          fi
+          # 仅 tag 触发时要求与 tag 一致；workflow_dispatch 手动触发用分支名，不做此校验
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$WS" != "$TAG" ]; then
+              echo "::error::tag 与版本号不一致：workspace=$WS tag=$TAG"
+              exit 1
+            fi
+          fi
+
   build:
     name: Build (${{ matrix.platform }})
+    needs: version-check
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +110,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新包 minisign 签名（缺失则不会产出 *.sig 与 latest.json，客户端无法更新）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
@@ -104,6 +136,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新包 minisign 签名（缺失则不会产出 *.sig 与 latest.json，客户端无法更新）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
@@ -127,6 +162,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新包 minisign 签名（缺失则不会产出 *.sig 与 latest.json，客户端无法更新）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
@@ -150,14 +188,17 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ↓↓↓ 可选：在仓库 Settings → Secrets 配置以下变量后，macOS 会自动签名并公证。
-          #     不配置则以「未签名」方式构建（功能正常，仅首次打开需右键→打开绕过 Gatekeeper）。
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 代码签名 + 公证（与更新包的 minisign 签名是两套独立机制）。
+          # 未配置对应 Secrets 时这些变量为空，action 会自动跳过签名与公证。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
@@ -181,13 +222,17 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ↓↓↓ 可选：在仓库 Settings → Secrets 配置以下变量后，macOS 会自动签名并公证。
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 代码签名 + 公证（与更新包的 minisign 签名是两套独立机制）。
+          # 未配置对应 Secrets 时这些变量为空，action 会自动跳过签名与公证。
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'

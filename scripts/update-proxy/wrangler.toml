@@ -1,0 +1,10 @@
+# Cloudflare Worker 部署配置：`npx wrangler deploy`（需先 `npx wrangler login`）
+name = "watt-update-proxy"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# 发布仓库（必须与实际发版仓库一致，别用 Cargo.toml 里的上游 repository 字段）
+REPO = "QiaTia/Watt-Toolkit-Tauri"
+# 安装包加速前缀：换任意可用镜像域名即可，客户端无需改动
+MIRROR_PREFIX = "https://ghfast.top/"

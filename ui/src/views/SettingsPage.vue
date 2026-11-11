@@ -5,8 +5,10 @@ import AntApp from 'ant-design-vue/es/app';
 import { useSettingsStore } from '@/stores/settings';
 import { useProxyStore } from '@/stores/proxy';
 import { useCertStore } from '@/stores/cert';
+import { useAppStore } from '@/stores/app';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
-import { dnsProbeDoh } from '@/api';
+import { useUpdateStore, RELEASE_PAGE_URL } from '@/stores/update';
+import { dnsProbeDoh, openExternal } from '@/api';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
 import { isMacOS } from '@/utils/platform';
 import type { ProxyMode } from '@/types/ipc';
@@ -14,8 +16,10 @@ import type { ProxyMode } from '@/types/ipc';
 const settings = useSettingsStore();
 const proxy = useProxyStore();
 const cert = useCertStore();
+const app = useAppStore();
 // 主题/语言即时生效（localStorage 持久化），不走「保存设置」
 const theme = useThemeStore();
+const update = useUpdateStore();
 const { t } = useI18n();
 const { message } = AntApp.useApp();
 
@@ -37,7 +41,37 @@ const dohTesting = ref(false);
 onMounted(() => {
   if (!settings.loaded) void settings.ensureLoaded().catch(() => {});
   if (cert.status === null) void cert.refresh().catch(() => {});
+  if (!update.settingsLoaded) void update.loadSettings();
 });
+
+/* 软件更新卡片：独立于代理设置保存，避免两处整对象写入互相覆盖 */
+const updateEndpoint = nullableString(
+  () => update.settings.endpoint,
+  (v) => (update.settings.endpoint = v),
+);
+const updateInterval = computed<number>({
+  get: () => update.settings.checkIntervalHours,
+  set: (v: unknown) => {
+    update.settings.checkIntervalHours =
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 24;
+  },
+});
+
+async function saveUpdateSettings(): Promise<void> {
+  const ok = await update.saveSettings();
+  if (ok) void message.success(t('common.saved'));
+  else void message.error(update.error ?? t('common.saveFailed'));
+}
+
+async function checkUpdateNow(): Promise<void> {
+  const result = await update.checkAndOpen();
+  if (result === 'upToDate') void message.info(t('update.upToDate'));
+  else if (result === 'error') void message.error(update.error ?? t('update.failed'));
+}
+
+function openManualDownload(): void {
+  void openExternal(RELEASE_PAGE_URL);
+}
 
 /**
  * 后端字段为 `string | null`，而 antd 表单组件的 v-model 只接受
@@ -457,6 +491,68 @@ function formatTime(iso: string): string {
         {{ $t('settings.certHint') }}
       </a-typography-paragraph>
     </a-card>
+
+    <a-card :bordered="false" :title="$t('update.settingsTitle')" class="panel">
+      <a-form layout="vertical">
+        <a-row :gutter="16">
+          <a-col :xs="24" :md="8">
+            <a-form-item :label="$t('update.autoCheck')">
+              <a-switch v-model:checked="update.settings.autoCheck" />
+              <template #extra>{{ $t('update.autoCheckHint') }}</template>
+            </a-form-item>
+          </a-col>
+          <a-col :xs="24" :md="8">
+            <a-form-item :label="$t('update.interval')">
+              <a-input-number v-model:value="updateInterval" :min="0" :max="720" class="w-full" />
+              <template #extra>{{ $t('update.intervalHint') }}</template>
+            </a-form-item>
+          </a-col>
+        </a-row>
+
+        <a-form-item :label="$t('update.endpoint')">
+          <a-input
+            v-model:value="updateEndpoint"
+            allow-clear
+            :placeholder="$t('update.endpointPlaceholder')"
+          />
+          <template #extra>{{ $t('update.endpointHint') }}</template>
+        </a-form-item>
+
+        <a-form-item v-if="update.settings.skippedVersion" :label="$t('update.skippedVersion')">
+          <a-space>
+            <a-tag>{{ update.settings.skippedVersion }}</a-tag>
+            <a-button size="small" @click="update.clearSkip()">
+              {{ $t('update.clearSkip') }}
+            </a-button>
+          </a-space>
+        </a-form-item>
+      </a-form>
+
+      <a-space wrap>
+        <a-button type="primary" :loading="update.savingSettings" @click="saveUpdateSettings">
+          {{ $t('update.saveSettings') }}
+        </a-button>
+        <a-button :loading="update.isChecking" @click="checkUpdateNow">
+          {{ $t('update.checkNow') }}
+        </a-button>
+        <a-button v-if="update.hasUpdate" type="link" @click="update.openModal()">
+          {{ $t('update.viewDetail') }}
+        </a-button>
+        <a-button type="link" @click="openManualDownload">
+          {{ $t('update.manualDownload') }}
+        </a-button>
+      </a-space>
+
+      <a-alert v-if="update.status === 'error' && update.error" type="error" show-icon class="update-error">
+        <template #message>{{ $t('update.failed') }}</template>
+        <template #description>
+          <span class="mono">{{ update.error }}</span>
+        </template>
+      </a-alert>
+      <a-typography-paragraph v-else type="secondary" class="hint">
+        {{ $t('update.currentVersion', { version: app.info?.version ?? '—' }) }}
+      </a-typography-paragraph>
+    </a-card>
   </div>
 </template>
 
@@ -497,6 +593,12 @@ function formatTime(iso: string): string {
   margin: 16px 0 0;
   line-height: 1.8;
   font-size: 13px;
+}
+
+.update-error {
+  margin-top: 16px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .field-hint {

@@ -40,6 +40,10 @@ watt-cloud = { workspace = true }
 # rustls crypto provider 需手动安装（全局唯一入口，见 lib.rs run()）
 rustls = { workspace = true }
 tauri-plugin-single-instance = "2.5.4"
+# 自动更新：minisign 校验 + 各平台安装（Win NSIS / macOS .app / Linux AppImage）
+tauri-plugin-updater = "2"
+# 打开外部链接（手动下载兜底）：WebView 内直接跳转会把界面导航走
+tauri-plugin-opener = "2"
 
 [features]
 default = []

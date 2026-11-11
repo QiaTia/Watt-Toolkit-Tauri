@@ -183,6 +183,34 @@ fn default_true() -> bool {
     true
 }
 
+/// 软件更新设置：`{AppData}/Settings/UpdateSettings.json`
+///
+/// 单独成文件而不并入 [`ProxySettings`]：更新设置由独立的设置卡片与「跳过此版本」
+/// 写入，和代理配置的整对象保存互不影响（避免用默认值覆盖对方的字段）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UpdateSettings {
+    /// 启动后自动检查更新
+    pub auto_check: bool,
+    /// 自动检查的最小间隔（小时）；<=0 视为每次启动都检查
+    pub check_interval_hours: u64,
+    /// 自定义更新源（镜像 / 自建 latest.json），None = 用 tauri.conf.json 默认
+    pub endpoint: Option<String>,
+    /// 用户选择「跳过」的版本
+    pub skipped_version: Option<String>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            check_interval_hours: 24,
+            endpoint: None,
+            skipped_version: None,
+        }
+    }
+}
+
 impl Default for ProxySettings {
     fn default() -> Self {
         Self {
@@ -247,6 +275,26 @@ pub fn load_proxy_settings_in(dir: &Path) -> Result<ProxySettings, SettingsError
 pub fn save_proxy_settings_in(dir: &Path, settings: &ProxySettings) -> Result<(), SettingsError> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("ProxySettings.json");
+    let content = serde_json::to_string_pretty(settings)?;
+    write_atomic(&path, content.as_bytes())?;
+    Ok(())
+}
+
+/// 从指定目录加载更新设置（不存在则返回默认值）
+pub fn load_update_settings_in(dir: &Path) -> Result<UpdateSettings, SettingsError> {
+    let path = dir.join("UpdateSettings.json");
+    if !path.exists() {
+        return Ok(UpdateSettings::default());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let settings: UpdateSettings = serde_json::from_str(&content)?;
+    Ok(settings)
+}
+
+/// 保存更新设置到指定目录（原子替换）
+pub fn save_update_settings_in(dir: &Path, settings: &UpdateSettings) -> Result<(), SettingsError> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("UpdateSettings.json");
     let content = serde_json::to_string_pretty(settings)?;
     write_atomic(&path, content.as_bytes())?;
     Ok(())
@@ -385,6 +433,35 @@ mod tests {
         assert_eq!(reloaded.system_proxy_port, 26502);
         assert_eq!(reloaded.enabled_accelerate_ids, vec!["steam"]);
         assert_eq!(reloaded.proxy_mode, ProxyMode::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_settings_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("watt-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 文件不存在 → 默认（自动检查开、24 小时）
+        let defaults = load_update_settings_in(&dir).unwrap();
+        assert!(defaults.auto_check);
+        assert_eq!(defaults.check_interval_hours, 24);
+
+        let settings = UpdateSettings {
+            auto_check: false,
+            check_interval_hours: 6,
+            endpoint: Some("https://mirror.example.com/latest.json".into()),
+            skipped_version: Some("0.5.3".into()),
+        };
+        save_update_settings_in(&dir, &settings).unwrap();
+        let reloaded = load_update_settings_in(&dir).unwrap();
+        assert!(!reloaded.auto_check);
+        assert_eq!(reloaded.check_interval_hours, 6);
+        assert_eq!(
+            reloaded.endpoint.as_deref(),
+            Some("https://mirror.example.com/latest.json")
+        );
+        assert_eq!(reloaded.skipped_version.as_deref(), Some("0.5.3"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

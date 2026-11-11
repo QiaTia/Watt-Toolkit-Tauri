@@ -1,9 +1,22 @@
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export type ThemeMode = 'light' | 'dark' | 'auto';
 
 const STORAGE_KEY = 'app.theme_mode';
+
+/**
+ * 同步原生窗口主题：Windows 标题栏（DWMWA_USE_IMMERSIVE_DARK_MODE）、
+ * macOS 外观都靠它，否则深色界面会顶一条白色原生标题栏。
+ */
+async function syncNativeTheme(dark: boolean): Promise<void> {
+  try {
+    await getCurrentWindow().setTheme(dark ? 'dark' : 'light');
+  } catch {
+    // 纯浏览器预览或权限缺失时只影响原生标题栏，不影响界面主题
+  }
+}
 
 function readStoredMode(): ThemeMode {
   try {
@@ -52,6 +65,8 @@ export const useThemeStore = defineStore('theme', () => {
     isDark,
     (dark) => {
       document.documentElement.classList.toggle('dark', dark);
+      // 原生标题栏与界面保持同一套明暗（「跟随系统」时随 matchMedia 变化重新同步）
+      void syncNativeTheme(dark);
     },
     { immediate: true },
   );

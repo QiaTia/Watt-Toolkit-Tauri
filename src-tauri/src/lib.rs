@@ -74,6 +74,9 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // 自动更新：必须有插件状态，UpdaterExt::updater_builder() 才能读到
+        // pubkey / endpoints 配置（不注册会在 check 时 panic 取不到 UpdaterState）
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = resolve_data_dir(app.handle());
             std::fs::create_dir_all(&data_dir)?;
@@ -185,6 +188,12 @@ pub fn run() {
             commands::logs::runtime_logs,
             commands::logs::runtime_logs_clear,
             commands::migrate::migration_get_report,
+            commands::update::update_check,
+            commands::update::update_install,
+            commands::update::update_get_settings,
+            commands::update::update_save_settings,
+            commands::update::update_gatekeeper_script,
+            commands::update::open_external,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

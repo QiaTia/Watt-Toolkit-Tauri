@@ -9,3 +9,4 @@ pub mod ip_pool;
 pub mod logs;
 pub mod migrate;
 pub mod settings;
+pub mod update;

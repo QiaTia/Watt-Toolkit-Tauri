@@ -3,9 +3,11 @@
 //! 对齐原版 `NetworkTestService.TestOpenUrlAsync` 的传输层语义：
 //! - `HttpClient.GetAsync(url, ResponseContentRead)` → 完整收到响应即 `ok`
 //!   （**任意状态码**，404/302 也算收到响应）；
-//! - 额外提供 `healthy`：仅 **HTTP 2xx** 视为服务可用。Google 翻译等固定
-//!   覆盖 IP 的节点可能返回 404，必须按 `healthy` 标记为不可用，避免
-//!   “能连上但打不开”被误报为加速成功。
+//! - 额外提供 `healthy`：**非 5xx** 视为服务可用。根路径返回 301/302 是常规
+//!   跳转，401/403/405/429 是鉴权或 WAF 限制，400/404 常见于 CDN 与 API 根路径，
+//!   这些都证明 TLS + HTTP 链路是通的；只有 5xx 才算网关/源站不可用。
+//! - 固定覆盖 IP 的项目（`ip_address`）需要更严格的判定：钉住的边缘节点失效时
+//!   典型表现就是「TLS 能握手但返回 403/404」，这一层收紧在前端按项目标记完成。
 //! - Stopwatch 计时 → 延迟毫秒；异常 → 失败；> 20s → Timeout（UI 层判定）；
 //! - 分组内全部域名**并发**测试。
 //!
@@ -83,7 +85,7 @@ pub struct ProbeResult {
     pub host: String,
     /// 完整收到 HTTP 响应（任意状态码）
     pub ok: bool,
-    /// HTTP 2xx：服务真正可用；404/5xx 等为 false
+    /// 服务端返回了正常语义的响应（非 5xx）
     pub healthy: bool,
     /// 响应状态码（ok 时必有）
     pub status: Option<u16>,
@@ -92,9 +94,13 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
-/// HTTP 状态码是否代表服务可用（仅 2xx）
+/// HTTP 状态码是否代表服务端可用（非 5xx）。
+///
+/// 301/302 是根路径的常规跳转；401/403/405/429 是鉴权 / WAF / 方法限制；
+/// 400/404 常见于 CDN 与 API 根路径——它们都证明 TLS 与 HTTP 链路是通的。
+/// 只有 5xx（网关 / 源站错误）才按不可用处理。
 fn status_is_healthy(status: u16) -> bool {
-    (200..300).contains(&status)
+    status < 500
 }
 
 /// 经 HTTP 正向代理建立 CONNECT 隧道（对齐 HttpClient 走系统代理的路径）。
@@ -318,9 +324,14 @@ mod tests {
         assert!(status_is_healthy(200));
         assert!(status_is_healthy(204));
         assert!(status_is_healthy(299));
-        assert!(!status_is_healthy(301)); // 重定向不等于服务可用
-        assert!(!status_is_healthy(404)); // Google 翻译边缘节点当前返回 404
-        assert!(!status_is_healthy(500));
+        assert!(status_is_healthy(301)); // 根路径常规跳转：链路可达
+        assert!(status_is_healthy(302));
+        assert!(status_is_healthy(400)); // CDN / API 根路径语义
+        assert!(status_is_healthy(403)); // 鉴权 / WAF 拦截：主机可达
+        assert!(status_is_healthy(404));
+        assert!(status_is_healthy(429));
+        assert!(!status_is_healthy(500)); // 网关 / 源站错误才算不可用
+        assert!(!status_is_healthy(503));
     }
 
     #[test]

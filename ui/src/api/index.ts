@@ -24,6 +24,8 @@ import type {
   ProxySettings,
   RuntimeLogFilter,
   RuntimeLogPage,
+  UpdateInfoDto,
+  UpdateSettings,
 } from '@/types/ipc';
 
 /* 应用 */
@@ -200,4 +202,44 @@ export function runtimeLogs(
 /** 清空应用运行日志 */
 export function runtimeLogsClear(): Promise<void> {
   return invoke('runtime_logs_clear');
+}
+
+/* 自动更新 */
+
+/**
+ * 检查更新。`endpoint` 为空时使用设置里的自定义源，再回退官方 GitHub 源。
+ * 后端会按顺序逐个尝试（含引擎运行时的代理直连），全部失败才抛错。
+ */
+export function updateCheck(endpoint?: string | null): Promise<UpdateInfoDto | null> {
+  return invoke('update_check', { endpoint: endpoint ?? null });
+}
+
+/** 下载并安装：后端会先强制停止加速引擎（还原 hosts / 系统代理 / 终端代理）。
+ *  `expectedVersion` 供后端做安装前版本一致性校验，避免静默装到与弹窗不同的版本。 */
+export function updateInstall(
+  endpoint?: string | null,
+  expectedVersion?: string | null,
+): Promise<void> {
+  return invoke('update_install', {
+    endpoint: endpoint ?? null,
+    expectedVersion: expectedVersion ?? null,
+  });
+}
+
+export function updateGetSettings(): Promise<UpdateSettings> {
+  return invoke('update_get_settings');
+}
+
+export function updateSaveSettings(settings: UpdateSettings): Promise<void> {
+  return invoke('update_save_settings', { settings });
+}
+
+/** 用系统默认浏览器打开链接（WebView 内跳转会把界面导航走） */
+export function openExternal(url: string): Promise<void> {
+  return invoke('open_external', { url });
+}
+
+/** macOS Gatekeeper 绕过脚本（清除 .app 隔离属性）；非 macOS 返回空串 */
+export function updateGatekeeperScript(): Promise<string> {
+  return invoke('update_gatekeeper_script');
 }
