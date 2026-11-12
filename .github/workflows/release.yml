@@ -112,6 +112,8 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # pin 到与本地/CI 一致的固定版本，保证发版构建可复现
+          toolchain: 1.96.0
           # 分架构构建需要安装对应的交叉编译 target：
           #  - macOS：x86_64 / aarch64
           #  - Windows：额外安装 arm64（x86_64 为默认 target，无需单独列出）

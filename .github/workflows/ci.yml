@@ -51,6 +51,8 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # pin 到与本地一致的固定版本，避免 stable 升级引入新 lint 反复炸 -D warnings
+          toolchain: 1.96.0
           components: clippy
 
       - name: Rust cache
@@ -81,6 +83,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
