@@ -61,6 +61,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # macOS 签名证书可用性检测：仅当 APPLE_CERTIFICATE 能解码为有效 PKCS#12（且密码匹配）
+      # 时才启用代码签名/公证；缺失或格式错误时降级为未签名构建（对应应用内 Gatekeeper 指引），
+      # 避免「Secret 非空但内容无效」导致 security import 失败、整个 macOS 构建中断。
+      - name: 检测 macOS 签名证书是否可用
+        id: signing
+        if: matrix.platform == 'macos-latest'
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          enabled=false
+          if [ -z "$CERT" ]; then
+            echo "::warning::未配置 APPLE_CERTIFICATE，macOS 以未签名方式构建（首次打开需右键→打开，或按应用内 Gatekeeper 指引）。"
+          elif printf '%s' "$CERT" | base64 -D > /tmp/watt-cert.p12 2>/dev/null \
+               && openssl pkcs12 -in /tmp/watt-cert.p12 -passin "pass:$CERT_PW" -noout 2>/dev/null; then
+            enabled=true
+            echo "检测到有效的 Apple 签名证书，启用代码签名与公证。"
+          else
+            echo "::warning::APPLE_CERTIFICATE 无法解码为有效 PKCS#12（或密码不匹配），macOS 改用未签名构建。请检查仓库 Secrets。"
+          fi
+          rm -f /tmp/watt-cert.p12
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -191,14 +214,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS 代码签名 + 公证（与更新包的 minisign 签名是两套独立机制）。
-          # 未配置对应 Secrets 时这些变量为空，action 会自动跳过签名与公证。
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 仅当上方 signing 检测确认证书有效时才传入；否则为空 → action 跳过签名，未签名构建。
+          APPLE_CERTIFICATE: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          KEYCHAIN_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.KEYCHAIN_PASSWORD || '' }}
+          APPLE_ID: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_TEAM_ID || '' }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
@@ -225,14 +248,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS 代码签名 + 公证（与更新包的 minisign 签名是两套独立机制）。
-          # 未配置对应 Secrets 时这些变量为空，action 会自动跳过签名与公证。
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 仅当上方 signing 检测确认证书有效时才传入；否则为空 → action 跳过签名，未签名构建。
+          APPLE_CERTIFICATE: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          KEYCHAIN_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.KEYCHAIN_PASSWORD || '' }}
+          APPLE_ID: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ steps.signing.outputs.enabled == 'true' && secrets.APPLE_TEAM_ID || '' }}
         with:
           projectPath: 'src-tauri'
           tagName: '${{ github.ref_name }}'
