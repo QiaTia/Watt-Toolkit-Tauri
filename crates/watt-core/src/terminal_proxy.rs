@@ -422,8 +422,10 @@ mod imp {
         }
         // REG_SZ / REG_EXPAND_SZ 均为 UTF-16LE，按 u16 解释并去尾 NUL
         let wide: Vec<u16> = buf
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let end = wide.iter().position(|c| *c == 0).unwrap_or(wide.len());
         Ok(Some(String::from_utf16_lossy(&wide[..end])))
