@@ -184,14 +184,16 @@ mod tests {
 
     #[test]
     fn expired_entry_reads_as_none() {
+        // Instant 在 Windows 以开机为原点：刚启动的 CI runner 上回退 301s 会下溢 panic。
+        // 用 checked_sub；无法表示「TTL 之前」的时刻时跳过（开机足够久的环境仍会验证过期逻辑）。
+        let Some(at) = Instant::now().checked_sub(PROBE_TTL + Duration::from_secs(1)) else {
+            return;
+        };
         let cache = ProbeCache::new();
         // 直接写入一条已过期条目（模拟 TTL 到期）
         cache.entries.lock().unwrap().insert(
             ("github.com".into(), ip("140.82.112.3")),
-            ProbeEntry {
-                rtt_ms: 42,
-                at: Instant::now() - PROBE_TTL - Duration::from_secs(1),
-            },
+            ProbeEntry { rtt_ms: 42, at },
         );
         assert_eq!(cache.get("github.com", ip("140.82.112.3")), None);
     }
