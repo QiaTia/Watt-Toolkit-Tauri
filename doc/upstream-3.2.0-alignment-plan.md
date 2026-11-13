@@ -340,6 +340,23 @@ https://dns.google/dns-query
 2. **`update_gatekeeper_script` 的引号**：原用双引号包裹 bundle 路径，而安装位置由用户决定，路径含 `"` / `$()` / 反引号时会被 shell 解释（该命令带 `sudo`）。改为单引号 + `'''` 闭合转义。
 3. **`is_elevated` 在中文 Windows 上恒为 false**（`watt-cert` 与 `watt-elevate` 各一处）：`whoami /groups` 按 OEM 代码页（GBK）输出，`String::from_utf8` 严格解码整段失败 → 把「已提权」误判成「未知/false」。改用 `from_utf8_lossy`（SID 是 ASCII，替换不影响匹配）。
 
+**补充审计（2026-11-13 二轮）—— 上一版「无等价入口」的结论不完整**
+
+上面的核对只覆盖了**进程内**的路径来源（IPC 参数、配置字段、命令白名单），漏了
+**进程启动环境**这一层：
+
+`watt-hosts::hosts_file_path()` 在 Windows 上用 `std::env::var("SystemRoot")` 拼
+hosts 路径。该值由父进程设置，而本进程声明了 `requireAdministrator`——构造
+`SystemRoot=C:\evil` 启动，hosts 写入就会以管理员身份落到任意路径，与本报告要
+对齐的上游漏洞（提权进程写任意路径）同性质。
+
+已在 `hosts_file_path()` 里加形态校验：只接受 `<盘符>:\Windows`（大小写不敏感、
+不允许尾随段），其余回退默认路径并告警。`is_valid_system_root` 有单测覆盖
+`C:\Windows` / `C:\WINDOWS` / `C:\Windows\Temp` / `C:\Windows\..\evil` /
+`C:Windows` 等形态。
+
+由此，审计结论应修正为：**IPC 层不存在等价入口；进程启动环境曾存在一处，已修。**
+
 ---
 
 ### 3.10 已天然对齐（不重复投入）

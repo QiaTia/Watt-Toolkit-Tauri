@@ -44,20 +44,64 @@ pub const BACKUP_MARK_START: &str = "# Steam++ Backup Start";
 pub const BACKUP_MARK_END: &str = "# Steam++ Backup End";
 
 /// hosts 文件路径
+///
+/// Windows 下取自 `SystemRoot`，但该值来自**环境变量**、由父进程设置。本进程声明了
+/// `requireAdministrator`，若放任 `SystemRoot=C:\evil`，hosts 写入就会以管理员身份
+/// 落到任意路径——与上游 3.2.0 修的「提权进程写任意路径」属同一类问题。
+/// 因此只接受 `<盘符>:\Windows` 这一形态，其余一律回退默认值并告警。
 pub fn hosts_file_path() -> std::path::PathBuf {
     if cfg!(target_os = "windows") {
-        std::env::var("SystemRoot")
-            .map(|sr| {
-                std::path::PathBuf::from(sr)
-                    .join("System32")
-                    .join("drivers")
-                    .join("etc")
-                    .join("hosts")
-            })
-            .unwrap_or_else(|_| std::path::PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"))
+        const DEFAULT: &str = r"C:\Windows\System32\drivers\etc\hosts";
+        let root = match std::env::var("SystemRoot") {
+            Ok(sr) if is_valid_system_root(std::path::Path::new(&sr)) => sr,
+            Ok(sr) => {
+                tracing::warn!(
+                    system_root = %sr,
+                    "SystemRoot 形态异常（期望 <盘符>:\\Windows），已回退默认系统目录"
+                );
+                return std::path::PathBuf::from(DEFAULT);
+            }
+            Err(_) => return std::path::PathBuf::from(DEFAULT),
+        };
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts")
     } else {
         std::path::PathBuf::from("/etc/hosts")
     }
+}
+
+/// `SystemRoot` 是否为 `<盘符>:\Windows` 形态。
+///
+/// 严格要求「前缀 + 单个 Windows 段」：多一段（`C:\Windows\Temp`）或相对路径
+/// 都不合法。真实系统的 `SystemRoot` 恒为盘根下的 Windows 目录，收紧不会误伤；
+/// 大小写不敏感（`C:\WINDOWS` 同样合法）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_valid_system_root(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut comps = path.components();
+    // 必须带盘符前缀（`C:` / `\\?\C:` 等）
+    if !matches!(comps.next(), Some(Component::Prefix(_))) {
+        return false;
+    }
+    // 注意 `C:\Windows` 的 components 是 Prefix + RootDir + Normal(Windows)，
+    // 中间的 RootDir 必须吃掉；没有根分隔符的 `C:Windows` 属「盘符相对」路径，
+    // 解析基准是进程当前目录，直接拒绝。
+    let after_root = match comps.next() {
+        Some(Component::RootDir) => comps.next(),
+        _ => return false,
+    };
+    let is_windows = after_root
+        .and_then(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .map(|s| s.eq_ignore_ascii_case("windows"))
+        .unwrap_or(false);
+    // 不允许尾随段（`C:\Windows\Temp`、`C:\Windows\..\evil`）
+    is_windows && comps.next().is_none()
 }
 
 /// Windows 默认 hosts 内容（对齐 WindowsPlatformServiceImpl）
@@ -696,6 +740,31 @@ mod tests {
             "127.0.0.1 localhost\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SystemRoot` 只接受 `<盘符>:\Windows`：环境变量可被父进程伪造，
+    /// 而本进程以管理员运行，放任它等于给出「管理员任意路径写入」能力
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn system_root_shape_is_strict() {
+        for ok in [r"C:\Windows", r"C:\WINDOWS", r"D:\Windows", r"C:\Windows\"] {
+            assert!(is_valid_system_root(std::path::Path::new(ok)), "{ok} 应合法");
+        }
+        for bad in [
+            r"C:\evil",
+            r"C:\Windows\Temp",
+            r"C:\Windows\..\evil",
+            r"C:\Windows\System32",
+            "Windows",
+            r"C:",
+            r"\Windows",
+            "",
+        ] {
+            assert!(
+                !is_valid_system_root(std::path::Path::new(bad)),
+                "{bad} 应被拒绝"
+            );
+        }
     }
 
     /// 提权写入只认系统 hosts：这是「管理员进程覆盖任意文件」的最后一道关口

@@ -184,6 +184,10 @@ async fn http_get(url: &str) -> Result<String, CommunityError> {
     if !status.is_success() {
         return Err(CommunityError::Fetch(format!("HTTP {status}")));
     }
+
+    // 重定向可能把 https 降到 http（reqwest 默认跟随最多 10 次）
+    ensure_transport_secure(resp.url())?;
+
     if let Some(len) = resp.content_length() {
         if len > MAX_BODY_BYTES as u64 {
             return Err(CommunityError::Fetch(format!(
@@ -191,17 +195,44 @@ async fn http_get(url: &str) -> Result<String, CommunityError> {
             )));
         }
     }
-    let body = resp
-        .bytes()
+
+    // 流式累加而非 `bytes()`：服务端用 chunked 编码时不返回 Content-Length，
+    // `bytes()` 会先把整个响应读进内存再判断，上限就形同虚设。这里每读到一块
+    // 就累加，超限立即中止（读一半断开，不再继续消费）。
+    let mut body: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| CommunityError::Fetch(e.to_string()))?;
-    if body.len() > MAX_BODY_BYTES {
-        return Err(CommunityError::Fetch(format!(
-            "响应过大（{} 字节，上限 {MAX_BODY_BYTES}）",
-            body.len()
-        )));
+        .map_err(|e| CommunityError::Fetch(e.to_string()))?
+    {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(CommunityError::Fetch(format!(
+                "响应超过 {MAX_BODY_BYTES} 字节上限（已读取 {} 字节），已中止",
+                body.len() + chunk.len()
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// 校验最终 URL（重定向后）仍走加密传输。
+///
+/// 只放行 `https` 与本机回环的 `http`：明文远程源可被中间人改写候选列表，
+/// 虽然异常 IP 仍会被 TLS 探测挡掉，但没必要给它这个改写机会。
+fn ensure_transport_secure(url: &reqwest::Url) -> Result<(), CommunityError> {
+    if url.scheme() == "https" || is_loopback_host(url.host_str()) {
+        return Ok(());
+    }
+    Err(CommunityError::Fetch(format!(
+        "源被重定向到非 HTTPS 地址（{url}），已拒绝"
+    )))
+}
+
+/// 是否为本机回环地址（`http` 仅对回环放行，便于自建/本地测试）
+fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("localhost" | "127.0.0.1" | "::1"))
 }
 
 /// 解析 hosts 清单。
@@ -359,5 +390,71 @@ mod tests {
             let text = format!(r#"[["1.2.3.4","{bad}"]]"#);
             assert!(parse_mappings(&text).is_err(), "{bad} 不应被接受");
         }
+    }
+
+    /// 重定向降级到明文必须被拒（reqwest 默认会跟随 10 次跳跃）
+    #[test]
+    fn rejects_plaintext_redirect_targets() {
+        let https = reqwest::Url::parse("https://hosts.gitcdn.top/hosts.json").unwrap();
+        assert!(ensure_transport_secure(&https).is_ok());
+
+        // 回环允许 http：本地自建镜像 / 测试
+        let loopback = reqwest::Url::parse("http://127.0.0.1:8080/hosts.json").unwrap();
+        assert!(ensure_transport_secure(&loopback).is_ok());
+
+        // 远程明文与非 http(s) 协议一律拒绝
+        for bad in ["http://evil.example.com/x", "ftp://example.com/x"] {
+            let url = reqwest::Url::parse(bad).unwrap();
+            assert!(ensure_transport_secure(&url).is_err(), "{bad} 应被拒绝");
+        }
+    }
+
+    /// chunked 响应不声明 Content-Length，必须靠流式累加才能守住体积上限。
+    /// 用本地服务器发 1.5MB 分块，断言 `http_get` 中止而不是读完再判断。
+    #[tokio::test]
+    async fn rejects_oversized_chunked_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            // 故意不写 Content-Length：只有 chunk 编码可用
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let payload = vec![b'a'; 64 * 1024];
+            for _ in 0..24 {
+                let head = format!("{:x}\r\n", payload.len());
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    return; // 客户端提前断开（正是预期）
+                }
+                if sock.write_all(&payload).await.is_err() {
+                    return;
+                }
+                if sock.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+
+        let err = http_get(&format!("http://127.0.0.1:{}/hosts.json", addr.port()))
+            .await
+            .expect_err("超限响应必须被拒绝");
+        assert!(
+            err.to_string().contains("上限"),
+            "错误信息应说明超限原因: {err}"
+        );
+        server.abort();
     }
 }
