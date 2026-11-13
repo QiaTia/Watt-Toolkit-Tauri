@@ -90,12 +90,36 @@ pub async fn community_hosts_refresh(
     run_refresh(&state.data_dir).await
 }
 
+/// 把拉取结果写回设置：**重新读取后再写**，只动 `last_fetch_ms` / `last_error`。
+///
+/// 一次拉取要花数秒（HTTP + 逐个探测），期间用户可能在卡片上改了 URL / 开关并保存。
+/// 若拿拉取前读到的旧快照整体回写，会把用户的修改静默回滚——表现为「改了设置，
+/// 过几秒自己变回去了」。这里只更新两个由后端维护的字段，其余以磁盘最新值为准。
+fn record_fetch_result(dir: &Path, last_fetch_ms: Option<u64>, last_error: Option<String>) {
+    let mut cfg = match watt_config::settings::load_community_hosts_settings_in(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            // 读不出来就不要写：宁可丢一次结果，也不要用默认值覆盖用户配置
+            tracing::warn!(error = %e, "读取社区源设置失败，本次拉取结果未记录");
+            return;
+        }
+    };
+    if let Some(ms) = last_fetch_ms {
+        cfg.last_fetch_ms = ms;
+    }
+    cfg.last_error = last_error;
+    if let Err(e) = watt_config::settings::save_community_hosts_settings_in(dir, &cfg) {
+        tracing::warn!(error = %e, "保存社区源设置失败");
+    }
+}
+
 /// 拉取一次并落盘（手动命令与后台任务共用）。
 ///
 /// 失败不抛给调用方之外的任何地方：池保持原样，只把原因记进 `last_error`。
 pub(crate) async fn run_refresh(data_dir: &Path) -> Result<watt_core::community_hosts::FetchOutcome, String> {
     let dir = data_dir.join("Settings");
-    let mut cfg =
+    // 只用于取源地址；写回时不复用它（见 `record_fetch_result`）
+    let cfg =
         watt_config::settings::load_community_hosts_settings_in(&dir).map_err(|e| e.to_string())?;
 
     let result =
@@ -103,11 +127,7 @@ pub(crate) async fn run_refresh(data_dir: &Path) -> Result<watt_core::community_
 
     match result {
         Ok(outcome) => {
-            cfg.last_fetch_ms = outcome.fetched_at_ms;
-            cfg.last_error = None;
-            if let Err(e) = watt_config::settings::save_community_hosts_settings_in(&dir, &cfg) {
-                tracing::warn!(error = %e, "保存社区源设置失败");
-            }
+            record_fetch_result(&dir, Some(outcome.fetched_at_ms), None);
             // 池落盘：下次启动无需等拉取就有候选
             let pool_path = dir.join("IpPool.json");
             let _ = tokio::task::spawn_blocking(move || watt_core::ip_pool::save_to(&pool_path)).await;
@@ -116,12 +136,7 @@ pub(crate) async fn run_refresh(data_dir: &Path) -> Result<watt_core::community_
         Err(e) => {
             let msg = e.to_string();
             tracing::warn!(source = %cfg.url, error = %msg, "社区 hosts 源拉取失败");
-            cfg.last_error = Some(msg.clone());
-            if let Err(save_err) =
-                watt_config::settings::save_community_hosts_settings_in(&dir, &cfg)
-            {
-                tracing::warn!(error = %save_err, "保存社区源设置失败");
-            }
+            record_fetch_result(&dir, None, Some(msg.clone()));
             Err(msg)
         }
     }
@@ -222,6 +237,45 @@ mod tests {
         assert!(dir.join("IpPool.json").exists(), "池必须落盘");
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 拉取期间用户改了设置：结果回写不得覆盖（回归用例）
+    #[test]
+    fn record_result_keeps_user_edits() {
+        let dir = std::env::temp_dir().join(format!("watt-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = CommunityHostsSettings::default();
+        watt_config::settings::save_community_hosts_settings_in(&dir, &cfg).unwrap();
+
+        // 模拟「拉取已经开始，用户随后保存了新配置」
+        let mut edited = watt_config::settings::load_community_hosts_settings_in(&dir).unwrap();
+        edited.url = "https://mirror.example.com/hosts.json".into();
+        edited.enabled = false;
+        edited.interval_hours = 6;
+        watt_config::settings::save_community_hosts_settings_in(&dir, &edited).unwrap();
+
+        // 拉取结果回写（只该动 last_*）
+        record_fetch_result(&dir, Some(12345), None);
+
+        let after = watt_config::settings::load_community_hosts_settings_in(&dir).unwrap();
+        assert_eq!(
+            after.url, "https://mirror.example.com/hosts.json",
+            "用户的 URL 修改不能被回写覆盖"
+        );
+        assert!(!after.enabled, "用户的开关修改不能被回写覆盖");
+        assert_eq!(after.interval_hours, 6, "间隔不能被回写覆盖");
+        assert_eq!(after.last_fetch_ms, 12345, "拉取时刻必须写入");
+        assert!(after.last_error.is_none(), "成功时应清空错误");
+
+        // 失败路径：只写 last_error，不动 last_fetch_ms
+        record_fetch_result(&dir, None, Some("boom".into()));
+        let after = watt_config::settings::load_community_hosts_settings_in(&dir).unwrap();
+        assert_eq!(after.last_fetch_ms, 12345, "失败不应改动上次成功时刻");
+        assert_eq!(after.last_error.as_deref(), Some("boom"));
+        assert_eq!(after.url, "https://mirror.example.com/hosts.json");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

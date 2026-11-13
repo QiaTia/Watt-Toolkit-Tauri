@@ -29,3 +29,14 @@ pub const DEFAULT_DNS_SERVERS: &[&str] = &["223.5.5.5", "119.29.29.29", "114.114
 /// 单个解析服务器的查询超时：DoH 多一次 TLS 往返，给多一点
 pub const UDP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub const DOH_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 单次解析的**总**预算（所有服务器串行回退之和的上限）。
+///
+/// 每项各有自己的超时（DoH 3s / UDP 2s），列表里全失败时会累加：3 DoH + 3 UDP
+/// 最坏约 15s，8 个 DoH 则 24s。而出站解析（`outbound::resolve_addrs`）外侧没有
+/// 超时兜底，断网时表现就是「网页卡十几秒才报错」。
+///
+/// 取 6s 的权衡：正常情况首个服务器毫秒级返回，只有全失败才吃满预算；6s 仍够
+/// 覆盖「前两个 DoH 各超时、第三个 UDP 成功」这类常见回退深度，同时把最坏等待
+/// 压到浏览器能接受的范围。宁可少试几个后端，也不要让整个请求挂十几秒。
+pub const TOTAL_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);

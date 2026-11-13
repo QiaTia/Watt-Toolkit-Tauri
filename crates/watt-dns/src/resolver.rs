@@ -386,6 +386,10 @@ impl DnsResolver {
     ///
     /// 顺序而非并发：并发会让「能通但被污染」的服务器抢先返回，
     /// 反而盖掉首位服务器的正确结果。
+    ///
+    /// 全程受 [`crate::TOTAL_LOOKUP_BUDGET`] 约束：串行回退在「列表里全失败」时
+    /// 会把各服务器的超时累加（3 DoH + 3 UDP 最坏 15s），而调用方（出站连接）
+    /// 外侧没有超时兜底，不设总预算就会让单个请求挂十几秒。
     async fn lookup(&self, host: &str, clean: bool) -> Result<Vec<IpAddr>, DnsError> {
         // IP 字面量直通
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -395,10 +399,21 @@ impl DnsResolver {
             return Err(DnsError::Resolve(format!("{host}: 无可用 DNS 服务器")));
         }
 
+        let deadline = tokio::time::Instant::now() + crate::TOTAL_LOOKUP_BUDGET;
         let mut last_err = String::new();
-        for entry in &self.entries {
+        for (index, entry) in self.entries.iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err = format!(
+                    "总预算 {}s 耗尽，已尝试 {index}/{} 个服务器（{last_err}）",
+                    crate::TOTAL_LOOKUP_BUDGET.as_secs(),
+                    self.entries.len()
+                );
+                break;
+            }
             let resolver = if clean { &entry.clean } else { &entry.resolver };
-            let timeout = entry.spec.query_timeout();
+            // 单项超时不得超过剩余预算，否则最后一个服务器会把总时长又拖出去
+            let timeout = entry.spec.query_timeout().min(remaining);
             match tokio::time::timeout(timeout, resolver.lookup_ip(host)).await {
                 Ok(Ok(response)) => {
                     let ips: Vec<IpAddr> = response.iter().collect();

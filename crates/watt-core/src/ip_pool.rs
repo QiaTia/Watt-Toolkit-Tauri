@@ -499,6 +499,22 @@ async fn refresh_one(
         };
     }
 
+    // 并入池内已有的**动态** IP 一起参与探测。
+    //
+    // 池里的 IP 不只来自 DNS：社区 hosts 源（`community_hosts`）也是写入方，
+    // 而本函数末尾用 `set_entry` **替换**动态部分。若只探测 DNS 结果，社区源
+    // 写入的候选会在每次手动刷新后被整体清掉，要等下次社区源拉取才回来。
+    // 并入后统一按「实测可达」裁决：仍可达的保留，不可达的自然淘汰——这比
+    // 按来源打标记去保留更简单，也符合「池内只放实测可用 IP」的既有约定。
+    //
+    // 只取 `ips`（动态）不取 `manual_ips`：手工 IP 由用户显式维护，不该被
+    // 一次自动刷新判死（`set_entry` 本身也不会动手工部分）。
+    for ip in crate::ip_pool::entry(host).map(|e| e.ips).unwrap_or_default() {
+        if is_usable_ip(&ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+
     // 并发探测全部候选
     let mut set = tokio::task::JoinSet::new();
     for ip in &candidates {
@@ -700,6 +716,66 @@ mod tests {
         // 显式删除才清空全部
         remove_entry("example.com");
         assert!(entry_ips("example.com").is_empty());
+        clear();
+    }
+
+    /// `add_dynamic_ips` 的五条语义：并集 / 幂等 / 上限截断 / 空输入无操作 / 顺序保持
+    #[test]
+    fn add_dynamic_ips_is_union_and_capped() {
+        let _g = TEST_LOCK.lock().unwrap();
+        clear();
+
+        // 首次写入
+        add_dynamic_ips("a.example.com", &[ip("1.1.1.1"), ip("2.2.2.2")], 8);
+        assert_eq!(
+            entry_ips("a.example.com"),
+            vec![ip("1.1.1.1"), ip("2.2.2.2")]
+        );
+
+        // 并集：已有候选保留（这正是区别于 set_entry 的地方——后者会整体替换）
+        add_dynamic_ips("a.example.com", &[ip("3.3.3.3")], 8);
+        assert_eq!(
+            entry_ips("a.example.com"),
+            vec![ip("1.1.1.1"), ip("2.2.2.2"), ip("3.3.3.3")]
+        );
+
+        // 幂等：重复写入不产生重复项
+        add_dynamic_ips("a.example.com", &[ip("1.1.1.1"), ip("3.3.3.3")], 8);
+        assert_eq!(entry_ips("a.example.com").len(), 3);
+
+        // 上限：按先到先得截断，超出部分丢弃
+        add_dynamic_ips("a.example.com", &[ip("4.4.4.4"), ip("5.5.5.5")], 4);
+        assert_eq!(
+            entry_ips("a.example.com"),
+            vec![ip("1.1.1.1"), ip("2.2.2.2"), ip("3.3.3.3"), ip("4.4.4.4")]
+        );
+
+        // 空输入：不得清空既有候选（合并失败时的安全行为）
+        add_dynamic_ips("a.example.com", &[], 8);
+        assert_eq!(entry_ips("a.example.com").len(), 4);
+
+        // max = 0 视为「不接收」，同样不清空
+        add_dynamic_ips("a.example.com", &[ip("6.6.6.6")], 0);
+        assert_eq!(entry_ips("a.example.com").len(), 4);
+
+        clear();
+    }
+
+    /// 手工 IP 归用户维护：既不重复写入动态部分，也不会被上限挤掉
+    #[test]
+    fn add_dynamic_ips_never_touches_manual() {
+        let _g = TEST_LOCK.lock().unwrap();
+        clear();
+
+        set_manual_entry("b.example.com", vec![ip("9.9.9.9")]);
+        // 社区源恰好也给了同一个 IP：不应在动态部分重复存一份
+        add_dynamic_ips("b.example.com", &[ip("9.9.9.9"), ip("8.8.8.8")], 8);
+
+        let e = entry("b.example.com").expect("条目应存在");
+        assert_eq!(e.manual_ips, vec![ip("9.9.9.9")]);
+        assert_eq!(e.ips, vec![ip("8.8.8.8")]);
+        assert_eq!(e.all_ips(), vec![ip("9.9.9.9"), ip("8.8.8.8")]);
+
         clear();
     }
 }
