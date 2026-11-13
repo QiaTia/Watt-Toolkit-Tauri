@@ -386,9 +386,61 @@ fn atomic_replace(path: &std::path::Path, content: &str) -> Result<(), AtomicWri
     }
 }
 
+/// 提权写入允许的目标（系统 hosts 的等价路径）
+///
+/// 提权子进程能覆盖任意文件，而上游 3.2.0 修的正是「命令行 `-path` 参数
+/// 让管理员进程写任意路径」的漏洞。hosts 路径将来很可能被做成可配置项，
+/// 因此把限制放在**提权入口**而不是配置层：无论上游怎么传路径，提权只写这两个。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ELEVATED_HOSTS_TARGETS: &[&str] = &["/etc/hosts", "/private/etc/hosts"];
+
+/// 是否为允许提权写入的系统 hosts 路径
+///
+/// macOS 上 `/etc` 是指向 `/private/etc` 的符号链接，两条路径都要认。
+/// 比较前先做词法归一化（消掉 `.` / `..` / 重复分隔符）：既避免 `/etc/./hosts`
+/// 这类等价路径被误拒，也避免 `/tmp/../etc/hosts` 之类靠字面绕过。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_system_hosts_path(path: &std::path::Path) -> bool {
+    normalize_lexical(path)
+        .map(|p| ELEVATED_HOSTS_TARGETS.contains(&p.as_str()))
+        .unwrap_or(false)
+}
+
+/// 词法归一化：仅处理 `.` / `..` / 多余分隔符，不访问文件系统
+/// （不解析符号链接——目标路径由本 crate 常量给出，无需跟随后缀变化）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn normalize_lexical(path: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => parts.clear(),
+            Component::CurDir => {}
+            Component::Normal(s) => parts.push(s.to_str()?),
+            // 上溯到根之上（`/..`）在词法上等价于根，保持 parts 为空即可
+            Component::ParentDir => {
+                parts.pop();
+            }
+            // Windows 盘符 / UNC 前缀不属于本函数的适用面
+            _ => return None,
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
 /// macOS 提权写入（[`write_file`] 的 PermissionDenied 兜底路径）
 #[cfg(target_os = "macos")]
 fn write_file_elevated(path: &std::path::Path, content: &str) -> Result<(), HostsError> {
+    // 提权是最后一个能「写任意文件」的关口，目标必须先过白名单。
+    // 命中此处说明调用方传入了自定义路径（测试/未来可配置化），
+    // 必须显式失败而不是静默以 root 覆盖文件。
+    if !is_system_hosts_path(path) {
+        tracing::error!(path = %path.display(), "拒绝提权写入非系统 hosts 路径");
+        return Err(HostsError::Other(format!(
+            "拒绝提权写入非系统 hosts 路径: {}",
+            path.display()
+        )));
+    }
     // 临时文件：O_EXCL 创建（create_new），防符号链接/竞争攻击；
     // 文件名只含 PID 与重试序号，无用户可控段
     let tmp = create_exclusive_temp(content)?;
@@ -644,5 +696,30 @@ mod tests {
             "127.0.0.1 localhost\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提权写入只认系统 hosts：这是「管理员进程覆盖任意文件」的最后一道关口
+    #[test]
+    fn elevated_target_must_be_system_hosts() {
+        use std::path::Path;
+        assert!(is_system_hosts_path(Path::new("/etc/hosts")));
+        // macOS 的 /etc 是 /private/etc 的软链，真实路径同样合法
+        assert!(is_system_hosts_path(Path::new("/private/etc/hosts")));
+        // 词法等价的写法必须认（否则合法调用会被误拒）
+        for same in ["/etc/./hosts", "/etc//hosts", "/tmp/../etc/hosts"] {
+            assert!(is_system_hosts_path(Path::new(same)), "{same} 应归一为 /etc/hosts");
+        }
+        // 任意路径必须被拒绝（上游 3.2.0 修的正是这类越权写入）
+        for bad in [
+            "/tmp/hosts",
+            "/etc/passwd",
+            "/etc/hosts/../../root/.ssh/authorized_keys",
+            "hosts",
+            "/private/etc/hosts.bak",
+            "/etc/hosts2",
+            "",
+        ] {
+            assert!(!is_system_hosts_path(Path::new(bad)), "{bad} 不应通过白名单");
+        }
     }
 }

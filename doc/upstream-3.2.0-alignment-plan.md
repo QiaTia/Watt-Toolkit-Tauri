@@ -6,11 +6,11 @@
 > 上一基线：tag `3.1.0`（commit `86122510`，2026-03-11）
 > 结论状态：✅ 已核对上游源码 / 🟡 推断 / ⚠️ 待人工确认
 >
-> **实施进度：P0（A1–A5）+ P1（B1–B4）已完成并验证** —— 见 §9。
+> **实施进度：P0（A1–A5）+ P1（B1–B4）+ P2（C1–C2）已完成并验证** —— 见 §9。
 
 ---
 
-## 9. 实施记录（P0 已落地）
+## 9. 实施记录（P0 / P1 / P2 全部落地）
 
 | 项 | 状态 | 落点 | 验证 |
 | --- | --- | --- | --- |
@@ -23,8 +23,12 @@
 | B2 host 归一化 | ✅ 完成 | `http_relay.rs`：`normalize_host`，规则匹配/DNS/SNI 用纯主机名；转发仍用原始 authority | 单测 `test_normalize_host` |
 | B3 错误码 | ✅ 完成 | `EngineErrorCode` + `AccessSurface`/`HostsWrite` 变体；`EngineStateDto::Error.code`；前端类型同步 | 单测断言 BindPort 分类 |
 | B4 Linux 系统代理 | ✅ 完成 | `system_proxy.rs`：`gsettings` 逐键 + 退出码校验，端点先写、`mode` 后切；缺失时明确报错 | 模块级交叉编译校验 + Linux CI |
+| C1 证书失败归因（替代 KeyIso 探测） | ✅ 完成 | `TrustError::Cancelled` + `classify_shell_execute_error`（保留 `GetLastError`）+ 新 `diagnose.rs` 与 `cert_diagnose` 命令 + 设置页诊断按钮 | 单测 6 例 + 真机诊断（见下） |
+| C2 提权面审计与加固 | ✅ 完成 | 审计 42 个 IPC 命令；`watt-hosts` 提权目标白名单、gatekeeper 脚本引号、`is_elevated` 编码修复 | 单测 `elevated_target_must_be_system_hosts` |
 
-**整体质量门**：`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo test --workspace` 全绿；`diag_github`（HTTP/1.1 + h2）均 200。
+**整体质量门**：`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo test --workspace` 全绿（watt-cert 24 / watt-core 126 / watt-config 16 / watt-hosts 15）；`diag_github`（HTTP/1.1 + h2）均 200；`vue-tsc --noEmit` + `vite build` 通过。
+
+**真机诊断记录（2026-11-13，Windows 11 中文版）**：`cargo test -p watt-cert --test diag_trust -- --ignored --nocapture` 首次运行即查出本机 Root 存储中 **2 张同名 "Watt Toolkit" 根证书** —— 正是「重新生成 CA 后旧根残留」这个此前无法自查的场景；同一次运行暴露了 `is_elevated` 在中文 Windows 恒为 false 的缺陷（已修）。
 
 **实现细节与上游的差异（有意）**
 
@@ -39,6 +43,11 @@
    失败只可能残留「端点已写、mode 未变」的中间态，切 `mode=none` 反而会关掉用户原有代理。
 8. Linux 模块无法在本机做完整交叉编译（缺 `x86_64-linux-gnu-gcc`，ring 需要 C 工具链），
    采用「抽出模块在宿主平台编译」的方式做语法/类型校验；真实运行需 Linux CI 覆盖。
+9. **不做上游的 KeyIso 注册表探测**：本项目的私钥从不进 CNG，那条故障链不存在；
+   改做「同 CN 证书计数 + 提权状态 + `GetLastError` 归因」——同一目的，贴着真实故障面。
+10. **提权目标白名单放在提权入口而非配置层**：`is_system_hosts_path` 在
+    `write_file_elevated` 里逐次校验，即使将来 hosts 路径可配置也绕不过去；
+    上游的做法是删掉那个子命令，属于「移除能力」，我们是「保留能力 + 锁死目标」。
 
 ---
 
@@ -283,6 +292,18 @@ https://dns.google/dns-query
 
 **结论**：真正踩 KeyIso 的概率低 → 优先级 P2。但**建议顺手实现诊断函数**，因为它同时能覆盖「证书存储被组策略锁定」「certutil 被安全软件拦截」两类真实故障的区分。成本约 80 行（注册表 + 一次 `QueryServiceStatus`，可用 `windows-sys` 现有 feature 集，无需新增依赖）。
 
+**✅ 实施结论（2026-11-13）—— 不跟进 KeyIso 注册表探测，改为等价诊断**
+
+逐行核对 `watt-cert/trust.rs` 后确认：Windows 装根证书分两条路——`CertAddEncodedCertificateToStore` 直接写用户 Root，失败才 `run_elevated("certutil", ...)`；`pfx.rs` 是纯 Rust PKCS#12 解析。**两条路都不把私钥交给 CNG**，私钥始终以文件形式留在 `Certificates/` 目录参与 rustls 握手。也就是说，上游那个「KeyIso 被禁用 → 导入 PFX 失败」的故障链路在我们这里**没有对应代码路径**，复制它的注册表探测只会得到「服务正常」这个恒定答案。
+
+因此把 C1 的目标从「探测 KeyIso」改回它真正要解决的问题：**让证书失败可归因**。落地三件事：
+
+1. `TrustError::Cancelled` 新变体 —— 用户取消 UAC 与提权失败分开。前者是预期行为，不该弹红色错误，也不该引导用户去查组策略；
+2. `classify_shell_execute_error` —— 保留 `ShellExecuteExW` 的 `GetLastError`（原先被整个丢弃，导致「取消 UAC / 组策略禁止 / 安全软件拦截」三种成因在日志里长得一模一样）：`1223 → Cancelled`、`5 → 策略或会话拒绝`、`740 → 安全软件拦截`，其余保留原始码；
+3. `cert_diagnose` 命令 —— 一次性查清 `certFileExists` / `installed` / `sameCnCerts` / `elevated`，并生成可直接展示的建议列表。
+
+`sameCnCerts` 是本次最实用的产出：**旧根残留**是「证书显示装好了但浏览器仍报错」的头号成因，而它此前只能靠用户自己打开 certmgr 数。本机首次运行即查出 **2 张同名根证书**（见 §9 验证记录）。
+
 ---
 
 ### 3.9 P2-2 特权 CLI 路径校验（自查）
@@ -295,6 +316,29 @@ https://dns.google/dns-query
 3. hosts 写入路径是否只能来自 `watt_hosts::HostsManager::new()` 的系统常量。
 
 > ⚠️ 该项为**审计项而非改造项**，需在 P2 阶段出一份结论（有则修，无则记录）。
+
+**✅ 审计结论（2026-11-13）—— 无等价漏洞，但补了 3 处纵深防御**
+
+逐项核对 42 个 IPC 命令与全部写盘点：
+
+| 审计项 | 结论 |
+|---|---|
+| 上游那个 `-clt ayaneo -path` 子命令 | **不存在**。本项目无 CLI 子命令体系，`main` 只做 `tauri::Builder` 启动 |
+| `EngineStartParams`（前端启动参数） | 无任何路径字段；`hosts_path` 在 `commands/engine.rs:202` 与 `tray.rs:245` 均为 `None`，只有单测传临时目录 |
+| `cert_export_ca` | 返回 PEM **字符串**给前端，不落盘（上游对应实现是写用户指定路径） |
+| `update_install` | `endpoint` 经 `parse_endpoint` 强制 HTTPS（仅回环允许 http）；安装包由 updater 插件写入自身临时目录 |
+| `open_external` | 仅允许 `http` / `https` scheme |
+| `update_gatekeeper_script` | 只返回字符串供用户手动粘贴，不执行 |
+| `terminal_proxy` | 目标文件固定为 `~/.zshenv` / `~/.bashrc` / `~/.config/fish/config.fish` / `~/.profile`，无外部输入 |
+| `watt-elevate`（382 行） | 程序白名单 + POSIX/AppleScript 双层转义 + 复合脚本逐段校验，已有 12 个单测覆盖注入面 |
+| `scripts`（JS 注入执行面） | 生产恒为 `Vec::new()`（`commands/engine.rs:200`），当前不开放 |
+
+**结论：不存在「前端可控路径 → 管理员写盘」的等价入口。** 但审计过程发现三处值得加固的点，已一并修掉：
+
+1. **提权写入目标无白名单**（与上游漏洞同性质，只是当前调用方恰好传常量）：
+   `watt_hosts::write_file_elevated` 加 `is_system_hosts_path` 校验，只认 `/etc/hosts` 与 `/private/etc/hosts`（macOS 的 `/etc` 是软链）。校验前做**词法归一化**（消 `.` / `..` / 重复分隔符），既避免 `/etc/./hosts` 被误拒，也堵住 `/tmp/../etc/hosts` 这类字面绕过。护栏放在提权入口而非配置层——这样即使将来 hosts 路径被做成可配置项，提权也写不出系统 hosts 之外的文件。
+2. **`update_gatekeeper_script` 的引号**：原用双引号包裹 bundle 路径，而安装位置由用户决定，路径含 `"` / `$()` / 反引号时会被 shell 解释（该命令带 `sudo`）。改为单引号 + `'''` 闭合转义。
+3. **`is_elevated` 在中文 Windows 上恒为 false**（`watt-cert` 与 `watt-elevate` 各一处）：`whoami /groups` 按 OEM 代码页（GBK）输出，`String::from_utf8` 严格解码整段失败 → 把「已提权」误判成「未知/false」。改用 `from_utf8_lossy`（SID 是 ASCII，替换不影响匹配）。
 
 ---
 
@@ -426,9 +470,9 @@ start(config):
 
 ### 阶段 C：P2
 
-- [ ] **C1 KeyIso 诊断**（0.5d）—— `watt-cert/trust.rs`；注册表 + SCM 状态
-- [ ] **C2 特权 CLI 审计**（0.5d）—— `watt-elevate` / `app.manifest` / 所有接受路径参数的入口；产出审计结论
-- [ ] **C3 文档与回归**（0.5d）—— `doc/` 更新对齐说明；`cargo test --workspace` + `vue-tsc` + 三平台 CI
+- [x] **C1 证书失败归因**（0.5d）✅ —— **不做 KeyIso 注册表探测**（不走 CNG，无该故障链路）；改为 `Cancelled` 变体 + `GetLastError` 分类 + `cert_diagnose`
+- [x] **C2 特权 CLI 审计**（0.5d）✅ —— 42 个 IPC 命令无等价入口；补 3 处加固（提权目标白名单 / gatekeeper 引号 / `is_elevated` 编码）
+- [x] **C3 文档与回归**（0.5d）✅ —— `doc/` 已更新（§3.8/§3.9/§9）；`cargo test --workspace` + `vue-tsc` + `vite build` 通过；三平台 CI 待推送后验证
 
 **合计约 8.5 人日**（单人串行）。
 

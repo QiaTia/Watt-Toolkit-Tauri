@@ -165,6 +165,7 @@ pub fn run() {
             commands::cert::cert_install,
             commands::cert::cert_uninstall,
             commands::cert::cert_export_ca,
+            commands::cert::cert_diagnose,
             commands::cert::cert_regenerate,
             commands::dns::dns_probe_doh,
             commands::settings::settings_get_proxy,

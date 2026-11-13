@@ -179,6 +179,8 @@ const fr: Schema = {
     elevateCancelled: "Autorisation administrateur annulée. L'opération n'a pas été effectuée.",
     runningLockedHint: "L'accélération est en cours ; le mode proxy et les ports sont verrouillés. Arrêtez l'accélération avant de les modifier.",
     certInstalled: 'Certificat racine installé et approuvé.',
+    certDiagnose: 'Diagnostiquer',
+    certDiagnoseTitle: 'Diagnostic du magasin de confiance',
     certInstallVerifyFailed: "La commande d'installation a été exécutée mais la vérification a échoué. Vérifiez les réglages de confiance du système ou exportez le PEM pour l'installer manuellement.",
     certUninstalled: 'Confiance du certificat racine supprimée.',
     certRegenerated: "CA régénérée et ancienne confiance nettoyée. Réinstallez le certificat racine avant d'activer l'accélération HTTPS.",

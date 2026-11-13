@@ -10,6 +10,7 @@ import type {
   BuiltinPoolGroup,
   CertificateInfo,
   CertStatusDto,
+  TrustDiagnostics,
   ConnectivityTestItem,
   DohProbeDto,
   DomainPoolOverview,
@@ -75,6 +76,11 @@ export function certInstall(): Promise<boolean> {
 /** 移除根证书信任（引擎运行中被拒绝） */
 export function certUninstall(): Promise<boolean> {
   return invoke('cert_uninstall');
+}
+
+/** 信任存储诊断：查旧根残留 / 是否已导入未信任 / 提权状态 */
+export function certDiagnose(): Promise<TrustDiagnostics> {
+  return invoke('cert_diagnose');
 }
 
 export function certExportCa(): Promise<string> {

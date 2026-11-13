@@ -8,10 +8,10 @@ import { useCertStore } from '@/stores/cert';
 import { useAppStore } from '@/stores/app';
 import { useThemeStore, type ThemeMode } from '@/stores/theme';
 import { useUpdateStore, RELEASE_PAGE_URL } from '@/stores/update';
-import { dnsProbeDoh, openExternal } from '@/api';
+import { certDiagnose, dnsProbeDoh, openExternal } from '@/api';
 import { getLocale, localeOptions, setLocale, type LocaleCode } from '@/locales';
 import { isMacOS } from '@/utils/platform';
-import type { ProxyMode } from '@/types/ipc';
+import type { ProxyMode, TrustDiagnostics } from '@/types/ipc';
 
 const settings = useSettingsStore();
 const proxy = useProxyStore();
@@ -34,6 +34,11 @@ const language = computed<LocaleCode>({
 
 /** 证书操作错误（UAC 取消 / 引擎运行中等） */
 const certError = ref<string | null>(null);
+
+/** 信任存储诊断结果（点击「诊断」后出现） */
+const certDiagnostics = ref<TrustDiagnostics | null>(null);
+/** 诊断进行中 */
+const diagnosing = ref(false);
 
 /** DoH 连通性测试中（防止重复点击） */
 const dohTesting = ref(false);
@@ -230,6 +235,20 @@ async function withCertError(action: () => Promise<void>): Promise<void> {
 
 async function exportCa(): Promise<void> {
   await withCertError(() => cert.exportCa());
+}
+
+/** 信任存储诊断：旧根残留 / 已导入未信任 / 未提权，一次查清 */
+async function diagnoseCa(): Promise<void> {
+  if (diagnosing.value) return;
+  diagnosing.value = true;
+  try {
+    certDiagnostics.value = await certDiagnose();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    message.error(msg);
+  } finally {
+    diagnosing.value = false;
+  }
 }
 
 async function installCa(): Promise<void> {
@@ -569,6 +588,9 @@ function formatTime(iso: string): string {
         <a-button :loading="cert.busy" @click="exportCa">
           {{ $t('settings.exportCert') }}
         </a-button>
+        <a-button :loading="diagnosing" @click="diagnoseCa">
+          {{ $t('settings.certDiagnose') }}
+        </a-button>
         <a-popconfirm
           :title="$t('settings.regenerateConfirm')"
           :ok-text="$t('settings.okRegenerate')"
@@ -578,6 +600,22 @@ function formatTime(iso: string): string {
           <a-button danger :loading="cert.busy">{{ $t('settings.regenerate') }}</a-button>
         </a-popconfirm>
       </a-space>
+
+      <a-alert
+        v-if="certDiagnostics"
+        :type="certDiagnostics.installed ? 'success' : 'warning'"
+        show-icon
+        closable
+        class="cert-error"
+        @close="certDiagnostics = null"
+      >
+        <template #message>{{ $t('settings.certDiagnoseTitle') }}</template>
+        <template #description>
+          <ul class="diag-list">
+            <li v-for="(line, i) in certDiagnostics.advice" :key="i">{{ line }}</li>
+          </ul>
+        </template>
+      </a-alert>
 
       <a-typography-paragraph type="secondary" class="hint">
         {{ $t('settings.certHint') }}
@@ -709,6 +747,17 @@ function formatTime(iso: string): string {
   margin-bottom: 12px;
   /* 后端的失败指引是多行（含可复制的手动命令），保留换行 */
   white-space: pre-line;
+}
+
+/* 诊断结论列表：默认 ul 缩进过大且无间距，压紧以贴合卡片的行距 */
+.diag-list {
+  margin: 0;
+  padding-left: 18px;
+  white-space: normal;
+}
+
+.diag-list li + li {
+  margin-top: 4px;
 }
 
 .hint {

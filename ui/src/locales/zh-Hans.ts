@@ -166,6 +166,8 @@ const zhHans = {
     elevateCancelled: '已取消管理员授权，操作未完成。',
     runningLockedHint: '加速运行中，代理模式与端口等设置已锁定；请先停止加速再修改。',
     certInstalled: '根证书已安装并受信任。',
+    certDiagnose: '诊断',
+    certDiagnoseTitle: '信任存储诊断',
     certInstallVerifyFailed: '根证书安装命令已执行，但校验未通过。请检查系统信任设置，或导出 PEM 手动安装。',
     certUninstalled: '根证书信任已移除。',
     certRegenerated: 'CA 已重新生成，旧信任已清理；请重新安装根证书后再启用 HTTPS 加速。',

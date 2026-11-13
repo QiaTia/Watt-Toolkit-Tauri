@@ -172,6 +172,8 @@ const ja: Schema = {
     elevateCancelled: '管理者の承認がキャンセルされました。操作は完了していません。',
     runningLockedHint: '加速の実行中はプロキシモードとポートがロックされています。加速を停止してから変更してください。',
     certInstalled: 'ルート証明書をインストールし、信頼しました。',
+    certDiagnose: '診断',
+    certDiagnoseTitle: 'トラストストアの診断',
     certInstallVerifyFailed: 'インストールコマンドは実行されましたが、検証に失敗しました。システムの信頼設定を確認するか、PEM をエクスポートして手動でインストールしてください。',
     certUninstalled: 'ルート証明書の信頼を削除しました。',
     certRegenerated: 'CA を再生成し、古い信頼を削除しました。HTTPS 加速を有効にする前にルート証明書を再インストールしてください。',

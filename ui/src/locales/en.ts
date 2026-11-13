@@ -175,6 +175,8 @@ const en: Schema = {
     elevateCancelled: 'Administrator authorization was cancelled. The operation was not completed.',
     runningLockedHint: 'Acceleration is running; proxy mode and ports are locked. Stop acceleration before changing them.',
     certInstalled: 'Root certificate installed and trusted.',
+    certDiagnose: 'Diagnose',
+    certDiagnoseTitle: 'Trust store diagnostics',
     certInstallVerifyFailed: 'The install command ran but verification failed. Check the system trust settings or export the PEM and install it manually.',
     certUninstalled: 'Root certificate trust removed.',
     certRegenerated: 'CA regenerated and old trust cleaned up. Reinstall the root certificate before enabling HTTPS acceleration.',

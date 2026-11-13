@@ -2,11 +2,13 @@
 //! 对齐原 CertificateManagerImpl / CertService。
 
 pub mod ca;
+pub mod diagnose;
 pub mod leaf;
 pub mod pfx;
 pub mod trust;
 
 pub use ca::{CaCertificate, CaError, CA_VALID_DAYS};
+pub use diagnose::{diagnose, TrustDiagnostics};
 pub use leaf::{LeafCertCache, LeafCertError};
 pub use pfx::{import_pfx, PfxError};
 

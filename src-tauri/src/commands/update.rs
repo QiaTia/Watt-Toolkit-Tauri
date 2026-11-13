@@ -388,6 +388,15 @@ pub fn open_external(url: String) -> Result<(), String> {
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
+/// 把任意路径安全嵌进「用户粘贴到终端」的 POSIX 命令。
+///
+/// 不能用双引号：`"` 内的 `$`、反引号、`\` 仍会被展开，而应用安装路径由用户
+/// 决定（可含空格、引号、`$(...)`）。单引号内一切都是字面量，只需闭合转义。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn posix_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 /// macOS Gatekeeper 绕过脚本：清除 .app 的隔离扩展属性（quarantine）。
 ///
 /// 未签名 / 未公证的应用经自动更新替换后，首次打开可能被 Gatekeeper 拦截
@@ -412,7 +421,9 @@ pub fn update_gatekeeper_script() -> Result<String, String> {
             }
         };
         let path = bundle.to_string_lossy();
-        Ok(format!("sudo xattr -cr \"{path}\""))
+        // 该命令由用户手动粘贴执行（带 sudo），路径必须按 shell 字面量处理：
+        // 安装位置在用户手里，含 `"` 或 `$()` 时双引号包裹会变成命令执行。
+        Ok(format!("sudo xattr -cr {}", posix_quote(&path)))
     }
     #[cfg(not(target_os = "macos"))]
     {

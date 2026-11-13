@@ -74,11 +74,13 @@ pub fn is_elevated() -> bool {
     {
         // 无额外依赖方案：查询当前进程令牌的完整性等级。
         // 高完整性（S-1-16-12288）或 System（S-1-16-16384）即视为已提权。
+        // 中文 Windows 的 whoami 输出为 OEM 代码页（非 UTF-8），严格解码会失败
+        // 并把「已提权」误判为 false；SID 是 ASCII，lossy 不影响匹配。
         Command::new("whoami")
             .arg("/groups")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .map(|s| s.contains("S-1-16-12288") || s.contains("S-1-16-16384"))
             .unwrap_or(false)
     }

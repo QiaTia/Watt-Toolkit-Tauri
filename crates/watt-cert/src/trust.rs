@@ -18,6 +18,53 @@ pub enum TrustError {
     Trust(String),
     #[error("需要管理员权限且提权被拒绝/失败: {0}")]
     Elevation(String),
+    /// 用户在系统授权弹窗中主动取消（UAC / 钥匙串）。
+    ///
+    /// 与 [`TrustError::Elevation`] 分开的原因：用户取消是**预期行为**，
+    /// UI 不该按「安装失败」弹红色错误，也不该引导用户去查组策略。
+    #[error("用户取消了管理员授权")]
+    Cancelled,
+}
+
+impl TrustError {
+    /// 结构化分类（供 IPC 层透传给前端做差异化提示）
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Trust(_) => "trust",
+            Self::Elevation(_) => "elevation",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// 是否为用户主动取消（不应当作错误上报）
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+/// 把 `ShellExecuteExW(runas)` 的 `GetLastError` 映射成可区分的错误。
+///
+/// 用字面 Win32 码而不引 `windows_sys` 常量，使本函数可在任意平台单测
+/// （码值取自 `WinError.h`，不会随 crate 版本漂移）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn classify_shell_execute_error(code: u32) -> TrustError {
+    match code {
+        // ERROR_CANCELLED：用户在 UAC 弹窗点了「否」
+        1223 => TrustError::Cancelled,
+        // ERROR_ACCESS_DENIED：提权请求被策略/会话拒绝（组策略禁用 UAC 提权、
+        // 服务或非交互会话中调用等）。这不是「用户取消」，重试也不会成功。
+        5 => TrustError::Elevation(
+            "系统拒绝提权请求（ERROR_ACCESS_DENIED）。组策略可能已关闭提权，或当前处于非交互会话；请手动安装证书".into(),
+        ),
+        // ERROR_ELEVATION_REQUIRED：系统要求提权但未能完成（常见于安全软件拦截）
+        740 => TrustError::Elevation(
+            "无法完成提权（ERROR_ELEVATION_REQUIRED）。可能被杀毒软件或 EDR 拦截，请手动安装证书".into(),
+        ),
+        other => TrustError::Elevation(format!(
+            "ShellExecuteExW(runas) 失败，Win32 错误码 {other}"
+        )),
+    }
 }
 
 /// CA 主题 CN（仅用于展示/手动排查；删除一律按证书指纹/ DER 精确匹配）
@@ -128,7 +175,7 @@ fn manual_install_hint(cert_path: &str, cause: &str) -> String {
 
 #[cfg(target_os = "windows")]
 pub mod platform {
-    use super::{sha1_hex, TrustError};
+    use super::{classify_shell_execute_error, sha1_hex, TrustError};
     use std::path::Path;
 
     fn load_der_from_pem(cert_pem_path: &Path) -> Result<Vec<u8>, TrustError> {
@@ -269,9 +316,10 @@ pub mod platform {
             info.nShow = SW_HIDE;
 
             if ShellExecuteExW(&mut info) == 0 {
-                return Err(TrustError::Elevation(
-                    "ShellExecuteExW(runas) 失败（用户取消 UAC 或策略禁止）".into(),
-                ));
+                // 提权失败的三种成因在用户侧处置完全不同，必须靠 GetLastError 区分：
+                // 丢掉错误码就只能笼统说「失败」，用户不知道该重试还是找管理员。
+                let code = windows_sys::Win32::Foundation::GetLastError();
+                return Err(classify_shell_execute_error(code));
             }
             if info.hProcess.is_null() {
                 return Ok(()); // 未返回进程句柄（罕见），按已提交处理
@@ -408,6 +456,71 @@ pub mod platform {
             ));
         }
         Ok(())
+    }
+
+    /// Root 存储中主题简单名包含 `cn` 的证书数量（用户 + 机器）
+    ///
+    /// 用于发现「重新生成 CA 后旧根残留」：旧根仍在信任库时浏览器可能继续信任
+    /// 旧 CA，而引擎已换新 CA —— 表现为随机证书错误，用户几乎无法自查。
+    /// 返回 None 表示存储打不开（无法判断，不能当成 0）。
+    pub fn count_root_certs_with_cn(cn: &str) -> Option<usize> {
+        use windows_sys::Win32::Security::Cryptography::{
+            CertCloseStore, CertEnumCertificatesInStore, CertGetNameStringW, CERT_CONTEXT,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        };
+        let mut count = 0usize;
+        let mut opened = false;
+        // SAFETY: 句柄在函数内关闭；CertEnum 每次调用释放上一个 context
+        unsafe {
+            for machine in [false, true] {
+                let store = open_root_store(machine);
+                if store.is_null() {
+                    continue;
+                }
+                opened = true;
+                let mut ctx: *mut CERT_CONTEXT = std::ptr::null_mut();
+                loop {
+                    ctx = CertEnumCertificatesInStore(store, ctx);
+                    if ctx.is_null() {
+                        break;
+                    }
+                    let mut buf = [0u16; 512];
+                    let len = CertGetNameStringW(
+                        ctx,
+                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                        0,
+                        std::ptr::null(),
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    );
+                    // 返回值含结尾 NUL；0 表示失败，1 表示空串
+                    if len > 1 {
+                        let name = String::from_utf16_lossy(&buf[..len as usize - 1]);
+                        if name.contains(cn) {
+                            count += 1;
+                        }
+                    }
+                }
+                CertCloseStore(store, 0);
+            }
+        }
+        opened.then_some(count)
+    }
+
+    /// 当前进程是否具备管理员权限
+    ///
+    /// 应用清单声明了 requireAdministrator，正常启动必为 true；false 说明被以
+    /// asInvoker 拉起（受限终端 / 调试器 / 计划任务），此时写 Root 存储会失败。
+    pub fn is_elevated() -> Option<bool> {
+        // 必须用 from_utf8_lossy：中文 Windows 的 whoami 按 OEM 代码页（GBK）输出，
+        // 严格 UTF-8 解码会整段失败 → 把「已提权」误判成「未知」。
+        // SID 本身是 ASCII，lossy 替换不会破坏匹配。
+        std::process::Command::new("whoami")
+            .arg("/groups")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .map(|s| s.contains("S-1-16-12288") || s.contains("S-1-16-16384"))
     }
 
     /// 检查根证书是否已安装（用户或机器 Root 存储中存在同 DER 证书）
@@ -580,9 +693,7 @@ pub mod platform {
                     notes.join(" / ")
                 ),
             ))),
-            Err(watt_elevate::ElevateError::Cancelled) => {
-                Err(TrustError::Elevation("用户取消了管理员授权".into()))
-            }
+            Err(watt_elevate::ElevateError::Cancelled) => Err(TrustError::Cancelled),
             Err(e) => {
                 let cause = format!("{}；提权重试失败: {e}", notes.join(" / "));
                 if is_no_interaction_error(&cause) {
@@ -634,9 +745,7 @@ pub mod platform {
             Some(watt_elevate::ElevatePurpose::RemoveCert.prompt()),
         ) {
             Ok(_) => Ok(()),
-            Err(watt_elevate::ElevateError::Cancelled) => {
-                Err(TrustError::Elevation("用户取消了管理员授权".into()))
-            }
+            Err(watt_elevate::ElevateError::Cancelled) => Err(TrustError::Cancelled),
             Err(e) => Err(TrustError::Elevation(format!("删除根证书失败: {e}"))),
         }
     }
@@ -765,6 +874,31 @@ pub mod platform {
         }
     }
 
+    /// 用户 + 系统钥匙串中 CN 匹配 `cn` 的证书数量（PEM 块计数）
+    ///
+    /// 用 `-p` 输出 PEM 而非解析 `find-certificate` 的文本摘要：摘要格式随
+    /// macOS 版本变化，PEM 块计数稳定。返回 None 表示两条命令都失败。
+    pub fn count_root_certs_with_cn(cn: &str) -> Option<usize> {
+        let user = user_keychain();
+        let mut total = 0usize;
+        let mut ok = false;
+        for kc in [user.as_str(), SYSTEM_KEYCHAIN] {
+            if let Ok(out) = security_output(&["find-certificate", "-a", "-c", cn, "-p", kc]) {
+                if out.status.success() {
+                    ok = true;
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    total += text.matches("-----BEGIN CERTIFICATE-----").count();
+                }
+            }
+        }
+        ok.then_some(total)
+    }
+
+    /// 当前进程是否以 root 运行
+    pub fn is_elevated() -> Option<bool> {
+        Some(watt_elevate::is_elevated())
+    }
+
     /// 检查根证书是否已安装**且处于信任状态**
     ///
     /// 两个条件都满足才算：
@@ -837,6 +971,22 @@ pub mod platform {
         } else {
             Err(TrustError::Trust("update-ca-certificates 失败".into()))
         }
+    }
+
+    /// Linux 无多证书存储：CA 目录只是单一文件，不存在「同名旧根残留」
+    pub fn count_root_certs_with_cn(_cn: &str) -> Option<usize> {
+        None
+    }
+
+    /// 是否以 root 运行（读 /proc/self/status 的 Uid，免引入 libc）
+    pub fn is_elevated() -> Option<bool> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let uid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse::<u32>().ok())?;
+        Some(uid == 0)
     }
 
     /// 检查根证书是否已安装（目标文件内容一致）
@@ -973,5 +1123,36 @@ mod tests {
         assert!(hint.contains("sudo security add-trusted-cert -d -r trustRoot"));
         assert!(hint.contains("钥匙串访问"));
         assert!(hint.contains("始终信任"));
+    }
+
+    /// UAC 取消必须与「提权失败」区分：前者是预期行为，不该报错
+    #[test]
+    fn shell_execute_cancel_is_not_error() {
+        let err = classify_shell_execute_error(1223);
+        assert!(matches!(err, TrustError::Cancelled));
+        assert!(err.is_cancelled());
+        assert_eq!(err.code(), "cancelled");
+        // 展示文案不能出现「失败」，否则 UI 会把它当故障
+        assert!(!err.to_string().contains("失败"));
+    }
+
+    /// 策略拒绝不能伪装成「用户取消」——用户重试永远没用，必须给出手动路径
+    #[test]
+    fn shell_execute_policy_denied_is_actionable() {
+        for code in [5u32, 740] {
+            let err = classify_shell_execute_error(code);
+            assert!(!err.is_cancelled(), "code {code} 不应被判为用户取消");
+            assert_eq!(err.code(), "elevation");
+            let msg = err.to_string();
+            assert!(msg.contains("手动安装证书"), "code {code}: {msg}");
+        }
+    }
+
+    #[test]
+    fn shell_execute_unknown_code_keeps_raw_code() {
+        let err = classify_shell_execute_error(87);
+        let msg = err.to_string();
+        assert!(msg.contains("87"), "必须保留原始错误码便于排查: {msg}");
+        assert!(!err.is_cancelled());
     }
 }

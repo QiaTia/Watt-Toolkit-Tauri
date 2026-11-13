@@ -65,6 +65,18 @@ export interface CertStatusDto {
   warning?: string;
 }
 
+/** 信任存储诊断结果（cert_diagnose，camelCase） */
+export interface TrustDiagnostics {
+  certFileExists: boolean;
+  installed: boolean;
+  /** 信任存储中同 CN 的证书数量（>1 表示旧根残留） */
+  sameCnCerts: number | null;
+  /** 当前进程是否已提权（null = 该平台无此概念） */
+  elevated: boolean | null;
+  /** 结论与建议，可直接展示 */
+  advice: string[];
+}
+
 /** 证书详细信息（watt-cert，snake_case） */
 export interface CertificateInfo {
   subject: string;

@@ -164,6 +164,8 @@ const zhHant: Schema = {
     elevateCancelled: '已取消管理員授權，操作未完成。',
     runningLockedHint: '加速執行中，代理模式與連接埠等設定已鎖定；請先停止加速再修改。',
     certInstalled: '根憑證已安裝並受信任。',
+    certDiagnose: '診斷',
+    certDiagnoseTitle: '信任儲存診斷',
     certInstallVerifyFailed: '根憑證安裝命令已執行，但驗證未通過。請檢查系統信任設定，或匯出 PEM 手動安裝。',
     certUninstalled: '根憑證信任已移除。',
     certRegenerated: 'CA 已重新產生，舊信任已清理；請重新安裝根憑證後再啟用 HTTPS 加速。',

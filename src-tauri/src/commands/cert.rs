@@ -70,6 +70,20 @@ pub async fn cert_get_status(state: tauri::State<'_, AppState>) -> Result<CertSt
     Ok(to_status(&ca, installed))
 }
 
+/// 信任存储诊断：「装不上 / 装了不生效」时的一次性自查
+///
+/// 平台侧要 spawn `security`/`whoami`，必须离开 tokio worker。
+/// 诊断只读取状态，不写入任何内容，可随时点击。
+#[tauri::command]
+pub async fn cert_diagnose(
+    state: tauri::State<'_, AppState>,
+) -> Result<watt_cert::TrustDiagnostics, String> {
+    let path = ca_cert_file(&state);
+    tokio::task::spawn_blocking(move || watt_cert::diagnose(&path))
+        .await
+        .map_err(|e| format!("诊断任务异常: {e}"))
+}
+
 /// 导出 CA 证书 PEM（供用户手动安装到系统信任存储）
 #[tauri::command]
 pub async fn cert_export_ca(state: tauri::State<'_, AppState>) -> Result<String, String> {
