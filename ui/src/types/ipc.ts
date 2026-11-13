@@ -65,6 +65,34 @@ export interface CertStatusDto {
   warning?: string;
 }
 
+/** 社区 GitHub Hosts 源设置（community_hosts_*，camelCase） */
+export interface CommunityHostsSettings {
+  enabled: boolean;
+  url: string;
+  /** 拉取间隔（小时）；0 = 仅手动 */
+  intervalHours: number;
+  /** 上次成功拉取时刻（unix 毫秒）；0 = 从未成功 */
+  lastFetchMs: number;
+  /** 上次失败原因（成功时清空） */
+  lastError: string | null;
+}
+
+/** 一次拉取的结果（community_hosts_refresh） */
+export interface CommunityHostsFetchOutcome {
+  source: string;
+  fetchedAtMs: number;
+  /** 源里的条目总数 */
+  entries: number;
+  /** 过滤保留地址/非法域名后剩余 */
+  usable: number;
+  /** 本地 TLS 探测通过的条数 */
+  probedOk: number;
+  /** 写入池的域名数 */
+  hostsTouched: number;
+  /** 写入池的 IP 数 */
+  ipsMerged: number;
+}
+
 /** 信任存储诊断结果（cert_diagnose，camelCase） */
 export interface TrustDiagnostics {
   certFileExists: boolean;

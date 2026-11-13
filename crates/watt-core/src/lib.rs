@@ -8,6 +8,7 @@
 //! - 8868：SOCKS5 入站
 
 pub mod connect_test;
+pub mod community_hosts;
 pub mod engine;
 pub mod access_log;
 pub mod fallback;

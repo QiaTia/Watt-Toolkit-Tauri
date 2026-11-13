@@ -155,6 +155,41 @@ pub fn set_entry(host: &str, ips: Vec<IpAddr>) {
     }
 }
 
+/// 追加某域名的**动态** IP（并集，不覆盖已有候选）。
+///
+/// 与 [`set_entry`] 的区别：`set_entry` 是「本次刷新的权威结果」，会整体替换；
+/// 本函数用于**额外候选来源**（社区 hosts 源等），只补不删——否则社区 IP 与
+/// DNS 刷新会互相清空对方的结果。手工 IP 始终保留。
+///
+/// `max_ips` 为动态部分上限：超出时**保留先到的**（调用方应按质量排序后传入）。
+pub fn add_dynamic_ips(host: &str, ips: &[IpAddr], max_ips: usize) {
+    if ips.is_empty() || max_ips == 0 {
+        return;
+    }
+    let host = normalize(host);
+    let mut map = pool().write().unwrap();
+    let entry = map.entry(host).or_insert_with(|| PoolEntry {
+        ips: Vec::new(),
+        manual_ips: Vec::new(),
+        refreshed_at_ms: now_ms(),
+    });
+    let mut added = false;
+    for ip in ips {
+        if entry.ips.len() >= max_ips {
+            break;
+        }
+        // 手工 IP 已在生效列表里，不必重复占位
+        if entry.ips.contains(ip) || entry.manual_ips.contains(ip) {
+            continue;
+        }
+        entry.ips.push(*ip);
+        added = true;
+    }
+    if added {
+        entry.refreshed_at_ms = now_ms();
+    }
+}
+
 /// 写入/替换某域名的**手工** IP（管理页保存入口；动态部分保留）
 pub fn set_manual_entry(host: &str, ips: Vec<IpAddr>) {
     let host = normalize(host);

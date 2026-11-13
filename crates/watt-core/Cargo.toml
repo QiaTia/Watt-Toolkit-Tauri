@@ -36,6 +36,9 @@ watt-script = { workspace = true }
 
 rustls-native-certs = "0.7"
 urlencoding = { workspace = true }
+# 社区 hosts 源拉取：复用 watt-cloud 的 rustls-no-provider 组合，避免引入第二个
+# crypto provider（aws-lc-rs）造成 rustls 全局 provider 歧义。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", features = [

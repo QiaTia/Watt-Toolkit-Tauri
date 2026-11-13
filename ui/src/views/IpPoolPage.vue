@@ -3,9 +3,20 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import AntApp from 'ant-design-vue/es/app';
 import dayjs from 'dayjs';
-import { ipPoolBuiltinList, ipPoolDomainOverview } from '@/api';
+import {
+  communityHostsGetSettings,
+  communityHostsRefresh,
+  communityHostsSaveSettings,
+  ipPoolBuiltinList,
+  ipPoolDomainOverview,
+} from '@/api';
 import { useIpPoolStore } from '@/stores/ipPool';
-import type { BuiltinPoolGroup, DomainPoolOverview, IpPoolDomain } from '@/types/ipc';
+import type {
+  BuiltinPoolGroup,
+  CommunityHostsSettings,
+  DomainPoolOverview,
+  IpPoolDomain,
+} from '@/types/ipc';
 
 const { t } = useI18n();
 const pool = useIpPoolStore();
@@ -93,10 +104,82 @@ async function loadOverview(): Promise<void> {
   }
 }
 
+/* ===================== 社区 GitHub Hosts 源 ===================== */
+
+/** 后端状态（含 lastFetchMs / lastError，由后端维护） */
+const community = ref<CommunityHostsSettings | null>(null);
+/** 表单：只有点「保存」才写回后端，避免输入过程频繁落盘 */
+const communityForm = ref({ enabled: true, url: '', intervalHours: 24 });
+const communitySaving = ref(false);
+const communityRefreshing = ref(false);
+
+const communityLastText = computed(() => {
+  const ms = community.value?.lastFetchMs ?? 0;
+  return ms > 0
+    ? t('pool.communityLast', { time: dayjs(ms).format('YYYY-MM-DD HH:mm') })
+    : t('pool.communityNever');
+});
+
+async function loadCommunity(): Promise<void> {
+  try {
+    const s = await communityHostsGetSettings();
+    community.value = s;
+    communityForm.value = {
+      enabled: s.enabled,
+      url: s.url,
+      intervalHours: s.intervalHours,
+    };
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function saveCommunity(): Promise<void> {
+  if (communitySaving.value) return;
+  communitySaving.value = true;
+  try {
+    community.value = await communityHostsSaveSettings({
+      enabled: communityForm.value.enabled,
+      url: communityForm.value.url,
+      // a-input-number 清空时是 null，后端要 u64
+      intervalHours: Number(communityForm.value.intervalHours ?? 0),
+    });
+    message.success(t('pool.communitySaved'));
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  } finally {
+    communitySaving.value = false;
+  }
+}
+
+async function refreshCommunity(): Promise<void> {
+  if (communityRefreshing.value) return;
+  communityRefreshing.value = true;
+  try {
+    const o = await communityHostsRefresh();
+    message.success(
+      t('pool.communityDone', {
+        ips: o.ipsMerged,
+        hosts: o.hostsTouched,
+        total: o.entries,
+      }),
+    );
+    // 新域名会出现在池里，两个视图都要重载
+    await Promise.all([loadCommunity(), pool.load()]);
+  } catch (e) {
+    // 后端已把失败原因写进 lastError，重新拉设置即可展示，不额外弹错
+    message.error(t('pool.communityFailed', { error: e instanceof Error ? e.message : String(e) }));
+    await loadCommunity();
+  } finally {
+    communityRefreshing.value = false;
+  }
+}
+
 onMounted(() => {
   void pool.load();
   void loadOverview();
   void loadBuiltin();
+  void loadCommunity();
 });
 
 // 动态池变化（刷新/保存/删除）后「来源」列会变，总览需同步重算。
@@ -522,6 +605,70 @@ async function submitEditor(): Promise<void> {
       </a-table>
     </a-card>
 
+    <!-- 社区维护的 GitHub Hosts 源：定期并入备选池 -->
+    <a-card :bordered="false" class="panel">
+      <div class="pool-head">
+        <div class="pool-summary">
+          <span class="pool-count">{{ $t('pool.communityTitle') }}</span>
+          <a-typography-text type="secondary" class="pool-sub">
+            {{ $t('pool.communitySub') }}
+          </a-typography-text>
+        </div>
+        <a-tag :color="communityForm.enabled ? 'success' : 'default'">
+          {{ communityForm.enabled ? $t('pool.communityEnabled') : $t('pool.communityDisabled') }}
+        </a-tag>
+      </div>
+
+      <a-form layout="vertical">
+        <a-row :gutter="16">
+          <a-col :xs="24" :md="6">
+            <a-form-item :label="$t('pool.communityEnable')">
+              <a-switch v-model:checked="communityForm.enabled" />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="24" :md="12">
+            <a-form-item :label="$t('pool.communityUrl')">
+              <a-input
+                v-model:value="communityForm.url"
+                placeholder="https://hosts.gitcdn.top/hosts.json"
+                allow-clear
+              />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="24" :md="6">
+            <a-form-item :label="$t('pool.communityInterval')">
+              <a-input-number
+                v-model:value="communityForm.intervalHours"
+                :min="0"
+                :max="720"
+                class="w-full"
+              />
+            </a-form-item>
+          </a-col>
+        </a-row>
+      </a-form>
+
+      <a-space :size="12" wrap>
+        <a-button type="primary" :loading="communitySaving" @click="saveCommunity">
+          {{ $t('pool.communitySave') }}
+        </a-button>
+        <a-button :loading="communityRefreshing" @click="refreshCommunity">
+          {{ $t('pool.communityRefresh') }}
+        </a-button>
+        <span class="refreshed">{{ communityLastText }}</span>
+      </a-space>
+
+      <a-alert v-if="community?.lastError" type="warning" show-icon class="community-error">
+        <template #message>
+          {{ $t('pool.communityLastError', { error: community.lastError }) }}
+        </template>
+      </a-alert>
+
+      <a-typography-paragraph type="secondary" class="pool-hint">
+        {{ $t('pool.communityHint') }}
+      </a-typography-paragraph>
+    </a-card>
+
     <a-modal
       v-model:open="editorOpen"
       :title="editorTitle"
@@ -612,6 +759,11 @@ async function submitEditor(): Promise<void> {
 .refreshed {
   font-size: 12px;
   color: var(--text-secondary, rgba(0, 0, 0, 0.45));
+}
+
+/* 社区源失败提示：与上方按钮组拉开距离，避免贴在状态文字上 */
+.community-error {
+  margin-top: 12px;
 }
 
 .ips {

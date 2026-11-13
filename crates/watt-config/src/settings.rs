@@ -220,6 +220,42 @@ impl Default for UpdateSettings {
     }
 }
 
+/// 社区维护的 GitHub Hosts 源设置：`{AppData}/Settings/CommunityHosts.json`
+///
+/// 单独成文件的原因同 [`UpdateSettings`]：它只由 IP 池页的卡片写入，与代理配置
+/// 的整对象保存互不覆盖。`last_*` 字段由后台拉取任务写回，供 UI 展示与「是否到期」
+/// 判断——不用文件 mtime，因为备份还原会篡改 mtime 导致误判。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CommunityHostsSettings {
+    /// 启用定期拉取
+    pub enabled: bool,
+    /// 源地址（默认社区维护的 hosts.json）
+    pub url: String,
+    /// 拉取间隔（小时）；0 = 只在手动点击时拉取
+    pub interval_hours: u64,
+    /// 上次**成功**拉取的时刻（unix 毫秒）；0 = 从未成功
+    pub last_fetch_ms: u64,
+    /// 上次失败原因（成功时清空）。
+    ///
+    /// 只存错误原文、不存「更新成功」这类展示文案：文案由前端按语言渲染，
+    /// 否则多语言界面里会混进一段固定中文。
+    pub last_error: Option<String>,
+}
+
+impl Default for CommunityHostsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: crate::constants::DEFAULT_COMMUNITY_HOSTS_URL.to_string(),
+            // 24h：社区源一天更新数次，更频繁只会增加探测开销
+            interval_hours: 24,
+            last_fetch_ms: 0,
+            last_error: None,
+        }
+    }
+}
+
 impl Default for ProxySettings {
     fn default() -> Self {
         Self {
@@ -298,6 +334,28 @@ pub fn load_update_settings_in(dir: &Path) -> Result<UpdateSettings, SettingsErr
     let content = std::fs::read_to_string(path)?;
     let settings: UpdateSettings = serde_json::from_str(&content)?;
     Ok(settings)
+}
+
+/// 读取社区源设置（文件不存在时返回默认值）
+pub fn load_community_hosts_settings_in(dir: &Path) -> Result<CommunityHostsSettings, SettingsError> {
+    let path = dir.join("CommunityHosts.json");
+    if !path.exists() {
+        return Ok(CommunityHostsSettings::default());
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// 保存社区源设置（原子替换）
+pub fn save_community_hosts_settings_in(
+    dir: &Path,
+    settings: &CommunityHostsSettings,
+) -> Result<(), SettingsError> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("CommunityHosts.json");
+    let content = serde_json::to_string_pretty(settings)?;
+    write_atomic(&path, content.as_bytes())?;
+    Ok(())
 }
 
 /// 保存更新设置到指定目录（原子替换）

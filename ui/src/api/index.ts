@@ -10,6 +10,8 @@ import type {
   BuiltinPoolGroup,
   CertificateInfo,
   CertStatusDto,
+  CommunityHostsFetchOutcome,
+  CommunityHostsSettings,
   TrustDiagnostics,
   ConnectivityTestItem,
   DohProbeDto,
@@ -55,6 +57,26 @@ export function engineGetStats(): Promise<FlowStatsDto> {
 
 export function engineProbeSummary(): Promise<ProbeSummaryDto | null> {
   return invoke('engine_probe_summary');
+}
+
+/* 社区 GitHub Hosts 源 */
+
+export function communityHostsGetSettings(): Promise<CommunityHostsSettings> {
+  return invoke('community_hosts_get_settings');
+}
+
+/** 保存设置（lastFetchMs / lastError 由后端维护，不在此提交） */
+export function communityHostsSaveSettings(form: {
+  enabled: boolean;
+  url: string;
+  intervalHours: number;
+}): Promise<CommunityHostsSettings> {
+  return invoke('community_hosts_save_settings', { form });
+}
+
+/** 立即拉取并并入池（需网络，约数秒） */
+export function communityHostsRefresh(): Promise<CommunityHostsFetchOutcome> {
+  return invoke('community_hosts_refresh');
 }
 
 /* 证书 */

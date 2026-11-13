@@ -93,6 +93,13 @@ pub fn run() {
             // 动态 IP 池热启动：加载上次刷新的结果（供引擎出站候选直接使用）
             watt_core::ip_pool::load_from(&data_dir.join("Settings").join("IpPool.json"));
 
+            // 社区维护的 GitHub Hosts 源：后台定期并入备选池。
+            // 每 30 分钟判断一次是否到期（不常驻 sleep 到点），失败退避 1 小时；
+            // 拉取失败不阻断启动，池里原有的候选照常可用。
+            tauri::async_runtime::spawn(commands::community_hosts::spawn_refresh_loop(
+                data_dir.clone(),
+            ));
+
             // CA 加载或生成
             let cert_dir = data_dir.join("Certificates");
             let ca = Arc::new(
@@ -166,6 +173,9 @@ pub fn run() {
             commands::cert::cert_uninstall,
             commands::cert::cert_export_ca,
             commands::cert::cert_diagnose,
+            commands::community_hosts::community_hosts_get_settings,
+            commands::community_hosts::community_hosts_save_settings,
+            commands::community_hosts::community_hosts_refresh,
             commands::cert::cert_regenerate,
             commands::dns::dns_probe_doh,
             commands::settings::settings_get_proxy,

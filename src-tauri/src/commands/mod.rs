@@ -3,6 +3,7 @@
 pub mod accelerate;
 pub mod app_info;
 pub mod cert;
+pub mod community_hosts;
 pub mod dns;
 pub mod engine;
 pub mod ip_pool;
