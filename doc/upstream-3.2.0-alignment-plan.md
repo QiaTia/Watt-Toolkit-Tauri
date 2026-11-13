@@ -49,6 +49,24 @@
     `write_file_elevated` 里逐次校验，即使将来 hosts 路径可配置也绕不过去；
     上游的做法是删掉那个子命令，属于「移除能力」，我们是「保留能力 + 锁死目标」。
 
+### 9.1 代码审阅修复（推送前，2026-11-13）
+
+P0–P2 落地后对整批未推送改动做了一次审阅，发现 8 处问题，全部已修：
+
+| # | 问题 | 严重度 | 修法 | 验证 |
+|---|---|---|---|---|
+| 1 | 「刷新 IP 池」用 `set_entry` 整体替换，会清空社区源候选 | P1 | `refresh_one` 探测前并入池内**动态** IP，统一按实测裁决 | `diag_refresh_keeps_existing_pool_ips`（实测 candidates=2） |
+| 2 | 拉取期间改设置被旧快照整体回写覆盖 | P1 | `record_fetch_result` 保存前重读，只改 `last_fetch_ms`/`last_error` | `record_result_keeps_user_edits` |
+| 3 | DNS 串行回退无总预算（最坏 15–24s） | P1 | `TOTAL_LOOKUP_BUDGET = 6s` + `min(remaining)` 截断单项超时 | `test_server_list_falls_back_on_timeout` |
+| 4 | Windows hosts 路径取自 `SystemRoot` 环境变量，无校验 | P2 | `is_valid_system_root` 只认 `<盘符>:\Windows` | `system_root_shape_is_strict` |
+| 5 | `backend()` 是「列表首项」，回退后来源标注失真 | P2 | 新增 `last_hit`/`hit_server`/`hit_backend`/`effective_backend`，展示层改用实际命中 | `test_hit_is_unknown_before_first_lookup` + 回退用例断言 `effective_backend != backend` |
+| 6 | 重定向可把 https 降级成 http | P2 | `ensure_transport_secure(resp.url())`，仅回环允许 http | `rejects_plaintext_redirect_targets` |
+| 7 | chunked 响应绕过 512KB 上限 | P2 | `resp.chunk()` 流式累加，超限即断 | `rejects_oversized_chunked_body`（本地 chunked 服务发 1.5MB） |
+| 8 | 手动与后台拉取可并发（2×40 次 TLS 握手） | P2 | 全局 `REFRESH_GATE`；后台在闸门内再判到期 | `refresh_gate_is_exclusive`、`refresh_if_due_skips_when_not_due` |
+
+其中 #5 的语义约定：`backend()` 只表示「首选（构建期结论）」，运行时来源一律用
+`effective_backend()`。两者在回退时必然不同——回退恰恰是常态，不能拿首项冒充。
+
 ---
 
 ## 0. 结论先行

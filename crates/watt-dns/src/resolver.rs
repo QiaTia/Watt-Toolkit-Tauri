@@ -6,6 +6,7 @@ use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -236,10 +237,10 @@ pub enum DnsError {
     Resolve(String),
 }
 
-/// 实际生效的主后端（列表首项）。
+/// 某台服务器对应的后端标识。
 ///
-/// DoH 配置失效（地址非法、引导解析失败等）时列表首项不再是 DoH，
-/// UI 不能再按「用户勾了 DoH」就宣称正在使用加密 DNS。
+/// 注意它描述的是**配置形态**，不代表运行时是否真的在用——后者见
+/// [`DnsResolver::hit_backend`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsBackend {
     /// 系统默认 DNS
@@ -260,6 +261,18 @@ struct Entry {
     clean: TokioResolver,
 }
 
+/// 单服务器的后端标识（构建期结论，不代表运行时命中）
+fn backend_of(spec: &ResolverServer) -> DnsBackend {
+    match spec {
+        ResolverServer::Doh(url) => DnsBackend::Doh(url.clone()),
+        ResolverServer::Udp(ip) => DnsBackend::Udp(ip.to_string()),
+        ResolverServer::SystemDefault => DnsBackend::System,
+    }
+}
+
+/// 尚无命中记录的哨兵下标（`entries.get()` 对超大值返回 None）
+const NO_HIT: usize = usize::MAX;
+
 /// DNS 解析器：按**有序服务器列表**逐个尝试，首个返回结果者生效。
 ///
 /// 每个服务器各自持有一个 hickory 解析器实例，缓存天然按服务器隔离——
@@ -271,6 +284,12 @@ pub struct DnsResolver {
     backend: DnsBackend,
     /// 构建/配置失败原因（仅用于诊断/UI 提示）
     doh_error: Option<String>,
+    /// 最近一次成功解析**实际命中**的服务器下标。
+    ///
+    /// 列表首项只代表「首选」，运行时完全可能因为超时/污染被跳过而落到第二、
+    /// 第三项。UI 与日志若直接读 `backend()` 会把来源标错（例如配置了 DoH，
+    /// 实际用明文 UDP 在解析，界面仍显示「DoH 生效中」）。
+    last_hit: Arc<AtomicUsize>,
 }
 
 impl DnsResolver {
@@ -317,17 +336,17 @@ impl DnsResolver {
             errors.push("已回退系统 DNS".to_string());
         }
 
-        let backend = match entries.first().map(|e| &e.spec) {
-            Some(ResolverServer::Doh(url)) => DnsBackend::Doh(url.clone()),
-            Some(ResolverServer::Udp(ip)) => DnsBackend::Udp(ip.to_string()),
-            _ => DnsBackend::System,
-        };
+        let backend = entries
+            .first()
+            .map(|e| backend_of(&e.spec))
+            .unwrap_or(DnsBackend::System);
 
         Self {
             entries,
             config,
             backend,
             doh_error: (!errors.is_empty()).then(|| errors.join("; ")),
+            last_hit: Arc::new(AtomicUsize::new(NO_HIT)),
         }
     }
 
@@ -340,12 +359,38 @@ impl DnsResolver {
         self.entries.iter().map(|e| &e.spec).collect()
     }
 
-    /// 实际生效的主后端（列表首项）
+    /// 首选后端（列表首项，**构建期**结论）。
+    ///
+    /// DoH 配置失效（地址非法、引导解析失败等）时列表首项不再是 DoH，
+    /// UI 不能再按「用户勾了 DoH」就宣称正在使用加密 DNS。
+    /// 但本方法仍只反映「首选」，运行时是否真在用请看 [`Self::hit_backend`]。
     pub fn backend(&self) -> &DnsBackend {
         &self.backend
     }
 
-    /// DoH 是否真正生效（列表首项是 DoH 且构建成功）
+    /// 最近一次成功解析**实际命中**的服务器（尚未成功解析过则为 None）。
+    pub fn hit_server(&self) -> Option<&ResolverServer> {
+        let index = self.last_hit.load(Ordering::Relaxed);
+        self.entries.get(index).map(|e| &e.spec)
+    }
+
+    /// 最近一次成功解析实际命中的后端（尚未成功解析过则为 None）。
+    pub fn hit_backend(&self) -> Option<DnsBackend> {
+        self.hit_server().map(backend_of)
+    }
+
+    /// **运行时**来源：优先报告实际命中的服务器，未解析过才退回首选。
+    ///
+    /// 展示与日志一律用这个，不要直接用 [`Self::backend`]——列表首项可能
+    /// 因超时/污染被跳过，用它会把「实际上在用明文 UDP」标成「DoH 生效中」。
+    pub fn effective_backend(&self) -> DnsBackend {
+        self.hit_backend().unwrap_or_else(|| self.backend.clone())
+    }
+
+    /// DoH 是否真正生效（首选是 DoH 且构建成功）。
+    ///
+    /// 同样只反映首选；`DnsResolver::single(Doh)` 上用它判断「该端点构建成功
+    /// 没有」是准确的，但在列表解析器上不能据此断言「正在用 DoH」。
     pub fn is_doh_active(&self) -> bool {
         matches!(self.backend, DnsBackend::Doh(_))
     }
@@ -421,6 +466,9 @@ impl DnsResolver {
                         last_err = format!("{} 无记录", entry.spec.describe());
                         continue;
                     }
+                    // 记录实际命中的服务器：展示/日志据此标注来源，
+                    // 不能拿「列表首项」冒充（回退很常见）
+                    self.last_hit.store(index, Ordering::Relaxed);
                     tracing::debug!(
                         host,
                         server = %entry.spec.describe(),
@@ -1113,14 +1161,28 @@ mod tests {
         assert!(!ips.is_empty(), "DoH 返回空结果");
     }
 
+    /// 尚未解析过时不得声称命中了某台服务器；此时来源退回「首选」
+    #[test]
+    fn test_hit_is_unknown_before_first_lookup() {
+        let resolver = DnsResolver::single(ResolverServer::Udp("223.5.5.5".parse().unwrap()));
+        assert!(resolver.hit_server().is_none(), "未解析过就该是 None");
+        assert!(resolver.hit_backend().is_none());
+        // 展示层退回首选，避免刚启动时来源为空
+        assert_eq!(
+            resolver.effective_backend(),
+            DnsBackend::Udp("223.5.5.5".into())
+        );
+    }
+
     /// 真实网络验证：首个服务器黑洞（TEST-NET-1 不可达）时应自动落到下一个。
     #[tokio::test]
     #[ignore = "需要网络：验证服务器列表逐项回退"]
     async fn test_server_list_falls_back_on_timeout() {
+        let second = ResolverServer::Udp("223.5.5.5".parse().unwrap());
         let resolver = DnsResolver::with_config(DnsConfig {
             resolver_servers: vec![
                 ResolverServer::Udp("192.0.2.1".parse().unwrap()),
-                ResolverServer::Udp("223.5.5.5".parse().unwrap()),
+                second.clone(),
             ],
             ..Default::default()
         });
@@ -1135,5 +1197,17 @@ mod tests {
             "回退不应叠加超时，实际 {:?}",
             started.elapsed()
         );
+        // 关键断言：首项不可达时，来源必须报「实际命中的第二项」，
+        // 而不是照抄列表首项（否则 UI 会显示一台根本没在用的服务器）
+        assert_eq!(
+            resolver.hit_server(),
+            Some(&second),
+            "应记录实际命中的服务器"
+        );
+        assert_eq!(
+            resolver.effective_backend(),
+            DnsBackend::Udp("223.5.5.5".into())
+        );
+        assert_ne!(resolver.effective_backend(), *resolver.backend());
     }
 }

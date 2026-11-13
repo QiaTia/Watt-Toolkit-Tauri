@@ -564,7 +564,9 @@ async fn refresh_one(
 /// 解析器来源描述（用于 UI 展示「IP 来自哪个 DNS」）。
 /// 按实际生效后端展示：DoH 配置失效会回退，不能只信 settings。
 fn describe_resolver(resolver: &watt_dns::DnsResolver) -> String {
-    match resolver.backend() {
+    // 用「实际命中的服务器」而非列表首项：解析顺序回退很常见，拿首项会把来源
+    // 标错（例如配置 DoH 但实际在用明文 UDP），排障时反而误导。
+    match resolver.effective_backend() {
         watt_dns::DnsBackend::Doh(url) => format!("DoH {url}"),
         watt_dns::DnsBackend::Udp(ip) => format!("DNS {ip}"),
         watt_dns::DnsBackend::System => "系统 DNS".to_string(),

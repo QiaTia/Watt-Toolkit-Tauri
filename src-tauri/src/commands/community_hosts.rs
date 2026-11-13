@@ -113,10 +113,46 @@ fn record_fetch_result(dir: &Path, last_fetch_ms: Option<u64>, last_error: Optio
     }
 }
 
+/// 拉取闸门：手动与后台共用**同一条**拉取通道。
+///
+/// 两者可能同时触发（启动 20s 后后台到期，用户同时又点了「立即拉取」）。
+/// 并发跑两份会重复 HTTP 与全部 TLS 探测（约 2×40 次握手），数据本身不会坏
+/// （`add_dynamic_ips` 是幂等的并集），但纯属浪费，也会让两边的等待时间翻倍。
+///
+/// 后台侧在**拿到闸门之后**才判到期（见 [`refresh_if_due`]），因此「手动刚拉完、
+/// 后台恰好醒来」这种时序不会再多拉一次。
+static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 拉取一次并落盘（手动命令与后台任务共用）。
 ///
 /// 失败不抛给调用方之外的任何地方：池保持原样，只把原因记进 `last_error`。
-pub(crate) async fn run_refresh(data_dir: &Path) -> Result<watt_core::community_hosts::FetchOutcome, String> {
+pub(crate) async fn run_refresh(
+    data_dir: &Path,
+) -> Result<watt_core::community_hosts::FetchOutcome, String> {
+    let _gate = REFRESH_GATE.lock().await;
+    refresh_locked(data_dir).await
+}
+
+/// 到期才拉取（后台循环专用）。返回 `None` 表示本次无需拉取。
+///
+/// 到期判断放在闸门**内部**：等待期间若手动拉取已完成并写回 `last_fetch_ms`，
+/// 这里重新读到的就是新值，直接跳过——否则会在手动拉取刚结束后再拉一遍。
+pub(crate) async fn refresh_if_due(
+    data_dir: &Path,
+) -> Option<Result<watt_core::community_hosts::FetchOutcome, String>> {
+    let _gate = REFRESH_GATE.lock().await;
+    let dir = data_dir.join("Settings");
+    let cfg = watt_config::settings::load_community_hosts_settings_in(&dir).ok()?;
+    if !is_due(&cfg) {
+        return None;
+    }
+    Some(refresh_locked(data_dir).await)
+}
+
+/// 真正的拉取实现：**调用方必须已持有** [`REFRESH_GATE`]。
+async fn refresh_locked(
+    data_dir: &Path,
+) -> Result<watt_core::community_hosts::FetchOutcome, String> {
     let dir = data_dir.join("Settings");
     // 只用于取源地址；写回时不复用它（见 `record_fetch_result`）
     let cfg =
@@ -167,27 +203,27 @@ pub async fn spawn_refresh_loop(data_dir: PathBuf) {
     let mut retry_after: Option<std::time::Instant> = None;
 
     loop {
-        let due = retry_after.map(|t| std::time::Instant::now() >= t).unwrap_or(true);
-        if due {
-            let dir = data_dir.join("Settings");
-            let cfg = watt_config::settings::load_community_hosts_settings_in(&dir).ok();
-            if let Some(cfg) = cfg {
-                if is_due(&cfg) {
-                    match run_refresh(&data_dir).await {
-                        Ok(o) => {
-                            tracing::info!(
-                                hosts = o.hosts_touched,
-                                ips = o.ips_merged,
-                                "社区 hosts 源定期更新完成"
-                            );
-                            retry_after = None;
-                        }
-                        Err(_) => {
-                            // 失败退避：不可达网络下不该每 30 分钟重试一次
-                            retry_after = Some(std::time::Instant::now() + RETRY_AFTER_FAILURE);
-                        }
-                    }
+        // `retry_ready`：失败退避是否已过。是否**到期**由 `refresh_if_due`
+        // 在闸门内重新判断（用户可能刚手动拉过一次）。
+        let retry_ready = retry_after
+            .map(|t| std::time::Instant::now() >= t)
+            .unwrap_or(true);
+        if retry_ready {
+            match refresh_if_due(&data_dir).await {
+                Some(Ok(o)) => {
+                    tracing::info!(
+                        hosts = o.hosts_touched,
+                        ips = o.ips_merged,
+                        "社区 hosts 源定期更新完成"
+                    );
+                    retry_after = None;
                 }
+                Some(Err(_)) => {
+                    // 失败退避：不可达网络下不该每 30 分钟重试一次
+                    retry_after = Some(std::time::Instant::now() + RETRY_AFTER_FAILURE);
+                }
+                // 未到期（或等待闸门期间已被手动拉取完成）→ 什么都不做
+                None => {}
             }
         }
         tokio::time::sleep(TICK).await;
@@ -276,6 +312,45 @@ mod tests {
         assert_eq!(after.url, "https://mirror.example.com/hosts.json");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拉取必须串行：手动与后台不能同时跑（会重复 HTTP + 全部 TLS 探测）
+    #[tokio::test]
+    async fn refresh_gate_is_exclusive() {
+        let guard = REFRESH_GATE.lock().await;
+        assert!(
+            REFRESH_GATE.try_lock().is_err(),
+            "已有拉取在跑时，第二份必须排队而不是并发进入"
+        );
+        drop(guard);
+        assert!(
+            REFRESH_GATE.try_lock().is_ok(),
+            "前一任务结束后必须释放闸门"
+        );
+    }
+
+    /// 未到期时后台不得拉取（在闸门内判到期，避免手动拉完后又来一遍）
+    #[tokio::test]
+    async fn refresh_if_due_skips_when_not_due() {
+        let data_dir =
+            std::env::temp_dir().join(format!("watt-due-{}", std::process::id()));
+        let dir = data_dir.join("Settings");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 刚拉过：即使后台 tick 醒来也应跳过（无网络调用，直接返回 None）
+        let fresh = cfg(true, 24, now_ms());
+        watt_config::settings::save_community_hosts_settings_in(&dir, &fresh).unwrap();
+        assert!(
+            refresh_if_due(&data_dir).await.is_none(),
+            "未到期不应触发拉取"
+        );
+
+        // 关闭后同样不拉
+        let off = cfg(false, 24, 0);
+        watt_config::settings::save_community_hosts_settings_in(&dir, &off).unwrap();
+        assert!(refresh_if_due(&data_dir).await.is_none(), "关闭后不应触发拉取");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
