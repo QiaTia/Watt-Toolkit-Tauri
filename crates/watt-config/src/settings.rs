@@ -129,13 +129,22 @@ pub struct DnsSettings {
     /// 启动前 DNS 检查/竞速
     #[serde(default)]
     pub before_dns_check: bool,
-    /// 主 DNS
+    /// 有序 DNS 服务器列表（字符串形式，顺序即优先级）。
+    ///
+    /// 空列表时由 `master_dns` / `use_doh` / `custom_doh_address` 三个旧字段合成，
+    /// 保证 v0.5.x 的配置文件可直接读取。
+    #[serde(default)]
+    pub resolver_servers: Vec<String>,
+    /// 旧配置是否已展开为 `resolver_servers`
+    #[serde(default)]
+    pub resolver_servers_migrated: bool,
+    /// 主 DNS（旧字段，保留读写兼容）
     #[serde(default)]
     pub master_dns: Option<String>,
-    /// 使用 DoH
+    /// 使用 DoH（旧字段）
     #[serde(default)]
     pub use_doh: bool,
-    /// 自定义 DoH 地址
+    /// 自定义 DoH 地址（旧字段）
     #[serde(default)]
     pub custom_doh_address: Option<String>,
 }

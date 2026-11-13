@@ -335,6 +335,18 @@ impl RelayContext {
                         disp,
                     );
                 }
+                // 自环兜底：解析结果为回环/未指定地址说明 DNS 把域名指回了本机
+                // （hosts 劫持 + 系统 DNS 被污染，或运营商 127.0.0.1 劫持）。
+                // 继续转发只会连回自己，必须显式失败而不是无限递归。
+                if ip.is_loopback() || ip.is_unspecified() {
+                    tracing::warn!(host = %host, %ip, "默认规则解析到回环地址，拒绝转发（疑似 DNS 污染）");
+                    return (
+                        error_response(&format!(
+                            "DNS 解析异常：{host} 被解析到 {ip}（回环地址），已拒绝转发以避免自环。请在设置中更换 DNS 服务器。"
+                        )),
+                        disp,
+                    );
+                }
             } else {
                 return (
                     error_response(&watt_dns::pollution::pollution_error_body(&host)),

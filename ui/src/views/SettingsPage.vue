@@ -131,14 +131,69 @@ const twoLevelPassword = nullableString(
   () => settings.settings.two_level_agent.password,
   (v) => (settings.settings.two_level_agent.password = v),
 );
-const masterDns = nullableString(
-  () => settings.settings.dns.master_dns,
-  (v) => (settings.settings.dns.master_dns = v),
-);
-const customDohAddress = nullableString(
-  () => settings.settings.dns.custom_doh_address,
-  (v) => (settings.settings.dns.custom_doh_address = v),
-);
+/** 默认 DoH 端点（与 Rust DEFAULT_DOH_ADDRESS 一致） */
+const DEFAULT_DOH = 'https://doh.pub/dns-query';
+/** 内置服务器预设（顺序即优先级，对齐 Rust DEFAULT_DOH_SERVERS / DEFAULT_DNS_SERVERS） */
+const PRESET_DNS_SERVERS = [
+  'https://doh.pub/dns-query',
+  'https://dns.alidns.com/dns-query',
+  'https://dns.google/dns-query',
+  '223.5.5.5',
+  '119.29.29.29',
+  '114.114.114.114',
+];
+
+/**
+ * 有序解析服务器列表。
+ *
+ * 列表为空时按旧字段（DoH 开关 / 主 DNS）临时合成用于展示——只在用户编辑后
+ * 才写回 `resolver_servers`，避免打开设置页就悄悄改写磁盘配置。
+ */
+const dnsServers = computed<string[]>({
+  get: () => {
+    const list = settings.settings.dns.resolver_servers;
+    if (list && list.length > 0) return list;
+    const legacy: string[] = [];
+    if (settings.settings.dns.use_doh) {
+      legacy.push(settings.settings.dns.custom_doh_address || DEFAULT_DOH);
+    }
+    if (settings.settings.dns.master_dns) legacy.push(settings.settings.dns.master_dns);
+    return legacy;
+  },
+  set: (v) => {
+    settings.settings.dns.resolver_servers = v;
+  },
+});
+
+function updateDnsServer(index: number, value: string): void {
+  const next = [...dnsServers.value];
+  next[index] = value;
+  dnsServers.value = next;
+}
+
+function addDnsServer(): void {
+  dnsServers.value = [...dnsServers.value, ''];
+}
+
+function removeDnsServer(index: number): void {
+  dnsServers.value = dnsServers.value.filter((_, i) => i !== index);
+}
+
+/** 上移/下移：顺序即优先级，必须立即落数组顺序 */
+function moveDnsServer(index: number, delta: number): void {
+  const target = index + delta;
+  const next = [...dnsServers.value];
+  if (target < 0 || target >= next.length) return;
+  const current = next[index] ?? '';
+  const other = next[target] ?? '';
+  next[index] = other;
+  next[target] = current;
+  dnsServers.value = next;
+}
+
+function fillDefaultDns(): void {
+  dnsServers.value = [...PRESET_DNS_SERVERS];
+}
 
 const modeOptions = computed<Array<{ value: ProxyMode; label: string; disabled: boolean }>>(() => [
   // macOS：Hosts 需要监听 443（特权端口），非 root 不可用，直接置灰
@@ -209,11 +264,23 @@ async function regenerateCa(): Promise<void> {
  * DoH 连通性测试：显式验证 TLS 握手 + 真实解析。
  * 引擎启动时若端点配置无效会回退系统 DNS，这里给用户一个「不静默」的检查入口。
  */
-async function probeDoh(): Promise<void> {
+/** 正在测试的行下标（仅该行按钮转圈） */
+const probingIndex = ref<number | null>(null);
+
+/** 该行是否为可测试的 DoH 端点 */
+function isDohServer(server: string): boolean {
+  return /^https:\/\//i.test(server.trim());
+}
+
+/** 单行 DoH 连通性测试（严格单端点，不做回退，失败即报错） */
+async function probeDohServer(index: number): Promise<void> {
   if (dohTesting.value) return;
+  const endpoint = (dnsServers.value[index] ?? '').trim();
+  if (!isDohServer(endpoint)) return;
   dohTesting.value = true;
+  probingIndex.value = index;
   try {
-    const r = await dnsProbeDoh(customDohAddress.value || null);
+    const r = await dnsProbeDoh(endpoint);
     message.success(
       t('settings.dohTestOk', {
         host: r.host,
@@ -226,6 +293,7 @@ async function probeDoh(): Promise<void> {
     message.error(t('settings.dohTestFail', { error: msg }));
   } finally {
     dohTesting.value = false;
+    probingIndex.value = null;
   }
 }
 
@@ -395,29 +463,53 @@ function formatTime(iso: string): string {
 
     <a-card :bordered="false" :title="$t('settings.dnsTitle')" class="panel">
       <a-form layout="vertical">
+        <a-form-item :label="$t('settings.dnsServers')">
+          <template #extra>
+            <span class="dns-hint">{{ $t('settings.dnsServersHint') }}</span>
+          </template>
+          <div class="dns-list">
+            <div v-for="(server, i) in dnsServers" :key="i" class="dns-row">
+              <span class="dns-index">{{ i + 1 }}</span>
+              <a-input
+                :value="server"
+                :placeholder="isDohServer(server) || i === 0 ? 'https://doh.pub/dns-query' : '223.5.5.5'"
+                allow-clear
+                @update:value="(v: string) => updateDnsServer(i, v)"
+              />
+              <a-button
+                v-if="isDohServer(server)"
+                size="small"
+                :loading="probingIndex === i"
+                :disabled="dohTesting && probingIndex !== i"
+                @click="probeDohServer(i)"
+              >
+                {{ $t('settings.dohTest') }}
+              </a-button>
+              <a-tooltip :title="$t('settings.dnsMoveUp')">
+                <a-button size="small" :disabled="i === 0" @click="moveDnsServer(i, -1)">↑</a-button>
+              </a-tooltip>
+              <a-tooltip :title="$t('settings.dnsMoveDown')">
+                <a-button size="small" :disabled="i === dnsServers.length - 1" @click="moveDnsServer(i, 1)">
+                  ↓
+                </a-button>
+              </a-tooltip>
+              <a-tooltip :title="$t('settings.dnsRemove')">
+                <a-button size="small" danger @click="removeDnsServer(i)">✕</a-button>
+              </a-tooltip>
+            </div>
+            <a-empty v-if="dnsServers.length === 0" :description="$t('settings.dnsEmpty')" />
+            <div class="dns-actions">
+              <a-button size="small" @click="addDnsServer">{{ $t('settings.dnsAdd') }}</a-button>
+              <a-button size="small" @click="fillDefaultDns">{{ $t('settings.dnsPreset') }}</a-button>
+            </div>
+          </div>
+        </a-form-item>
         <a-row :gutter="16">
           <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item :label="$t('settings.masterDns')">
-              <a-input v-model:value="masterDns" placeholder="223.5.5.5" allow-clear />
-            </a-form-item>
-          </a-col>
-          <a-col :xs="24" :md="12" :lg="8">
-            <a-form-item :label="$t('settings.useDoh')">
-              <a-switch v-model:checked="settings.settings.dns.use_doh" />
-            </a-form-item>
-          </a-col>
-          <a-col v-if="settings.settings.dns.use_doh" :xs="24" :md="12" :lg="8">
-            <a-form-item :label="$t('settings.dohAddr')">
-              <div class="doh-row">
-                <a-input
-                  v-model:value="customDohAddress"
-                  placeholder="https://dns.alidns.com/dns-query"
-                  allow-clear
-                />
-                <a-button :loading="dohTesting" @click="probeDoh">
-                  {{ $t('settings.dohTest') }}
-                </a-button>
-              </div>
+            <a-form-item>
+              <a-checkbox v-model:checked="settings.settings.dns.before_dns_check">
+                {{ $t('settings.beforeDnsCheck') }}
+              </a-checkbox>
             </a-form-item>
           </a-col>
         </a-row>
@@ -574,9 +666,39 @@ function formatTime(iso: string): string {
   gap: 8px;
 }
 
-.doh-row :deep(.ant-input-affix-wrapper),
-.doh-row :deep(.ant-input) {
+.dns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.dns-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dns-row :deep(.ant-input-affix-wrapper),
+.dns-row :deep(.ant-input) {
   flex: 1;
+}
+
+.dns-index {
+  width: 18px;
+  color: rgba(0, 0, 0, 0.45);
+  text-align: right;
+  flex: none;
+}
+
+.dns-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.dns-hint {
+  color: rgba(0, 0, 0, 0.45);
+  font-size: 12px;
 }
 
 .cert-desc {

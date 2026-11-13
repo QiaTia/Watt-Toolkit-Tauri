@@ -648,11 +648,66 @@ impl OutboundConnector {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let ips = self.dns.resolve(host).await.map_err(OutboundError::Dns)?;
-        Ok(ips
+        // 自环防护：Hosts 模式下引擎自己把加速域名写进 hosts，若 DNS 又把域名解析
+        // 回 127.0.0.1，直连就是「连自己」——表现为请求挂死或无限递归。
+        // localhost 系列域名是用户明确要求访问本机，放行。
+        let allow_loopback = is_local_host(host);
+        let addrs: Vec<SocketAddr> = ips
             .into_iter()
+            .filter(|ip| allow_loopback || !(*ip).is_loopback())
+            .filter(|ip| allow_loopback || !(*ip).is_unspecified())
             .map(|ip| SocketAddr::new(ip, port))
-            .collect())
+            .collect();
+        if addrs.is_empty() {
+            return Err(OutboundError::Dns(format!(
+                "{host} 解析到回环/未指定地址，已拒绝连接（疑似 DNS 污染）"
+            )));
+        }
+        Ok(addrs)
     }
+}
+
+/// 本机域名（允许解析到回环地址）
+fn is_local_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// 权威格式的 `host:port`。
+///
+/// IPv6 字面量必须加方括号（RFC 3986 §3.2.2）：`CONNECT 2001:db8::1:443` 无法被
+/// 代理正确切分，会被当成「主机 2001:db8::1:443 + 缺端口」或直接 400。
+fn host_for_authority(host: &str, port: u16) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{host}]:{port}"),
+        Err(_) => format!("{host}:{port}"),
+    }
+}
+
+/// 构造 SOCKS5 CONNECT 请求体（RFC 1928）。
+///
+/// 目标必须是 IP 时用 `ATYP=0x01/0x04`：把 IPv6 字面量当域名（`0x03`）发送时，
+/// 代理端会按域名去解析 `2001:db8::1` 这类字符串，必然失败。
+fn socks5_connect_request(host: &str, port: u16) -> Result<Vec<u8>, OutboundError> {
+    let (atyp, addr_bytes): (u8, Vec<u8>) = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => (0x01, v4.octets().to_vec()),
+        Ok(std::net::IpAddr::V6(v6)) => (0x04, v6.octets().to_vec()),
+        Err(_) => {
+            let bytes = host.as_bytes();
+            if bytes.is_empty() || bytes.len() > 255 {
+                return Err(OutboundError::Upstream("域名长度非法".into()));
+            }
+            (0x03, bytes.to_vec())
+        }
+    };
+
+    let mut req = Vec::with_capacity(7 + addr_bytes.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00, atyp]);
+    if atyp == 0x03 {
+        req.push(addr_bytes.len() as u8);
+    }
+    req.extend_from_slice(&addr_bytes);
+    req.extend_from_slice(&port.to_be_bytes());
+    Ok(req)
 }
 
 /// HTTP CONNECT 隧道
@@ -676,9 +731,8 @@ async fn http_connect_tunnel(
         _ => None,
     };
     let req = format!(
-        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n",
-        host = target.host,
-        port = target.port,
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{auth}\r\n",
+        authority = host_for_authority(&target.host, target.port),
         auth = auth.unwrap_or_default(),
     );
     stream.write_all(req.as_bytes()).await?;
@@ -766,14 +820,8 @@ async fn socks5_tunnel(
         }
     }
 
-    // 2. CONNECT 命令（域名远程解析）
-    let host_bytes = target.host.as_bytes();
-    if host_bytes.len() > 255 {
-        return Err(OutboundError::Upstream("域名过长".into()));
-    }
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
-    req.extend_from_slice(host_bytes);
-    req.extend_from_slice(&target.port.to_be_bytes());
+    // 2. CONNECT 命令（IP 字面量用地址类型，域名走远程解析）
+    let req = socks5_connect_request(&target.host, target.port)?;
     stream.write_all(&req).await?;
 
     // 3. 响应
@@ -1067,5 +1115,40 @@ mod tests {
         let until = *health.demoted.lock().unwrap().get(&a.ip()).unwrap();
         assert!(until > Instant::now());
         assert!(until <= Instant::now() + Duration::from_secs(DEMOTE_SECS + 1));
+    }
+
+    /// IPv6 目标必须在 CONNECT 行加方括号（RFC 3986 authority）。
+    #[test]
+    fn test_host_for_authority_ipv6() {
+        assert_eq!(host_for_authority("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert_eq!(host_for_authority("::1", 8080), "[::1]:8080");
+        // 域名与 IPv4 保持原样
+        assert_eq!(host_for_authority("github.com", 443), "github.com:443");
+        assert_eq!(host_for_authority("127.0.0.1", 26501), "127.0.0.1:26501");
+    }
+
+    /// SOCKS5 目标地址类型：IP 字面量必须走 ATYP=1/4，不能当域名（0x03）发。
+    #[test]
+    fn test_socks5_connect_request_atyp() {
+        // IPv4：ATYP=0x01，4 字节地址 + 2 字节端口（大端）
+        let v4 = socks5_connect_request("1.2.3.4", 443).unwrap();
+        assert_eq!(&v4[..4], &[0x05, 0x01, 0x00, 0x01]);
+        assert_eq!(&v4[4..8], &[1, 2, 3, 4]);
+        assert_eq!(&v4[8..10], &[0x01, 0xBB]);
+
+        // IPv6：ATYP=0x04，16 字节地址
+        let v6 = socks5_connect_request("2001:db8::1", 443).unwrap();
+        assert_eq!(&v6[..4], &[0x05, 0x01, 0x00, 0x04]);
+        assert_eq!(v6.len(), 4 + 16 + 2);
+
+        // 域名：ATYP=0x03，带长度前缀
+        let domain = socks5_connect_request("github.com", 443).unwrap();
+        assert_eq!(&domain[..5], &[0x05, 0x01, 0x00, 0x03, 10]);
+        assert_eq!(&domain[5..15], b"github.com");
+        assert_eq!(&domain[15..17], &[0x01, 0xBB]);
+
+        // 超长域名应被拒绝（长度字段只有 1 字节）
+        let long = "a".repeat(256);
+        assert!(socks5_connect_request(&long, 443).is_err());
     }
 }

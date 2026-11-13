@@ -84,8 +84,15 @@ export interface TwoLevelAgentSettings {
 
 export interface DnsSettings {
   before_dns_check: boolean;
+  /** 有序 DNS 服务器列表，顺序即优先级（空 = 由以下旧字段合成） */
+  resolver_servers: string[];
+  /** 旧配置是否已展开为 resolver_servers */
+  resolver_servers_migrated: boolean;
+  /** 旧字段：主 DNS */
   master_dns: string | null;
+  /** 旧字段：是否使用 DoH */
   use_doh: boolean;
+  /** 旧字段：自定义 DoH 地址 */
   custom_doh_address: string | null;
 }
 

@@ -372,7 +372,13 @@ impl ProxyEngine {
         // 域名型 DoH 需要在启动时做一次引导解析（getaddrinfo，最长 3s）。
         // 必须在改系统代理**之前**完成：否则代理已指向未监听的端口，用户会短暂断网。
         // 放到 spawn_blocking，避免占用 tokio worker。
-        let dns_config = config.dns.clone();
+        let mut dns_config = config.dns.clone();
+        // Hosts 模式：把「系统默认 DNS」替换为公共 DNS。
+        // hosts 已把加速域名指向 127.0.0.1，此时哪怕绕过 hosts 文件，
+        // 系统/运营商 DNS 仍可能把域名解析成回环地址 → 出站连回自己（自环）。
+        if mode == ProxyMode::Hosts {
+            dns_config.prefer_public_dns = true;
+        }
         let dns = match tokio::task::spawn_blocking(move || {
             watt_dns::DnsResolver::with_config(dns_config)
         })
@@ -385,7 +391,34 @@ impl ProxyEngine {
                 return Err(EngineError::Other(msg));
             }
         };
-        tracing::info!(backend = ?dns.backend(), "DNS 解析器已初始化");
+        tracing::info!(
+            backend = ?dns.backend(),
+            servers = ?dns.servers(),
+            "DNS 解析器已初始化"
+        );
+        if let Some(err) = dns.doh_error() {
+            tracing::warn!(error = %err, "部分 DNS 服务器不可用，已按列表顺序降级");
+        }
+
+        // 启动前 DNS 体检（可选，默认关）：只判断「这套配置现在能不能解析」，
+        // 失败也**不阻断**启动——对齐上游语义（继续按配置顺序尝试）。
+        // 超时收紧到 3s：这是诊断而非守门，不应把加速启动拖成十几秒。
+        if config.dns.before_dns_check {
+            let check_config = dns.config().clone();
+            let check = watt_dns::check_resolver_servers(
+                &check_config,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+            if check.ok {
+                tracing::info!(detail = %check.detail, "DNS 预检查通过");
+            } else {
+                tracing::warn!(
+                    detail = %check.detail,
+                    "DNS 预检查未通过：将继续按配置顺序尝试，若加速后无法访问请检查解析设置"
+                );
+            }
+        }
 
         // —— 1. 模式前置（对齐 C# switch(proxyMode)）——
         // 系统代理/PAC 地址回退：0.0.0.0 → 127.0.0.1（注册表/PAC 不接受 unspecified）

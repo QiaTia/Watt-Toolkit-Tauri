@@ -24,6 +24,8 @@ export function defaultProxySettings(): ProxySettings {
     },
     dns: {
       before_dns_check: false,
+      resolver_servers: [],
+      resolver_servers_migrated: false,
       master_dns: null,
       use_doh: false,
       custom_doh_address: null,

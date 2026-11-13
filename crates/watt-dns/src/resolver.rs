@@ -27,15 +27,207 @@ type BootstrapCache = std::sync::Mutex<
 static DOH_BOOTSTRAP_CACHE: Lazy<BootstrapCache> =
     Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// 单个解析服务器。
+///
+/// 对齐上游 `DnsAnalysisServiceSwitchImpl.Server`：配置是一个**有序列表**，
+/// 顺序即优先级，逐个尝试、首个返回结果者生效。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolverServer {
+    /// 系统默认 DNS（读系统配置；Hosts 模式下会被替换为公共 DNS，防回环）
+    SystemDefault,
+    /// 明文 UDP/TCP DNS（IP 字面量）
+    Udp(IpAddr),
+    /// RFC 8484 DoH 端点（必须 https，已规范化为 `/dns-query` 等路径）
+    Doh(String),
+}
+
+/// 配置里最多生效的服务器数量（超出截断，避免用户粘一整页地址拖慢每次解析）
+const MAX_RESOLVER_SERVERS: usize = 8;
+
+impl ResolverServer {
+    /// 解析单条配置项。无法识别的项返回 `None`（调用方跳过，不让整表失效）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if s.eq_ignore_ascii_case("system default") || s.eq_ignore_ascii_case("system") {
+            return Some(Self::SystemDefault);
+        }
+        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("https://") {
+            let normalized = normalize_legacy_doh_endpoint(s);
+            let endpoint = parse_doh_endpoint(&normalized).ok()?;
+            return Some(Self::Doh(canonical_doh_url(&endpoint)));
+        }
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return Some(Self::Udp(ip));
+        }
+        None
+    }
+
+    /// 用于日志/UI 的短描述
+    pub fn describe(&self) -> String {
+        match self {
+            Self::SystemDefault => "System Default".to_string(),
+            Self::Udp(ip) => ip.to_string(),
+            Self::Doh(url) => url.clone(),
+        }
+    }
+
+    fn query_timeout(&self) -> Duration {
+        match self {
+            Self::Doh(_) => crate::DOH_QUERY_TIMEOUT,
+            _ => crate::UDP_QUERY_TIMEOUT,
+        }
+    }
+}
+
+/// 历史预设的 DoH 端点多为 JSON 接口（`/resolve`），而客户端始终按 RFC 8484
+/// 发送 wireformat 请求到该路径 → 必然失败。已知预设统一改写为 `/dns-query`。
+///
+/// 对齐上游 `NormalizeLegacyDohEndpoint`（保留既有配置的可用性）。
+fn normalize_legacy_doh_endpoint(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(endpoint) = parse_doh_endpoint(trimmed) else {
+        return trimmed.to_string();
+    };
+    const JSON_ONLY_HOSTS: &[&str] = &[
+        "doh.pub",
+        "dns.alidns.com",
+        "223.6.6.6",
+        "1.12.12.12",
+        "dns.google",
+        "doh.360.cn",
+        "101.6.6.6",
+    ];
+    if endpoint.path == "/resolve" && JSON_ONLY_HOSTS.contains(&endpoint.host.as_str()) {
+        let mut fixed = endpoint;
+        fixed.path = DEFAULT_DOH_PATH.to_string();
+        return canonical_doh_url(&fixed);
+    }
+    trimmed.to_string()
+}
+
+/// 由解析结果还原规范 URL（IPv6 补方括号、默认端口省略）
+fn canonical_doh_url(endpoint: &DohEndpoint) -> String {
+    let host = if endpoint.host.contains(':') {
+        format!("[{}]", endpoint.host)
+    } else {
+        endpoint.host.clone()
+    };
+    if endpoint.port == 443 {
+        format!("https://{host}{}", endpoint.path)
+    } else {
+        format!("https://{host}:{}{}", endpoint.port, endpoint.path)
+    }
+}
+
 /// DNS 解析配置
+///
+/// `resolver_servers` 为空时由旧字段（`use_doh` / `master_dns` / `custom_doh_address`）
+/// 合成列表，保证 v0.5.x 的配置文件可直接读取。
 #[derive(Debug, Clone, Default)]
 pub struct DnsConfig {
-    /// 主 DNS 服务器（如 "223.5.5.5"），None 用系统默认
+    /// 有序服务器列表（首个可用者生效）
+    pub resolver_servers: Vec<ResolverServer>,
+    /// 旧字段：主 DNS 服务器（如 "223.5.5.5"），None 用系统默认
     pub master_dns: Option<String>,
-    /// 使用 DoH
+    /// 旧字段：使用 DoH
     pub use_doh: bool,
-    /// 自定义 DoH 地址
+    /// 旧字段：自定义 DoH 地址
     pub custom_doh_address: Option<String>,
+    /// Hosts 模式下把 `SystemDefault` 替换为公共 DNS。
+    ///
+    /// hosts 已把加速域名指向 127.0.0.1，此时用系统解析（哪怕绕过 hosts 文件）
+    /// 仍可能被运营商 DNS 污染为回环地址 → 出站连回自己。上游同样处理。
+    pub prefer_public_dns: bool,
+    /// 严格模式：只使用显式列出的服务器，不注入隐式系统兜底。
+    /// 用于「单端点探测」等必须如实报告失败的场景。
+    pub strict: bool,
+    /// 启动前做一次 DNS 可用性体检（仅诊断，不阻断启动）
+    pub before_dns_check: bool,
+}
+
+/// 解析字符串列表；无法识别的项**跳过**而不是让整表失效
+/// （用户在列表里多打一个空格，不应导致全部 DNS 降级）。
+pub fn parse_server_list(list: &[String]) -> Vec<ResolverServer> {
+    list.iter().filter_map(|s| ResolverServer::parse(s)).collect()
+}
+
+/// 合成生效服务器列表（去重、替换、截断）
+pub fn effective_servers(config: &DnsConfig) -> Vec<ResolverServer> {
+    plan_servers(config).0
+}
+
+/// 合成列表 + 旧配置遗留问题（用于诊断展示）
+fn plan_servers(config: &DnsConfig) -> (Vec<ResolverServer>, Option<String>) {
+    let (mut list, mut config_error) = if config.resolver_servers.is_empty() {
+        legacy_servers(config)
+    } else {
+        (config.resolver_servers.clone(), None)
+    };
+
+    if config.prefer_public_dns {
+        let mut replaced = Vec::with_capacity(list.len() + crate::DEFAULT_DNS_SERVERS.len());
+        for server in list {
+            match server {
+                ResolverServer::SystemDefault => {
+                    for raw in crate::DEFAULT_DNS_SERVERS {
+                        if let Ok(ip) = raw.parse::<IpAddr>() {
+                            replaced.push(ResolverServer::Udp(ip));
+                        }
+                    }
+                }
+                other => replaced.push(other),
+            }
+        }
+        list = replaced;
+    }
+
+    // 去重保序（用户可能同时填了预设与手写）
+    let mut seen = HashSet::new();
+    list.retain(|server| {
+        let key = server.describe();
+        seen.insert(key)
+    });
+    list.truncate(MAX_RESOLVER_SERVERS);
+    if list.is_empty() {
+        config_error.get_or_insert_with(|| "没有可用的 DNS 服务器配置".to_string());
+    }
+    (list, config_error)
+}
+
+/// 旧配置字段 → 服务器列表（use_doh 为真时 DoH 优先）
+fn legacy_servers(config: &DnsConfig) -> (Vec<ResolverServer>, Option<String>) {
+    let mut list = Vec::new();
+    let mut error = None;
+    if config.use_doh {
+        let url = config
+            .custom_doh_address
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::DEFAULT_DOH_ADDRESS.to_string());
+        match ResolverServer::parse(&url) {
+            Some(server) => list.push(server),
+            None => {
+                tracing::warn!(url, "旧版 DoH 地址非法，已忽略");
+                error = Some(format!("旧版 DoH 地址非法: {url}"));
+            }
+        }
+    }
+    if let Some(ip) = config
+        .master_dns
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<IpAddr>().ok())
+    {
+        list.push(ResolverServer::Udp(ip));
+    }
+    if list.is_empty() {
+        list.push(ResolverServer::SystemDefault);
+    }
+    (list, error)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,9 +236,9 @@ pub enum DnsError {
     Resolve(String),
 }
 
-/// 实际生效的 DNS 后端。
+/// 实际生效的主后端（列表首项）。
 ///
-/// DoH 配置失效（地址非法、引导解析失败等）时会回退到主 DNS / 系统 DNS，
+/// DoH 配置失效（地址非法、引导解析失败等）时列表首项不再是 DoH，
 /// UI 不能再按「用户勾了 DoH」就宣称正在使用加密 DNS。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsBackend {
@@ -58,19 +250,26 @@ pub enum DnsBackend {
     Doh(String),
 }
 
-/// DNS 解析器：包装 hickory-resolver，支持按配置重建。
-///
-/// 持有两个解析器：`resolver`（系统语义，读 hosts 文件，用于污染判定等
-/// 需对齐 getaddrinfo 行为的场景）与 `clean`（绕过 hosts，专供加速引擎
-/// 出站连接——引擎自身会写入 hosts 劫持条目，出站解析若读 hosts 会把
-/// 加速域名解析成 127.0.0.1 导致回环连接）。
-pub struct DnsResolver {
+/// 单个服务器的两套解析器
+struct Entry {
+    spec: ResolverServer,
+    /// 读 hosts 文件（系统语义，用于污染判定等对齐 getaddrinfo 的场景）
     resolver: TokioResolver,
+    /// 绕过 hosts（出站连接专用：引擎自身会写 hosts 劫持条目，
+    /// 若读 hosts 会把加速域名解析成 127.0.0.1 导致回环）
     clean: TokioResolver,
+}
+
+/// DNS 解析器：按**有序服务器列表**逐个尝试，首个返回结果者生效。
+///
+/// 每个服务器各自持有一个 hickory 解析器实例，缓存天然按服务器隔离——
+/// 若共享实例，hickory 以 question 为键的缓存会让「回退服务器的答案」
+/// 冒充「首选服务器的答案」。
+pub struct DnsResolver {
+    entries: Vec<Entry>,
     config: DnsConfig,
-    /// 实际生效的后端（DoH 失效时为回退后的后端）
     backend: DnsBackend,
-    /// DoH 配置失败原因（仅用于诊断/UI 提示）
+    /// 构建/配置失败原因（仅用于诊断/UI 提示）
     doh_error: Option<String>,
 }
 
@@ -80,42 +279,55 @@ impl DnsResolver {
         Self::with_config(DnsConfig::default())
     }
 
-    /// 按配置创建（主 DNS / DoH）
-    pub fn with_config(config: DnsConfig) -> Self {
-        let (doh, doh_error) = match build_doh_plan(&config) {
-            Ok(plan) => (plan, None),
-            Err(err) => (None, Some(err)),
-        };
+    /// 单端点严格解析器：只使用给定服务器，失败即失败（供端点探测使用）。
+    pub fn single(server: ResolverServer) -> Self {
+        Self::with_config(DnsConfig {
+            resolver_servers: vec![server],
+            strict: true,
+            ..Default::default()
+        })
+    }
 
-        match (
-            build_resolver(&config, true, doh.as_ref()),
-            build_resolver(&config, false, doh.as_ref()),
-        ) {
-            (Ok(resolver), Ok(clean)) => Self {
-                resolver,
-                clean,
-                backend: select_backend(&config, doh.as_ref()),
-                config,
-                doh_error,
-            },
-            (resolver, clean) => {
-                // 正常输入不会走到这里（DoH 构建失败已在上面兜底）；仅当系统配置
-                // 本身不可用时最后兜底，保证应用仍能解析 DNS。
-                let err = resolver
-                    .as_ref()
-                    .err()
-                    .or(clean.as_ref().err())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                tracing::error!(error = %err, "DNS 解析器构造失败，回退系统 DNS");
-                Self {
-                    resolver: system_resolver(true),
-                    clean: system_resolver(false),
-                    backend: DnsBackend::System,
-                    config,
-                    doh_error: Some(err),
+    /// 按配置创建（有序列表 + 逐项回退）
+    pub fn with_config(config: DnsConfig) -> Self {
+        let (specs, config_error) = plan_servers(&config);
+        let mut entries = Vec::with_capacity(specs.len());
+        let mut errors: Vec<String> = Vec::new();
+        if let Some(err) = config_error {
+            errors.push(err);
+        }
+
+        for spec in specs {
+            match build_entry(&spec) {
+                Ok(entry) => entries.push(entry),
+                Err(err) => {
+                    tracing::warn!(server = %spec.describe(), error = %err, "DNS 服务器不可用，已跳过");
+                    errors.push(format!("{}: {err}", spec.describe()));
                 }
             }
+        }
+
+        // 非严格模式：全部显式服务器都不可用时兜底系统 DNS，保证应用仍能解析
+        if entries.is_empty() && !config.strict {
+            entries.push(Entry {
+                spec: ResolverServer::SystemDefault,
+                resolver: system_resolver(true),
+                clean: system_resolver(false),
+            });
+            errors.push("已回退系统 DNS".to_string());
+        }
+
+        let backend = match entries.first().map(|e| &e.spec) {
+            Some(ResolverServer::Doh(url)) => DnsBackend::Doh(url.clone()),
+            Some(ResolverServer::Udp(ip)) => DnsBackend::Udp(ip.to_string()),
+            _ => DnsBackend::System,
+        };
+
+        Self {
+            entries,
+            config,
+            backend,
+            doh_error: (!errors.is_empty()).then(|| errors.join("; ")),
         }
     }
 
@@ -123,46 +335,34 @@ impl DnsResolver {
         &self.config
     }
 
-    /// 实际生效的 DNS 后端
+    /// 实际生效的服务器列表（顺序即优先级，供 UI/日志展示真实状态）
+    pub fn servers(&self) -> Vec<&ResolverServer> {
+        self.entries.iter().map(|e| &e.spec).collect()
+    }
+
+    /// 实际生效的主后端（列表首项）
     pub fn backend(&self) -> &DnsBackend {
         &self.backend
     }
 
-    /// DoH 是否真正生效（而不是配置后静默回退）
+    /// DoH 是否真正生效（列表首项是 DoH 且构建成功）
     pub fn is_doh_active(&self) -> bool {
         matches!(self.backend, DnsBackend::Doh(_))
     }
 
-    /// DoH 配置失败原因（None = 未配置 DoH 或 DoH 正常）
+    /// 配置/构建失败原因（None = 全部就绪）
     pub fn doh_error(&self) -> Option<&str> {
         self.doh_error.as_deref()
     }
 
     /// 解析域名（A/AAAA，返回全部结果）
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
-        // IP 字面量直通
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![ip]);
-        }
-        let response = self
-            .resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|e| DnsError::Resolve(format!("{host}: {e}")))?;
-        Ok(response.iter().collect())
+        self.lookup(host, false).await
     }
 
     /// 绕过 hosts 文件解析（出站连接专用，加速域名不会被劫持成回环）
     pub async fn resolve_clean(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![ip]);
-        }
-        let response = self
-            .clean
-            .lookup_ip(host)
-            .await
-            .map_err(|e| DnsError::Resolve(format!("{host}: {e}")))?;
-        Ok(response.iter().collect())
+        self.lookup(host, true).await
     }
 
     /// 解析首个地址（对齐 AnalysisDomainIpAsync(...).FirstOrDefaultAsync）
@@ -181,12 +381,111 @@ impl DnsResolver {
             .ok()
             .and_then(|v| v.into_iter().next())
     }
+
+    /// 按顺序逐个服务器查询，首个非空结果即返回。
+    ///
+    /// 顺序而非并发：并发会让「能通但被污染」的服务器抢先返回，
+    /// 反而盖掉首位服务器的正确结果。
+    async fn lookup(&self, host: &str, clean: bool) -> Result<Vec<IpAddr>, DnsError> {
+        // IP 字面量直通
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        if self.entries.is_empty() {
+            return Err(DnsError::Resolve(format!("{host}: 无可用 DNS 服务器")));
+        }
+
+        let mut last_err = String::new();
+        for entry in &self.entries {
+            let resolver = if clean { &entry.clean } else { &entry.resolver };
+            let timeout = entry.spec.query_timeout();
+            match tokio::time::timeout(timeout, resolver.lookup_ip(host)).await {
+                Ok(Ok(response)) => {
+                    let ips: Vec<IpAddr> = response.iter().collect();
+                    if ips.is_empty() {
+                        last_err = format!("{} 无记录", entry.spec.describe());
+                        continue;
+                    }
+                    tracing::debug!(
+                        host,
+                        server = %entry.spec.describe(),
+                        count = ips.len(),
+                        "DNS 解析成功"
+                    );
+                    return Ok(ips);
+                }
+                Ok(Err(err)) => {
+                    last_err = format!("{}: {err}", entry.spec.describe());
+                }
+                Err(_) => {
+                    last_err = format!("{}: 超时({}s)", entry.spec.describe(), timeout.as_secs());
+                }
+            }
+        }
+
+        Err(DnsError::Resolve(format!(
+            "{host}: 全部 DNS 均失败（{last_err}）"
+        )))
+    }
+}
+
+/// 为单个服务器构建两套解析器
+fn build_entry(spec: &ResolverServer) -> Result<Entry, String> {
+    match spec {
+        ResolverServer::SystemDefault => Ok(Entry {
+            spec: spec.clone(),
+            resolver: system_resolver(true),
+            clean: system_resolver(false),
+        }),
+        ResolverServer::Udp(ip) => Ok(Entry {
+            spec: spec.clone(),
+            resolver: build_udp_resolver(*ip, true)?,
+            clean: build_udp_resolver(*ip, false)?,
+        }),
+        ResolverServer::Doh(url) => {
+            let plan = build_doh_plan(url)?;
+            Ok(Entry {
+                spec: spec.clone(),
+                resolver: build_doh_resolver(&plan, true)?,
+                clean: build_doh_resolver(&plan, false)?,
+            })
+        }
+    }
+}
+
+fn build_udp_resolver(ip: IpAddr, use_hosts_file: bool) -> Result<TokioResolver, String> {
+    let mut resolver_config = empty_resolver_config();
+    resolver_config.add_name_server(NameServerConfig::udp(ip));
+    TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+        .with_options(base_opts(use_hosts_file, 3, 2))
+        .build()
+        .map_err(|e| format!("构建 UDP DNS 解析器失败: {e}"))
+}
+
+fn build_doh_resolver(plan: &DohPlan, use_hosts_file: bool) -> Result<TokioResolver, String> {
+    // 每个引导地址一条 nameserver（hickory 会自行轮询/重试）
+    let mut resolver_config = empty_resolver_config();
+    for addr in &plan.addrs {
+        let mut ns_config = NameServerConfig::https(
+            addr.ip(),
+            Arc::from(plan.server_name.as_str()),
+            Some(Arc::from(plan.path.as_str())),
+        );
+        if let Some(conn) = ns_config.connections.first_mut() {
+            conn.port = addr.port();
+        }
+        ns_config.trust_negative_responses = false;
+        resolver_config.add_name_server(ns_config);
+    }
+    TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+        .with_options(base_opts(use_hosts_file, 4, 2))
+        .with_tls_config(doh_tls_client_config().clone())
+        .build()
+        .map_err(|e| format!("构建 DoH 解析器失败: {e}"))
 }
 
 /// 已解析好的 DoH 端点：主机名（用于 TLS 校验 + SNI）、路径与引导得到的 IP 列表
 struct DohPlan {
-    /// 用户配置的原始 URL，用于日志/UI 展示
-    url: String,
     /// TLS ServerName；IP 端点时即 IP 字面量（按 IP SAN 校验）
     server_name: String,
     /// DoH 请求路径（hickory 0.26 支持自定义）
@@ -202,91 +501,14 @@ struct DohEndpoint {
     path: String,
 }
 
-fn build_doh_plan(config: &DnsConfig) -> Result<Option<DohPlan>, String> {
-    if !config.use_doh {
-        return Ok(None);
-    }
-    let url = config
-        .custom_doh_address
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::DEFAULT_DOH_ADDRESS.to_string());
-    let endpoint = parse_doh_endpoint(&url)?;
+fn build_doh_plan(url: &str) -> Result<DohPlan, String> {
+    let endpoint = parse_doh_endpoint(url)?;
     let addrs = resolve_doh_addrs(&endpoint.host, endpoint.port)?;
-    Ok(Some(DohPlan {
-        url,
+    Ok(DohPlan {
         server_name: endpoint.host,
         path: endpoint.path,
         addrs,
-    }))
-}
-
-/// 根据配置与 DoH 计划推导实际后端（必须与 `build_resolver` 的回退顺序一致）
-fn select_backend(config: &DnsConfig, doh: Option<&DohPlan>) -> DnsBackend {
-    if let Some(plan) = doh {
-        return DnsBackend::Doh(plan.url.clone());
-    }
-    if let Some(ip) = config
-        .master_dns
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<IpAddr>().ok())
-    {
-        return DnsBackend::Udp(ip.to_string());
-    }
-    DnsBackend::System
-}
-
-fn build_resolver(
-    config: &DnsConfig,
-    use_hosts_file: bool,
-    doh: Option<&DohPlan>,
-) -> Result<TokioResolver, String> {
-    // DoH 模式：每个引导地址一条 nameserver（hickory 会自行轮询/重试）
-    if let Some(plan) = doh {
-        let mut resolver_config = empty_resolver_config();
-        for addr in &plan.addrs {
-            let mut ns_config = NameServerConfig::https(
-                addr.ip(),
-                Arc::from(plan.server_name.as_str()),
-                Some(Arc::from(plan.path.as_str())),
-            );
-            if let Some(conn) = ns_config.connections.first_mut() {
-                conn.port = addr.port();
-            }
-            ns_config.trust_negative_responses = false;
-            resolver_config.add_name_server(ns_config);
-        }
-        return TokioResolver::builder_with_config(
-            resolver_config,
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(base_opts(use_hosts_file, 4, 2))
-        .with_tls_config(doh_tls_client_config().clone())
-        .build()
-        .map_err(|e| format!("构建 DoH 解析器失败: {e}"));
-    }
-
-    // 自定义主 DNS
-    if let Some(master) = config.master_dns.as_deref().filter(|s| !s.is_empty()) {
-        if let Ok(ip) = master.parse::<IpAddr>() {
-            let mut resolver_config = empty_resolver_config();
-            resolver_config.add_name_server(NameServerConfig::udp(ip));
-            return TokioResolver::builder_with_config(
-                resolver_config,
-                TokioRuntimeProvider::default(),
-            )
-            .with_options(base_opts(use_hosts_file, 3, 2))
-            .build()
-            .map_err(|e| format!("构建 UDP DNS 解析器失败: {e}"));
-        }
-        tracing::warn!(
-            master,
-            "主 DNS 不是合法 IP，已回退到系统 DNS（设置页请填写 IP 字面量）"
-        );
-    }
-
-    Ok(system_resolver(use_hosts_file))
+    })
 }
 
 fn base_opts(use_hosts_file: bool, timeout_secs: u64, attempts: usize) -> ResolverOpts {
@@ -522,15 +744,17 @@ pub async fn fastest_dns(
             async move {
                 let config = if is_doh {
                     DnsConfig {
-                        master_dns: None,
                         use_doh: true,
                         custom_doh_address: doh,
+                        strict: true,
+                        ..Default::default()
                     }
                 } else {
                     DnsConfig {
-                        master_dns: Some(c.clone()),
-                        use_doh: false,
-                        custom_doh_address: None,
+                        resolver_servers: vec![ResolverServer::parse(&c)
+                            .unwrap_or(ResolverServer::SystemDefault)],
+                        strict: true,
+                        ..Default::default()
                     }
                 };
                 let resolver =
@@ -562,6 +786,63 @@ pub async fn fastest_dns(
 
 /// 供 watt-core 注入的共享解析器类型
 pub type SharedDnsResolver = Arc<DnsResolver>;
+
+/// DNS 预检查结果
+#[derive(Debug, Clone)]
+pub struct DnsCheckResult {
+    /// 至少一个配置内的服务器可用
+    pub ok: bool,
+    /// 诊断文本（成功时为首个应答服务器，失败时为聚合错误）
+    pub detail: String,
+}
+
+/// 启动前 DNS 预检查：**至少一个**配置服务器可用即通过。
+///
+/// 对齐上游 `CheckDnsServersAsync` 语义——它从「选出最快的一个并替换配置」
+/// 改为「只做可用性体检、配置顺序不变」，因此这里不返回「最佳服务器」，
+/// 只回答「这套配置现在能不能解析」。
+pub async fn check_resolver_servers(config: &DnsConfig, total_timeout: Duration) -> DnsCheckResult {
+    let strict = DnsConfig {
+        strict: true,
+        ..config.clone()
+    };
+    if effective_servers(&strict).is_empty() {
+        return DnsCheckResult {
+            ok: false,
+            detail: "未配置任何 DNS 服务器".to_string(),
+        };
+    }
+    // 构造可能在 getaddrinfo 上阻塞（DoH 引导），放到阻塞线程池
+    let resolver = match tokio::task::spawn_blocking(move || DnsResolver::with_config(strict)).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return DnsCheckResult {
+                ok: false,
+                detail: format!("DNS 预检查任务异常: {e}"),
+            }
+        }
+    };
+
+    match tokio::time::timeout(total_timeout, resolver.resolve(crate::DNS_CHECK_HOST)).await {
+        Ok(Ok(ips)) if !ips.is_empty() => DnsCheckResult {
+            ok: true,
+            detail: format!("{}（{} 个地址）", crate::DNS_CHECK_HOST, ips.len()),
+        },
+        Ok(Ok(_)) => DnsCheckResult {
+            ok: false,
+            detail: format!("{} 解析结果为空", crate::DNS_CHECK_HOST),
+        },
+        Ok(Err(e)) => DnsCheckResult {
+            ok: false,
+            detail: e.to_string(),
+        },
+        Err(_) => DnsCheckResult {
+            ok: false,
+            detail: format!("预检查超时（{}s）", total_timeout.as_secs()),
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -618,10 +899,138 @@ mod tests {
             master_dns: Some("223.5.5.5".into()),
             use_doh: true,
             custom_doh_address: Some("http://doh.pub/dns-query".into()),
+            ..Default::default()
         });
         assert!(!resolver.is_doh_active());
         assert_eq!(resolver.backend(), &DnsBackend::Udp("223.5.5.5".into()));
-        assert!(resolver.doh_error().unwrap().contains("https://"));
+        assert!(
+            resolver.doh_error().unwrap().contains("DoH"),
+            "应记录 DoH 配置失败：{:?}",
+            resolver.doh_error()
+        );
+    }
+
+    /// 列表解析：三类服务器识别 + 无法识别的项跳过而不是整表失效
+    #[test]
+    fn test_resolver_server_parse() {
+        assert_eq!(
+            ResolverServer::parse("System Default"),
+            Some(ResolverServer::SystemDefault)
+        );
+        assert_eq!(
+            ResolverServer::parse(" system "),
+            Some(ResolverServer::SystemDefault)
+        );
+        assert_eq!(
+            ResolverServer::parse("223.5.5.5"),
+            Some(ResolverServer::Udp("223.5.5.5".parse().unwrap()))
+        );
+        assert_eq!(
+            ResolverServer::parse("https://doh.pub/dns-query"),
+            Some(ResolverServer::Doh("https://doh.pub/dns-query".into()))
+        );
+
+        // 非法项返回 None（由调用方跳过）
+        assert_eq!(ResolverServer::parse(""), None);
+        assert_eq!(ResolverServer::parse("   "), None);
+        assert_eq!(ResolverServer::parse("not-a-server"), None);
+        assert_eq!(ResolverServer::parse("http://doh.pub/dns-query"), None);
+
+        // 历史 JSON 端点 → RFC 8484 路径
+        assert_eq!(
+            ResolverServer::parse("https://dns.google/resolve"),
+            Some(ResolverServer::Doh("https://dns.google/dns-query".into()))
+        );
+        // 非预设的自定义路径保持原样
+        assert_eq!(
+            ResolverServer::parse("https://example.com/resolve"),
+            Some(ResolverServer::Doh("https://example.com/resolve".into()))
+        );
+    }
+
+    /// 生效列表：去重保序、Hosts 模式替换系统项、超长截断
+    #[test]
+    fn test_effective_servers_order_and_substitution() {
+        let raw = "https://doh.pub/dns-query\n223.5.5.5\nhttps://doh.pub/dns-query\nbad-entry";
+        let config = DnsConfig {
+            resolver_servers: raw
+                .lines()
+                .filter_map(ResolverServer::parse)
+                .collect::<Vec<_>>(),
+            ..Default::default()
+        };
+        let servers = effective_servers(&config);
+        assert_eq!(servers.len(), 2, "重复项应被去重：{servers:?}");
+        assert_eq!(servers[0], ResolverServer::Doh("https://doh.pub/dns-query".into()));
+        assert_eq!(servers[1], ResolverServer::Udp("223.5.5.5".parse().unwrap()));
+
+        // Hosts 模式：SystemDefault 被替换为公共 DNS，且顺序仍在原位置
+        let config = DnsConfig {
+            resolver_servers: vec![ResolverServer::SystemDefault],
+            prefer_public_dns: true,
+            ..Default::default()
+        };
+        let servers = effective_servers(&config);
+        assert_eq!(servers.len(), crate::DEFAULT_DNS_SERVERS.len());
+        assert!(servers.iter().all(|s| matches!(s, ResolverServer::Udp(_))));
+        assert!(!servers.contains(&ResolverServer::SystemDefault));
+
+        // 截断
+        let config = DnsConfig {
+            resolver_servers: (1..=20u8)
+                .map(|i| ResolverServer::Udp(IpAddr::from([10, 0, 0, i])))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(effective_servers(&config).len(), MAX_RESOLVER_SERVERS);
+    }
+
+    /// 旧配置合成顺序：勾选 DoH 时 DoH 优先，否则明文优先
+    #[test]
+    fn test_legacy_config_server_synthesis() {
+        let with_doh = DnsConfig {
+            use_doh: true,
+            custom_doh_address: Some("https://doh.pub/dns-query".into()),
+            master_dns: Some("119.29.29.29".into()),
+            ..Default::default()
+        };
+        let servers = effective_servers(&with_doh);
+        assert!(matches!(servers[0], ResolverServer::Doh(_)));
+        assert_eq!(servers[1], ResolverServer::Udp("119.29.29.29".parse().unwrap()));
+
+        let without_doh = DnsConfig {
+            master_dns: Some("119.29.29.29".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_servers(&without_doh),
+            vec![ResolverServer::Udp("119.29.29.29".parse().unwrap())]
+        );
+
+        // 全空 → 系统默认
+        assert_eq!(
+            effective_servers(&DnsConfig::default()),
+            vec![ResolverServer::SystemDefault]
+        );
+    }
+
+    /// 严格单端点：构建失败不注入系统兜底（供 DoH 探测如实报错）
+    #[test]
+    fn test_strict_single_server_has_no_system_fallback() {
+        let resolver = DnsResolver::single(ResolverServer::Doh(
+            "http://doh.pub/dns-query".into(),
+        ));
+        // Doh("http://…") 无法构建 → 严格模式不兜底
+        assert!(resolver.servers().is_empty());
+        assert!(!resolver.is_doh_active());
+        assert!(resolver.doh_error().is_some());
+
+        let ok = DnsResolver::single(ResolverServer::Udp("223.5.5.5".parse().unwrap()));
+        assert_eq!(
+            ok.servers(),
+            vec![&ResolverServer::Udp("223.5.5.5".parse().unwrap())]
+        );
+        assert_eq!(ok.backend(), &DnsBackend::Udp("223.5.5.5".into()));
     }
 
     #[test]
@@ -657,9 +1066,9 @@ mod tests {
             .try_init();
 
         let resolver = DnsResolver::with_config(DnsConfig {
-            master_dns: None,
             use_doh: true,
             custom_doh_address: Some("https://doh.pub/dns-query".into()),
+            ..Default::default()
         });
         assert!(
             resolver.is_doh_active(),
@@ -676,9 +1085,9 @@ mod tests {
     #[ignore = "需要网络：验证真实 DoH 握手"]
     async fn test_doh_live_ip_endpoint() {
         let resolver = DnsResolver::with_config(DnsConfig {
-            master_dns: None,
             use_doh: true,
             custom_doh_address: Some("https://1.12.12.12/dns-query".into()),
+            ..Default::default()
         });
         assert!(
             resolver.is_doh_active(),
@@ -687,5 +1096,29 @@ mod tests {
         );
         let ips = resolver.resolve_clean("example.com").await.unwrap();
         assert!(!ips.is_empty(), "DoH 返回空结果");
+    }
+
+    /// 真实网络验证：首个服务器黑洞（TEST-NET-1 不可达）时应自动落到下一个。
+    #[tokio::test]
+    #[ignore = "需要网络：验证服务器列表逐项回退"]
+    async fn test_server_list_falls_back_on_timeout() {
+        let resolver = DnsResolver::with_config(DnsConfig {
+            resolver_servers: vec![
+                ResolverServer::Udp("192.0.2.1".parse().unwrap()),
+                ResolverServer::Udp("223.5.5.5".parse().unwrap()),
+            ],
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let ips = resolver
+            .resolve_clean("example.com")
+            .await
+            .expect("首个服务器失败后应回退到第二个");
+        assert!(!ips.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "回退不应叠加超时，实际 {:?}",
+            started.elapsed()
+        );
     }
 }

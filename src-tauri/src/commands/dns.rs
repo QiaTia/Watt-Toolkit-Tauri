@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 use std::time::Instant;
-use watt_dns::{DnsConfig, DnsResolver};
+use watt_dns::DnsResolver;
 
 /// DoH 探测结果
 #[derive(Debug, Clone, Serialize)]
@@ -35,11 +35,8 @@ pub async fn dns_probe_doh(endpoint: Option<String>) -> Result<DohProbeDto, Stri
 
     let probe_endpoint = endpoint.clone();
     let resolver = tokio::task::spawn_blocking(move || {
-        DnsResolver::with_config(DnsConfig {
-            master_dns: None,
-            use_doh: true,
-            custom_doh_address: Some(probe_endpoint),
-        })
+        // 严格单端点：不做任何回退，端点不可用时如实报错（而不是悄悄用系统 DNS）
+        DnsResolver::single(watt_dns::ResolverServer::Doh(probe_endpoint))
     })
     .await
     .map_err(|e| format!("DoH 探测任务异常: {e}"))?;

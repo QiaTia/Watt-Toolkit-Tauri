@@ -43,40 +43,47 @@ async fn build_resolvers(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>
 fn build_resolvers_sync(dns: &watt_config::DnsSettings) -> Vec<Arc<DnsResolver>> {
     let mut out: Vec<Arc<DnsResolver>> = Vec::new();
 
-    // 1. DoH（仅当启用且端点真正可用；失效时由后续 UDP 链路兜底）
-    if dns.use_doh {
-        let resolver = DnsResolver::with_config(DnsConfig {
-            master_dns: None,
-            use_doh: true,
-            custom_doh_address: dns.custom_doh_address.clone(),
-        });
-        if resolver.is_doh_active() {
-            out.push(Arc::new(resolver));
+    // 1. 用户配置的有序服务器列表（每个服务器一个单端点解析器，便于标注来源）。
+    //    空列表时由旧三字段合成，兼容 v0.5.x 配置。
+    let configured = DnsConfig {
+        resolver_servers: watt_dns::parse_server_list(&dns.resolver_servers),
+        master_dns: dns.master_dns.clone(),
+        use_doh: dns.use_doh,
+        custom_doh_address: dns.custom_doh_address.clone(),
+        ..Default::default()
+    };
+    for server in watt_dns::effective_servers(&configured) {
+        // 系统 DNS 留到最后统一兜底，避免与第 4 步重复
+        if matches!(server, watt_dns::ResolverServer::SystemDefault) {
+            continue;
         }
+        let resolver = DnsResolver::single(server.clone());
+        // DoH 端点不可用时（地址非法/引导失败）跳过，由后续链路兜底
+        if matches!(server, watt_dns::ResolverServer::Doh(_)) && !resolver.is_doh_active() {
+            tracing::warn!(
+                server = %server.describe(),
+                error = resolver.doh_error().unwrap_or("未知原因"),
+                "IP 池的 DoH 端点不可用，已跳过"
+            );
+            continue;
+        }
+        out.push(Arc::new(resolver));
     }
 
-    // 2. 用户配置的 DNS（仅当为 IP 字面量时生效；域名型不适用于本链路）
-    if let Some(master) = dns.master_dns.as_deref().filter(|s| !s.is_empty()) {
-        if master.parse::<IpAddr>().is_ok() {
-            out.push(Arc::new(DnsResolver::with_config(DnsConfig {
-                master_dns: Some(master.to_string()),
-                use_doh: false,
-                custom_doh_address: None,
-            })));
-        }
-    }
-
-    // 3. 内置公共 DNS（UDP）
+    // 2. 内置公共 DNS（UDP）
     for ip in PUBLIC_DNS_IPS {
-        out.push(Arc::new(DnsResolver::with_config(DnsConfig {
-            master_dns: Some((*ip).to_string()),
-            use_doh: false,
-            custom_doh_address: None,
-        })));
+        let Ok(parsed) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        out.push(Arc::new(DnsResolver::single(
+            watt_dns::ResolverServer::Udp(parsed),
+        )));
     }
 
-    // 4. 系统 DNS（最终兜底）
-    out.push(Arc::new(DnsResolver::system()));
+    // 3. 系统 DNS（最终兜底）
+    out.push(Arc::new(DnsResolver::single(
+        watt_dns::ResolverServer::SystemDefault,
+    )));
     out
 }
 

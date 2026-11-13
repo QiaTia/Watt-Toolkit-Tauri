@@ -10,3 +10,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 dirs = "5"
+# 旧配置迁移需要与运行时同一套 DNS 服务器解析规则（默认 DoH 地址、/resolve 规范化）
+watt-dns = { workspace = true }

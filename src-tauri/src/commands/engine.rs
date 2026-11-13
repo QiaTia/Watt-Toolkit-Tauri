@@ -104,11 +104,16 @@ pub async fn engine_start(
         Some(ip) => ip.parse().map_err(|_| format!("无效监听 IP: {ip}"))?,
     };
 
-    // DNS 设置转换
+    // DNS 设置转换：有序列表优先，空列表时由旧三字段合成（兼容 v0.5.x 配置）。
+    // `prefer_public_dns` 由 watt-core 按代理模式决定（Hosts 模式替换系统 DNS）。
     let dns = DnsConfig {
+        resolver_servers: watt_dns::parse_server_list(&params.dns.resolver_servers),
         master_dns: params.dns.master_dns,
         use_doh: params.dns.use_doh,
         custom_doh_address: params.dns.custom_doh_address,
+        before_dns_check: params.dns.before_dns_check,
+        prefer_public_dns: false,
+        strict: false,
     };
 
     // 端口 0 在 bind 语义里是「由系统分配随机端口」，而设置页清空端口输入框会写入 0。

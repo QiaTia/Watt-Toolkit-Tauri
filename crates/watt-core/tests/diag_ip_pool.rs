@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use watt_dns::{DnsConfig, DnsResolver};
+use watt_dns::DnsResolver;
 
 /// 与命令层一致的解析器链（内置公共 DNS → 系统 DNS；不使用 DoH，见命令层注释）
 fn resolvers() -> Vec<(String, Arc<DnsResolver>)> {
@@ -19,11 +19,9 @@ fn resolvers() -> Vec<(String, Arc<DnsResolver>)> {
     for ip in ["223.5.5.5", "119.29.29.29", "8.8.8.8"] {
         out.push((
             format!("DNS {ip}"),
-            Arc::new(DnsResolver::with_config(DnsConfig {
-                master_dns: Some((*ip).to_string()),
-                use_doh: false,
-                custom_doh_address: None,
-            })),
+            Arc::new(DnsResolver::single(watt_dns::ResolverServer::Udp(
+                ip.parse().expect("内置 DNS 必须是合法 IP"),
+            ))),
         ));
     }
     out.push(("系统 DNS".to_string(), Arc::new(DnsResolver::system())));

@@ -9,6 +9,53 @@ use crate::settings::{ProxyMode, ProxySettings};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// 把旧版「主 DNS / 是否 DoH / 自定义 DoH」三字段展开为有序服务器列表。
+///
+/// 顺序对齐上游 `MigrateDnsServerList`：勾选 DoH 时 DoH 优先，否则明文优先；
+/// 无法识别的地址跳过（剩下的项仍可用），全部不可识别时保持空列表，
+/// 由运行时按旧字段兜底（系统 DNS）。
+///
+/// 与上游的一处刻意差异：未勾选 DoH 时**不**追加 DoH 端点——
+/// 用户明确关掉加密 DNS 后不应被迁移重新打开。
+pub fn expand_dns_server_list(dns: &mut crate::settings::DnsSettings) {
+    if dns.resolver_servers_migrated {
+        return;
+    }
+    let mut servers: Vec<String> = Vec::new();
+
+    let doh = dns
+        .custom_doh_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| watt_dns::DEFAULT_DOH_ADDRESS.to_string());
+    let master = dns
+        .master_dns
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if dns.use_doh {
+        servers.push(doh);
+        if let Some(master) = master {
+            servers.push(master);
+        }
+    } else if let Some(master) = master {
+        servers.push(master);
+    }
+
+    // 只保留可识别的项，并去重（保序）
+    let mut seen = std::collections::HashSet::new();
+    servers.retain(|s| {
+        watt_dns::ResolverServer::parse(s).is_some() && seen.insert(s.to_ascii_lowercase())
+    });
+
+    dns.resolver_servers = servers;
+    dns.resolver_servers_migrated = true;
+}
+
 /// 旧版数据目录（`%LocalAppData%\Steam++`，见 WindowsFileSystem.AppDataDirectory）
 #[derive(Debug, Clone)]
 pub struct LegacyPaths {
@@ -198,7 +245,11 @@ impl From<LegacyProxySettings> for MigrationOutcome {
             master_dns: legacy.proxy_master_dns,
             use_doh: legacy.use_doh.unwrap_or(false),
             custom_doh_address: legacy.custom_doh_addres2,
+            resolver_servers: Vec::new(),
+            resolver_servers_migrated: false,
         };
+        // 展开为有序服务器列表（对齐上游 MigrateDnsServerList：勾选 DoH 时 DoH 优先）
+        expand_dns_server_list(&mut settings.dns);
 
         // GOG
         settings.is_proxy_gog = legacy.is_proxy_gog.unwrap_or(false);
@@ -275,6 +326,16 @@ mod tests {
             Some("https://dns.alidns.com/dns-query")
         );
         assert!(s.dns.before_dns_check);
+        // 旧三字段已展开为有序列表：勾选 DoH → DoH 优先，明文 DNS 次之
+        assert!(s.dns.resolver_servers_migrated);
+        assert_eq!(
+            s.dns.resolver_servers.first().map(String::as_str),
+            Some("https://dns.alidns.com/dns-query")
+        );
+        assert_eq!(
+            s.dns.resolver_servers.get(1).map(String::as_str),
+            Some("223.5.5.5")
+        );
         assert!(s.is_proxy_gog);
         assert_eq!(s.enabled_accelerate_ids, vec!["steam", "github"]);
         assert!(outcome.warnings.is_empty());
