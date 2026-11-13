@@ -66,7 +66,19 @@ pub enum EngineStateDto {
     Stopping,
     Error {
         message: String,
+        /// 结构化错误分类（bindPort / accessSurface / hostsWrite / dnsInit / …）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
+}
+
+/// 构建 DTO：错误分类来自 engine（`EngineState` 本身只带消息文本）
+fn state_dto(engine: &watt_core::ProxyEngine) -> EngineStateDto {
+    let mut dto: EngineStateDto = engine.state().into();
+    if let EngineStateDto::Error { code, .. } = &mut dto {
+        *code = engine.error_code().map(|c| c.as_str().to_string());
+    }
+    dto
 }
 
 impl From<EngineState> for EngineStateDto {
@@ -79,7 +91,10 @@ impl From<EngineState> for EngineStateDto {
                 mode: mode.as_str().to_string(),
             },
             EngineState::Stopping => EngineStateDto::Stopping,
-            EngineState::Error(message) => EngineStateDto::Error { message },
+            EngineState::Error(message) => EngineStateDto::Error {
+                message,
+                code: None,
+            },
         }
     }
 }
@@ -195,7 +210,7 @@ pub async fn engine_start(
     };
 
     engine.start(config).await.map_err(|e| e.to_string())?;
-    let dto: EngineStateDto = engine.state().into();
+    let dto = state_dto(&engine);
     drop(engine);
     // 同步托盘菜单文案并广播状态变更（使面板与托盘一致）
     crate::tray::sync_tray_label(&app, matches!(dto, EngineStateDto::Running { .. }));
@@ -210,7 +225,7 @@ pub async fn engine_stop(
 ) -> Result<EngineStateDto, String> {
     let mut engine = state.engine.lock().await;
     engine.stop().await.map_err(|e| e.to_string())?;
-    let dto: EngineStateDto = engine.state().into();
+    let dto = state_dto(&engine);
     drop(engine);
     crate::tray::sync_tray_label(&app, false);
     let _ = app.emit(crate::tray::ENGINE_STATE_EVENT, ());
@@ -229,7 +244,7 @@ pub async fn engine_probe_summary(
 #[tauri::command]
 pub async fn engine_get_state(state: tauri::State<'_, AppState>) -> Result<EngineStateDto, String> {
     let engine = state.engine.lock().await;
-    Ok(engine.state().into())
+    Ok(state_dto(&engine))
 }
 
 #[tauri::command]

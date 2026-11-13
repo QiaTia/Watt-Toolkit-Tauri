@@ -29,6 +29,6 @@ pub mod system_proxy;
 pub mod terminal_proxy;
 pub mod upgrade;
 
-pub use engine::{EngineConfig, EngineState, ProxyEngine};
+pub use engine::{EngineConfig, EngineError, EngineErrorCode, EngineState, ProxyEngine};
 pub use stats::FlowStats;
 pub use access_log::{AccessLogEntry, AccessLogFilter, AccessLogPage, AccessLogStore, Disposition};

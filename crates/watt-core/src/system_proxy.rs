@@ -4,8 +4,10 @@
 //! - 系统代理：ProxyEnable / ProxyServer / ProxyOverride
 //! - PAC：AutoConfigURL
 //!
-//! 其他平台：本阶段不接入（原版 macOS/Linux 各自走 gsettings/networksetup，
-//! 返回不支持错误由引擎决定是否阻断）。
+//! Linux：`gsettings`（GNOME/dconf 系）。逐键执行并校验退出码——拼接整段 shell
+//! 一次执行且永远返回成功会让用户误以为设置生效。
+//!
+//! 其余平台（含 KDE 等非 GNOME 桌面）：返回明确的「不支持」错误，不静默成功。
 
 /// 排除代理地址（对齐 IPlatformService.GetNoProxyHostName：内网段 + 官方 API）
 pub fn no_proxy_host_names() -> Vec<String> {
@@ -139,7 +141,11 @@ pub fn set_system_proxy(enable: bool, ip: &str, port: u16) -> Result<(), String>
     {
         macos::set_system_proxy(enable, ip, port)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_system_proxy(enable, ip, port)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (enable, ip, port);
         Err("当前平台暂不支持系统代理模式设置".into())
@@ -214,7 +220,11 @@ pub fn set_system_pac(enable: bool, pac_url: &str) -> Result<(), String> {
     {
         macos::set_system_pac(enable, pac_url)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_system_pac(enable, pac_url)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (enable, pac_url);
         Err("当前平台暂不支持 PAC 代理模式设置".into())
@@ -304,7 +314,11 @@ pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
     {
         macos::get_system_proxy_status()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::get_system_proxy_status()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         (false, None, None)
     }
@@ -345,7 +359,13 @@ pub fn should_rollback_proxy_on_failure() -> bool {
     {
         macos::snapshot_exists()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        // 未做快照：失败时只可能残留「端点已写、mode 仍是原值」的中间态，
+        // 此时切 mode=none 反而会关掉用户原有的手动代理。
+        false
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         true
     }
@@ -555,6 +575,118 @@ mod netparse {
             let services = parse_service_list(LIST_OUTPUT);
             let resolved = resolve_from(&services, &None);
             assert_eq!(resolved.len(), 3);
+        }
+    }
+}
+
+/// Linux 实现：`gsettings`（GNOME/dconf）。
+///
+/// 与上游 3.2.0 一致的两点关键行为：
+/// 1. **逐键执行并校验退出码**——旧实现把多条命令拼成一段 shell 一次执行且
+///    永远返回成功，用户以为设置生效其实没有；
+/// 2. **端点先写、`mode` 最后切**——避免「模式已改 manual、端点还是空」的中间态，
+///    那个窗口里浏览器会连一个空代理直接断网。
+///
+/// 不支持 gsettings 的桌面（KDE/XFCE/无 GUI）明确报错，不静默成功。
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::process::Command;
+
+    /// 执行 `gsettings set`，失败带 stderr 原文
+    fn gsettings_set(schema: &str, key: &str, value: &str) -> Result<(), String> {
+        let output = Command::new("gsettings")
+            .args(["set", schema, key, value])
+            .output()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "未找到 gsettings：当前桌面环境不支持自动配置系统代理（仅 GNOME/dconf 系可用），\
+                     请改用 Hosts 模式或在系统设置中手动填写代理"
+                        .to_string()
+                }
+                _ => format!("执行 gsettings 失败: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "gsettings set {schema} {key} 失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 读取 gsettings 值（去掉 GVariant 的引号）；不可用时返回 None
+    fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+        let output = Command::new("gsettings")
+            .args(["get", schema, key])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .trim_matches('\'')
+                .to_string(),
+        )
+    }
+
+    pub fn set_system_proxy(enable: bool, ip: &str, port: u16) -> Result<(), String> {
+        if !enable {
+            return gsettings_set("org.gnome.system.proxy", "mode", "none");
+        }
+        if port == 0 {
+            return Err("代理端口不能为 0".into());
+        }
+        let port = port.to_string();
+        for schema in [
+            "org.gnome.system.proxy.http",
+            "org.gnome.system.proxy.https",
+        ] {
+            gsettings_set(schema, "host", ip)?;
+            gsettings_set(schema, "port", &port)?;
+        }
+        gsettings_set(
+            "org.gnome.system.proxy",
+            "ignore-hosts",
+            &ignore_hosts_value(),
+        )?;
+        gsettings_set("org.gnome.system.proxy", "mode", "manual")
+    }
+
+    pub fn set_system_pac(enable: bool, pac_url: &str) -> Result<(), String> {
+        if !enable {
+            return gsettings_set("org.gnome.system.proxy", "mode", "none");
+        }
+        gsettings_set("org.gnome.system.proxy", "autoconfig-url", pac_url)?;
+        gsettings_set("org.gnome.system.proxy", "mode", "auto")
+    }
+
+    /// `ignore-hosts` 是 GVariant 字符串数组：`['10.*', '192.168.*']`
+    fn ignore_hosts_value() -> String {
+        let items: Vec<String> = super::no_proxy_host_names()
+            .iter()
+            .map(|host| format!("'{host}'"))
+            .collect();
+        format!("[{}]", items.join(", "))
+    }
+
+    pub fn get_system_proxy_status() -> (bool, Option<String>, Option<String>) {
+        let mode = gsettings_get("org.gnome.system.proxy", "mode").unwrap_or_default();
+        if mode.is_empty() || mode == "none" {
+            return (false, None, None);
+        }
+        if mode == "auto" {
+            let pac = gsettings_get("org.gnome.system.proxy", "autoconfig-url")
+                .filter(|v| !v.is_empty());
+            return (true, None, pac);
+        }
+        let host = gsettings_get("org.gnome.system.proxy.http", "host").unwrap_or_default();
+        let port = gsettings_get("org.gnome.system.proxy.http", "port").unwrap_or_default();
+        if host.is_empty() {
+            (true, None, None)
+        } else {
+            (true, Some(format!("{host}:{port}")), None)
         }
     }
 }

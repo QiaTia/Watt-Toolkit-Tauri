@@ -18,12 +18,24 @@ export interface AppInfo {
 
 /* ========== 引擎状态 ========== */
 
+/** 引擎错误分类（后端 EngineErrorCode，用于差异化提示） */
+export type EngineErrorCode =
+  | 'bindPort'
+  | 'privileged'
+  | 'dnsInit'
+  | 'accessSurface'
+  | 'hostsWrite'
+  | 'shutdownTimeout'
+  | 'alreadyRunning'
+  | 'notRunning'
+  | 'other';
+
 export type EngineStateDto =
   | { type: 'stopped' }
   | { type: 'starting' }
   | { type: 'running'; startedAt: string; mode: string }
   | { type: 'stopping' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: EngineErrorCode };
 
 export interface FlowStatsDto {
   upBytes: number;

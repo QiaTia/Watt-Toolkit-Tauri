@@ -270,9 +270,12 @@ impl RelayContext {
         host: &str,
     ) -> (RelayResponse, Disposition) {
         let host = host.to_string();
+        // 纯主机名：Host 头可能带端口（`example.com:8080`）或 IPv6 方括号。
+        // 规则匹配 / DNS 查询 / TLS SNI 只接受主机名，必须用归一化值。
+        let bare_host = normalize_host(&host);
 
         // —— 本地域名 / 注入脚本路径短路 ——
-        if LocalDomainHandler::should_handle(&host, req.uri().path()) {
+        if LocalDomainHandler::should_handle(&bare_host, req.uri().path()) {
             return (
                 self.local.handle(req, &host).await.map(boxed_full),
                 Disposition::Local,
@@ -302,7 +305,7 @@ impl RelayContext {
         let is_script_inject = !scripts.is_empty();
 
         // —— 域名规则匹配 ——
-        let matched = self.find_domain_config(&url, &host);
+        let matched = self.find_domain_config(&url, &bare_host);
 
         let Some((rule, is_default)) = matched else {
             // 未匹配：二级代理全局转发 或 404
@@ -328,10 +331,10 @@ impl RelayContext {
         // 原版用 DNSPod 公共 DNS 反查（绕过本机 hosts），此处用 clean 解析对齐：
         // 若用读 hosts 的解析器，用户/引擎自身写入的 hosts 条目会被误判为污染。
         if is_default && !self.only_enable_proxy_script {
-            if let Some(ip) = self.dns.resolve_first_clean(&host).await {
+            if let Some(ip) = self.dns.resolve_first_clean(&bare_host).await {
                 if watt_dns::is_polluted_ip(&ip) {
                     return (
-                        error_response(&watt_dns::pollution::pollution_error_body(&host)),
+                        error_response(&watt_dns::pollution::pollution_error_body(&bare_host)),
                         disp,
                     );
                 }
@@ -342,14 +345,14 @@ impl RelayContext {
                     tracing::warn!(host = %host, %ip, "默认规则解析到回环地址，拒绝转发（疑似 DNS 污染）");
                     return (
                         error_response(&format!(
-                            "DNS 解析异常：{host} 被解析到 {ip}（回环地址），已拒绝转发以避免自环。请在设置中更换 DNS 服务器。"
+                            "DNS 解析异常：{bare_host} 被解析到 {ip}（回环地址），已拒绝转发以避免自环。请在设置中更换 DNS 服务器。"
                         )),
                         disp,
                     );
                 }
             } else {
                 return (
-                    error_response(&watt_dns::pollution::pollution_error_body(&host)),
+                    error_response(&watt_dns::pollution::pollution_error_body(&bare_host)),
                     disp,
                 );
             }
@@ -606,7 +609,7 @@ impl RelayContext {
                 },
             ),
             tls: destination_uri.scheme_str() == Some("https"),
-            tls_sni: resolve_tls_sni(rule, &host),
+            tls_sni: resolve_tls_sni(rule, &normalize_host(&host)),
             tls_ignore_name_mismatch: rule.fields.tls_ignore_name_mismatch,
             tls_skip_verify: rule.fields.tls_skip_verify,
             override_ip: rule.fields.ip_address,
@@ -1375,6 +1378,34 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+/// 去掉 `Host` 头里的端口与 IPv6 方括号，得到纯主机名。
+///
+/// `Host: example.com:8080` / `[::1]:8080` 是合法请求，但域名规则匹配、DNS 查询、
+/// TLS SNI 都只接受主机名：
+/// - `resolve("example.com:8080")` 必然失败 → 被误判成 DNS 污染，返回错误页；
+/// - SNI 里带冒号无法解析成 `ServerName` → 上游 TLS 握手直接失败。
+///
+/// 只处理「一个冒号且右侧全为数字」和「`[..]` 包裹」两种情况；无方括号的
+/// IPv6 形式（多个冒号）原样返回，避免把地址误裁成前半段。
+pub fn normalize_host(raw: &str) -> String {
+    let host = raw.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some((addr, _)) = rest.split_once(']') {
+            return addr.to_string();
+        }
+        return host.to_string();
+    }
+    if host.matches(':').count() != 1 {
+        return host.to_string();
+    }
+    match host.split_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name.to_string()
+        }
+        _ => host.to_string(),
+    }
+}
+
 /// 解析请求的目标主机。
 ///
 /// HTTP/1.1（origin-form）的目标主机在 `Host` 头；而 **HTTP/2 没有 `Host` 头**，主机只存在于
@@ -1629,5 +1660,22 @@ mod tests {
             .map(|v| v.to_str().unwrap())
             .collect();
         assert_eq!(values, vec!["a=1; Path=/", "b=2; Path=/"]);
+    }
+
+    /// Host 头归一化：去端口 / 去 IPv6 方括号，但不误裁无方括号的 IPv6
+    #[test]
+    fn test_normalize_host() {
+        assert_eq!(normalize_host("example.com"), "example.com");
+        assert_eq!(normalize_host("example.com:8080"), "example.com");
+        assert_eq!(normalize_host("  example.com:443  "), "example.com");
+
+        assert_eq!(normalize_host("[::1]:8080"), "::1");
+        assert_eq!(normalize_host("[2001:db8::1]"), "2001:db8::1");
+
+        // 无方括号的 IPv6（多个冒号）原样保留，不能被裁成前半段
+        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
+        // 非数字端口 / 空端口不当作端口处理
+        assert_eq!(normalize_host("example.com:abc"), "example.com:abc");
+        assert_eq!(normalize_host("example.com:"), "example.com:");
     }
 }

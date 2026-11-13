@@ -1,13 +1,17 @@
 //! 代理引擎：启停编排（对齐 ProxyService.Operate / YarpReverseProxyServiceImpl）。
 //!
-//! 启动时序（对齐 C#）：
-//! 1. 模式前置：Hosts → 443 端口预检（Windows 报占用进程名）；
-//!    System → 注册表系统代理（失败即中止）；PAC → AutoConfigURL。
-//! 2. 构建规则/脚本上下文 → 按模式绑定监听：
-//!    - Hosts：443 MITM（+可选 80 重定向）
-//!    - System/PAC/ProxyOnly：正向代理端口（CONNECT 隧道/绝对 URI/PAC 端点）
-//!    - SOCKS5：可选，与模式无关
-//! 3. Hosts 模式：监听启动后写 hosts（失败回滚停止，对齐 C#）。
+//! 启动时序（对齐上游 3.2.0 的「先监听、后接入」）：
+//! 1. 模式前置：仅做 Hosts 的 443 端口预检（Windows 报占用进程名）。
+//! 2. 解析器 / 规则 / 脚本 / 探测上下文构建。
+//! 3. **绑定全部监听端口**（Hosts: 443/80；System/PAC/ProxyOnly: 正向代理；SOCKS5）。
+//! 4. 启动监听任务。
+//! 5. **接入面**（绑定成功之后才写）：
+//!    - Hosts：写 hosts 标记块
+//!    - System：写注册表系统代理；PAC：写 AutoConfigURL
+//!    - 失败 → 撤销已写入的接入面 + 关闭监听
+//!
+//! 顺序不可颠倒：先写接入面再绑定，中间会出现「系统代理指向未监听端口」的窗口，
+//! 进程此刻被强杀就是全断网。
 //!
 //! 停止时序：摘除 hosts（失败阻止停止）→ 取消系统代理/PAC → 关闭监听。
 
@@ -130,6 +134,8 @@ pub struct ProxyEngine {
     probe_cache_persist: bool,
     /// 本次运行注入的终端代理环境变量备份路径（未注入为 None）
     terminal_proxy_backup: Option<std::path::PathBuf>,
+    /// 最近一次进入 Error 状态的分类（供前端差异化提示）
+    last_error: Option<EngineErrorCode>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,8 +146,68 @@ pub enum EngineError {
     AlreadyRunning,
     #[error("引擎未运行")]
     NotRunning,
+    #[error("系统代理/PAC 写入失败: {0}")]
+    AccessSurface(String),
+    #[error("hosts 写入失败: {0}")]
+    HostsWrite(String),
     #[error("{0}")]
     Other(String),
+}
+
+/// 引擎错误分类：随 Error 状态回传前端做差异化提示。
+///
+/// 与消息文本分开表达，前端不需要靠字符串匹配猜测失败原因
+/// （上游 3.2.0 同样把「端口绑定 / 证书 / 接入面」拆成独立结果码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineErrorCode {
+    /// 端口被占用或无权限监听
+    BindPort,
+    /// 特权模式被拦截（macOS Hosts 需 root）
+    Privileged,
+    /// DNS 解析器初始化失败
+    DnsInit,
+    /// 系统代理 / PAC 写入失败（已自动回滚）
+    AccessSurface,
+    /// hosts 文件写入失败（监听已回滚）
+    HostsWrite,
+    /// 停止时监听未按时退出
+    ShutdownTimeout,
+    /// 已在运行
+    AlreadyRunning,
+    /// 未运行
+    NotRunning,
+    /// 其它未分类错误
+    Other,
+}
+
+impl EngineErrorCode {
+    /// 前端使用的稳定标识（serde 时按此字符串传输）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BindPort => "bindPort",
+            Self::Privileged => "privileged",
+            Self::DnsInit => "dnsInit",
+            Self::AccessSurface => "accessSurface",
+            Self::HostsWrite => "hostsWrite",
+            Self::ShutdownTimeout => "shutdownTimeout",
+            Self::AlreadyRunning => "alreadyRunning",
+            Self::NotRunning => "notRunning",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl EngineError {
+    pub fn code(&self) -> EngineErrorCode {
+        match self {
+            Self::BindPortError(_, _) => EngineErrorCode::BindPort,
+            Self::AlreadyRunning => EngineErrorCode::AlreadyRunning,
+            Self::NotRunning => EngineErrorCode::NotRunning,
+            Self::AccessSurface(_) => EngineErrorCode::AccessSurface,
+            Self::HostsWrite(_) => EngineErrorCode::HostsWrite,
+            Self::Other(_) => EngineErrorCode::Other,
+        }
+    }
 }
 
 impl ProxyEngine {
@@ -162,6 +228,7 @@ impl ProxyEngine {
             probe_cache_path: None,
             probe_cache_persist: false,
             terminal_proxy_backup: None,
+            last_error: None,
         }
     }
 
@@ -293,24 +360,49 @@ impl ProxyEngine {
         }
     }
 
-    /// 模式前置后的绑定（失败时回滚系统代理设置并置 Error 状态）
+    /// 关闭已启动的监听任务（启动中途失败时的回滚：先停监听，再撤接入面）
+    async fn teardown_listeners(&mut self) {
+        self.shutdown_tx.send_replace(true);
+        if let Some(task) = self.running_task.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        }
+    }
+
+    /// 置 Error 状态并记录分类（code 由 EngineError 推导）
+    fn set_error(&mut self, err: &EngineError) {
+        self.last_error = Some(err.code());
+        self.state.send_replace(EngineState::Error(err.to_string()));
+    }
+
+    /// 置 Error 状态并显式指定分类（错误类型本身无法区分时使用）
+    fn set_error_code(&mut self, err: &EngineError, code: EngineErrorCode) {
+        self.last_error = Some(code);
+        self.state.send_replace(EngineState::Error(err.to_string()));
+    }
+
+    /// 当前错误分类（仅在 Error 状态下有值）
+    pub fn error_code(&self) -> Option<EngineErrorCode> {
+        match *self.state_rx.borrow() {
+            EngineState::Error(_) => self.last_error,
+            _ => None,
+        }
+    }
+
+    /// 绑定监听端口（失败时置 Error 状态；不触碰接入面）
     async fn bind_or_fail(
-        &self,
-        mode: ProxyMode,
+        &mut self,
         ip: IpAddr,
         port: u16,
     ) -> Result<tokio::net::TcpListener, EngineError> {
         match tokio::net::TcpListener::bind((ip, port)).await {
             Ok(listener) => Ok(listener),
             Err(e) => {
-                // 回滚系统代理设置（阻塞操作放 spawn_blocking：macOS 提权路径可能弹窗）
-                if let Err(join_err) =
-                    tokio::task::spawn_blocking(move || revert_proxy_settings(mode)).await
-                {
-                    tracing::warn!("回滚系统代理设置任务异常: {join_err}");
-                }
+                // 此处**不做**接入面回滚：按「先监听后接入」的顺序，绑定失败时
+                // 系统代理 / hosts 都还没被改动过。盲目 set_system_proxy(false)
+                // 会把用户原有的代理关掉（比起绑定失败本身伤害更大）。
+                // 已绑定成功的其它监听器是局部变量，随本函数返回自动关闭。
                 let err = EngineError::BindPortError(port, describe_bind_error(e, port));
-                self.state.send_replace(EngineState::Error(err.to_string()));
+                self.set_error(&err);
                 Err(err)
             }
         }
@@ -335,8 +427,9 @@ impl ProxyEngine {
             if let Some(reason) =
                 crate::privileged::hosts_mode_block_reason(config.https_port, http_port)
             {
-                self.state.send_replace(EngineState::Error(reason.clone()));
-                return Err(EngineError::Other(reason));
+                let err = EngineError::Other(reason);
+                self.set_error_code(&err, EngineErrorCode::Privileged);
+                return Err(err);
             }
         }
         // 落盘配置存 engine（stop 时保存用；config 之后不再可用）
@@ -386,9 +479,9 @@ impl ProxyEngine {
         {
             Ok(resolver) => Arc::new(resolver),
             Err(e) => {
-                let msg = format!("DNS 初始化任务异常: {e}");
-                self.state.send_replace(EngineState::Error(msg.clone()));
-                return Err(EngineError::Other(msg));
+                let err = EngineError::Other(format!("DNS 初始化任务异常: {e}"));
+                self.set_error_code(&err, EngineErrorCode::DnsInit);
+                return Err(err);
             }
         };
         tracing::info!(
@@ -420,73 +513,20 @@ impl ProxyEngine {
             }
         }
 
-        // —— 1. 模式前置（对齐 C# switch(proxyMode)）——
+        // —— 1. 模式前置（仅端口预检；接入面统一留到监听就绪之后）——
         // 系统代理/PAC 地址回退：0.0.0.0 → 127.0.0.1（注册表/PAC 不接受 unspecified）
         let proxy_ip = if config.listen_ip.is_unspecified() {
             IpAddr::from([127, 0, 0, 1])
         } else {
             config.listen_ip
         };
-        match mode {
-            ProxyMode::Hosts => {
-                if let Err(e) =
-                    Self::check_port_available(config.listen_ip, config.https_port).await
-                {
-                    // 端口预检失败也必须落 Error：否则状态永久停在 Starting，
-                    // stop() 只接受 Running，前端只能重启应用。
-                    self.state.send_replace(EngineState::Error(e.to_string()));
-                    return Err(e);
-                }
+        if mode == ProxyMode::Hosts {
+            if let Err(e) = Self::check_port_available(config.listen_ip, config.https_port).await {
+                // 端口预检失败也必须落 Error：否则状态永久停在 Starting，
+                // stop() 只接受 Running，前端只能重启应用。
+                self.set_error(&e);
+                return Err(e);
             }
-            ProxyMode::System => {
-                let proxy_ip_s = proxy_ip.to_string();
-                let forward_port = config.forward_proxy_port;
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::system_proxy::set_system_proxy(true, &proxy_ip_s, forward_port)
-                })
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r);
-                if let Err(e) = result {
-                    // 部分写入（例如 ProxyEnable 已置 1、ProxyServer 写失败）同样要撤销：
-                    // 否则系统可能指向一个未监听的地址。只有快照已建立时才回滚——
-                    // capture 失败时尚未写入任何值，回滚反而会关掉用户原有代理。
-                    if crate::system_proxy::should_rollback_proxy_on_failure() {
-                        let _ = tokio::task::spawn_blocking(|| {
-                            crate::system_proxy::set_system_proxy(false, "", 0)
-                        })
-                        .await;
-                    }
-                    let msg = format!("设置系统代理失败: {e}");
-                    self.state.send_replace(EngineState::Error(msg.clone()));
-                    return Err(EngineError::Other(msg));
-                }
-            }
-            ProxyMode::Pac => {
-                let pac_url = format!(
-                    "http://{}/pac",
-                    authority(&proxy_ip, config.forward_proxy_port)
-                );
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::system_proxy::set_system_pac(true, &pac_url)
-                })
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r);
-                if let Err(e) = result {
-                    // 同 System 分支：只有快照已建立时才回滚，避免误关用户原有代理
-                    if crate::system_proxy::should_rollback_proxy_on_failure() {
-                        let _ = tokio::task::spawn_blocking(|| {
-                            crate::system_proxy::set_system_pac(false, "")
-                        })
-                        .await;
-                    }
-                    let msg = format!("设置 PAC 系统代理失败: {e}");
-                    self.state.send_replace(EngineState::Error(msg.clone()));
-                    return Err(EngineError::Other(msg));
-                }
-            }
-            ProxyMode::ProxyOnly => {}
         }
 
         // —— 2. 构建运行时上下文 ——
@@ -538,7 +578,7 @@ impl ProxyEngine {
 
         let https_listener = if use_https_mitm {
             Some(
-                self.bind_or_fail(mode, config.listen_ip, config.https_port)
+                self.bind_or_fail(config.listen_ip, config.https_port)
                     .await?,
             )
         } else {
@@ -547,14 +587,14 @@ impl ProxyEngine {
 
         let http_listener = if use_https_mitm && config.enable_http_to_https {
             let port = config.http_port.unwrap_or(80);
-            Some(self.bind_or_fail(mode, config.listen_ip, port).await?)
+            Some(self.bind_or_fail(config.listen_ip, port).await?)
         } else {
             None
         };
 
         let forward_listener = if !use_https_mitm {
             Some(
-                self.bind_or_fail(mode, config.listen_ip, config.forward_proxy_port)
+                self.bind_or_fail(config.listen_ip, config.forward_proxy_port)
                     .await?,
             )
         } else {
@@ -562,7 +602,7 @@ impl ProxyEngine {
         };
 
         let socks5_listener = if let Some(port) = config.socks5_port {
-            Some(self.bind_or_fail(mode, config.listen_ip, port).await?)
+            Some(self.bind_or_fail(config.listen_ip, port).await?)
         } else {
             None
         };
@@ -621,7 +661,62 @@ impl ProxyEngine {
         });
         self.running_task = Some(join);
 
-        // —— 5. Hosts 模式：监听启动后写 hosts（对齐 C# 启动成功后 UpdateHosts）——
+        // —— 5. 接入面（监听已就绪之后才写）——
+        // System/PAC：写注册表 / AutoConfigURL。失败必须回滚：部分写入
+        // （ProxyEnable 已置 1、ProxyServer 写失败）同样会让系统指向未监听地址。
+        // 只有快照已建立时才回滚——capture 失败说明尚未写入任何值，
+        // 此时回滚反而会关掉用户原有代理。
+        match mode {
+            ProxyMode::System => {
+                let proxy_ip_s = proxy_ip.to_string();
+                let forward_port = config.forward_proxy_port;
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::system_proxy::set_system_proxy(true, &proxy_ip_s, forward_port)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                if let Err(e) = result {
+                    if crate::system_proxy::should_rollback_proxy_on_failure() {
+                        let _ = tokio::task::spawn_blocking(|| {
+                            crate::system_proxy::set_system_proxy(false, "", 0)
+                        })
+                        .await;
+                    }
+                    self.teardown_listeners().await;
+                    let err = EngineError::AccessSurface(format!("设置系统代理失败: {e}"));
+                    self.set_error(&err);
+                    return Err(err);
+                }
+            }
+            ProxyMode::Pac => {
+                let pac_url = format!(
+                    "http://{}/pac",
+                    authority(&proxy_ip, config.forward_proxy_port)
+                );
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::system_proxy::set_system_pac(true, &pac_url)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                if let Err(e) = result {
+                    if crate::system_proxy::should_rollback_proxy_on_failure() {
+                        let _ = tokio::task::spawn_blocking(|| {
+                            crate::system_proxy::set_system_pac(false, "")
+                        })
+                        .await;
+                    }
+                    self.teardown_listeners().await;
+                    let err = EngineError::AccessSurface(format!("设置 PAC 系统代理失败: {e}"));
+                    self.set_error(&err);
+                    return Err(err);
+                }
+            }
+            _ => {}
+        }
+
+        // —— 6. Hosts 模式：监听启动后写 hosts（对齐 C# 启动成功后 UpdateHosts）——
         if mode == ProxyMode::Hosts {
             let entries = collect_hosts_entries(&config);
             if !entries.is_empty() {
@@ -639,13 +734,10 @@ impl ProxyEngine {
                 .and_then(|r| r.map_err(|e| e.to_string()));
                 if let Err(e) = write_result {
                     // 回滚：停止已启动的监听（对齐 C# StopProxyAsync 回滚）
-                    self.shutdown_tx.send_replace(true);
-                    if let Some(task) = self.running_task.take() {
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-                    }
-                    let msg = format!("hosts 写入失败: {e}");
-                    self.state.send_replace(EngineState::Error(msg.clone()));
-                    return Err(EngineError::Other(msg));
+                    self.teardown_listeners().await;
+                    let err = EngineError::HostsWrite(e);
+                    self.set_error(&err);
+                    return Err(err);
                 }
                 self.hosts_written = Some(manager_path);
             }
@@ -799,9 +891,11 @@ impl ProxyEngine {
                 .await
                 .is_err()
             {
-                let msg = "监听停止超时（端口可能仍被占用），请重启应用".to_string();
-                self.state.send_replace(EngineState::Error(msg.clone()));
-                return Err(EngineError::Other(msg));
+                let err = EngineError::Other(
+                    "监听停止超时（端口可能仍被占用），请重启应用".to_string(),
+                );
+                self.set_error_code(&err, EngineErrorCode::ShutdownTimeout);
+                return Err(err);
             }
         }
         self.running_mode = None;
@@ -846,18 +940,6 @@ fn describe_bind_error(e: std::io::Error, port: u16) -> String {
 }
 
 /// 撤销模式前置的系统代理设置（启动失败回滚）
-fn revert_proxy_settings(mode: ProxyMode) {
-    match mode {
-        ProxyMode::System => {
-            let _ = crate::system_proxy::set_system_proxy(false, "", 0);
-        }
-        ProxyMode::Pac => {
-            let _ = crate::system_proxy::set_system_pac(false, "");
-        }
-        _ => {}
-    }
-}
-
 /// 判断注册表 / PAC 里的代理地址是否指向本引擎。
 ///
 /// 除 loopback / unspecified 外，也匹配本次配置的监听地址（例如用户把
@@ -995,6 +1077,36 @@ mod tests {
         assert!(matches!(result, Err(EngineError::BindPortError(_, _))));
 
         engine.stop().await.unwrap();
+    }
+
+    /// 接入面时序：System 模式端口被占用时必须「绑定先失败」，不得留下监听任务。
+    ///
+    /// 系统代理是否被改写属于进程外副作用，单测不触碰真实注册表；
+    /// 顺序保证由 `start()` 的结构（绑定在前、接入面在后）与
+    /// `bind_or_fail` 不再做接入面回滚共同成立。
+    #[tokio::test]
+    async fn test_engine_system_mode_bind_failure_keeps_state_error() {
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        let mut engine = ProxyEngine::new();
+        let config = EngineConfig {
+            mode: ProxyMode::System,
+            forward_proxy_port: port,
+            ..Default::default()
+        };
+        let result = engine.start(config).await;
+        assert!(
+            matches!(result, Err(EngineError::BindPortError(p, _)) if p == port),
+            "应返回 BindPortError"
+        );
+        assert!(matches!(engine.state(), EngineState::Error(_)));
+        assert_eq!(
+            engine.error_code(),
+            Some(EngineErrorCode::BindPort),
+            "错误分类应可区分绑定失败"
+        );
+        assert!(engine.running_task.is_none(), "失败后不应留下监听任务");
     }
 
     /// Hosts 模式：hosts 写入/移除时序 + "ip domain" 反序格式

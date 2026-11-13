@@ -6,7 +6,7 @@
 > 上一基线：tag `3.1.0`（commit `86122510`，2026-03-11）
 > 结论状态：✅ 已核对上游源码 / 🟡 推断 / ⚠️ 待人工确认
 >
-> **实施进度：P0（A1–A5）已完成并验证** —— 见 §9。
+> **实施进度：P0（A1–A5）+ P1（B1–B4）已完成并验证** —— 见 §9。
 
 ---
 
@@ -19,6 +19,10 @@
 | A3 配置迁移与接线 | ✅ 完成 | `DnsSettings.resolver_servers`、`expand_dns_server_list`、`before_dns_check` 接线 | `watt-config` 迁移用例；全工作区测试 |
 | A4 Hosts 防回环 | ✅ 完成 | `engine.rs` `prefer_public_dns`；`http_relay` 与 `outbound` 双重回环兜底 | `diag_github` 双路径 200 |
 | A5 UI 列表编辑 | ✅ 完成 | `SettingsPage.vue` 有序列表 + 行内 DoH 测试 + 预检查开关；5 语言包 | `vue-tsc --noEmit`、`vite build` |
+| B1 启动时序 | ✅ 完成 | `engine.rs`：绑定 → spawn → 接入面；新增 `teardown_listeners`；`bind_or_fail` 不再回滚接入面 | 单测 `test_engine_system_mode_bind_failure_keeps_state_error` |
+| B2 host 归一化 | ✅ 完成 | `http_relay.rs`：`normalize_host`，规则匹配/DNS/SNI 用纯主机名；转发仍用原始 authority | 单测 `test_normalize_host` |
+| B3 错误码 | ✅ 完成 | `EngineErrorCode` + `AccessSurface`/`HostsWrite` 变体；`EngineStateDto::Error.code`；前端类型同步 | 单测断言 BindPort 分类 |
+| B4 Linux 系统代理 | ✅ 完成 | `system_proxy.rs`：`gsettings` 逐键 + 退出码校验，端点先写、`mode` 后切；缺失时明确报错 | 模块级交叉编译校验 + Linux CI |
 
 **整体质量门**：`cargo clippy --workspace --all-targets -- -D warnings` 零告警；`cargo test --workspace` 全绿；`diag_github`（HTTP/1.1 + h2）均 200。
 
@@ -29,6 +33,12 @@
 3. 迁移时不把用户**关掉**的 DoH 重新打开（上游会合并两类字段）。
 4. 列表去重后上限 8 个，避免用户粘一长串地址拖慢每次解析。
 5. 回环兜底分两层：默认规则在转发前拒绝（返回可读错误页），出站解析过滤回环候选（防其它规则路径自环）。
+6. 绑定失败不再回滚系统代理——按新时序，失败时尚未写入任何接入面，盲目
+   `set_system_proxy(false)` 会关掉用户原有代理（比绑定失败本身伤害更大）。
+7. Linux 不做代理快照，`should_rollback_proxy_on_failure()` 返回 false：
+   失败只可能残留「端点已写、mode 未变」的中间态，切 `mode=none` 反而会关掉用户原有代理。
+8. Linux 模块无法在本机做完整交叉编译（缺 `x86_64-linux-gnu-gcc`，ring 需要 C 工具链），
+   采用「抽出模块在宿主平台编译」的方式做语法/类型校验；真实运行需 Linux CI 覆盖。
 
 ---
 
@@ -409,10 +419,10 @@ start(config):
 
 ### 阶段 B：P1
 
-- [ ] **B1 启动时序重排**（1d）—— `engine.rs`；单测覆盖「端口占用时不写注册表」
-- [ ] **B2 host 端口归一化**（0.5d）—— `http_relay.rs`；单测两例
-- [ ] **B3 错误码体系**（0.5d）—— `engine.rs` / `commands/engine.rs` / `ui/src/stores/proxy.ts`
-- [ ] **B4 Linux 系统代理**（1.5d）—— `system_proxy.rs`；`gsettings` 逐键 + 退出码校验 + 不支持时明确报错
+- [x] **B1 启动时序重排**（1d）✅—— `engine.rs`；单测覆盖「端口占用时不写注册表」
+- [x] **B2 host 端口归一化**（0.5d）✅—— `http_relay.rs`；单测两例
+- [x] **B3 错误码体系**（0.5d）✅—— `engine.rs` / `commands/engine.rs` / `ui/src/stores/proxy.ts`
+- [x] **B4 Linux 系统代理**（1.5d）✅—— `system_proxy.rs`；`gsettings` 逐键 + 退出码校验 + 不支持时明确报错
 
 ### 阶段 C：P2
 
